@@ -13,7 +13,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency in some environments
     torch = None
 
-from pointcloud_viewer import PointCloudViewerFigure
+from .pointcloud_viewer import PointCloudViewerFigure
 
 
 def _to_numpy(x: np.ndarray | torch.Tensor | None) -> np.ndarray | None:
