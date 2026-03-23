@@ -13,7 +13,10 @@ try:
 except Exception:  # pragma: no cover - optional dependency in some environments
     torch = None
 
-from .pointcloud_viewer import PointCloudViewerFigure
+try:
+    from .pointcloud_viewer import PointCloudViewerFigure
+except ImportError:  # pragma: no cover - allow direct module imports from the repo root
+    from pointcloud_viewer import PointCloudViewerFigure
 
 
 def _to_numpy(x: np.ndarray | torch.Tensor | None) -> np.ndarray | None:
@@ -894,7 +897,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
   </script>
   <script type=\"module\">
     import * as THREE from 'three';
-    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { TrackballControls } from 'three/addons/controls/TrackballControls.js';
     import {
       acceleratedRaycast,
       computeBoundsTree,
@@ -990,12 +993,12 @@ class MeshViewerFigure(PointCloudViewerFigure):
     renderer.setClearColor(0x111827, 1.0);
     document.getElementById('canvas-container').appendChild(renderer.domElement);
 
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = false;
-    controls.screenSpacePanning = true;
-    controls.zoomSpeed = 1.0;
-    controls.rotateSpeed = 0.9;
+    const controls = new TrackballControls(camera, renderer.domElement);
+    controls.rotateSpeed = 2.0;
+    controls.zoomSpeed = 1.2;
     controls.panSpeed = 0.8;
+    controls.dynamicDampingFactor = 0.15;
+    controls.staticMoving = false;
 
     const layers = [];
     let isDayMode = false;
@@ -1018,18 +1021,10 @@ class MeshViewerFigure(PointCloudViewerFigure):
       clientX: 0,
       clientY: 0,
     };
-    let renderRequested = false;
     let hoverRefreshQueued = false;
 
-    function renderScene() {
-      renderRequested = false;
-      renderer.render(scene, camera);
-    }
-
     function requestRender() {
-      if (renderRequested) return;
-      renderRequested = true;
-      requestAnimationFrame(renderScene);
+      // Rendering is driven by the animation loop to match the point cloud viewer.
     }
 
     function scheduleHoverRefresh() {
@@ -1955,17 +1950,23 @@ class MeshViewerFigure(PointCloudViewerFigure):
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
+      controls.handleResize?.();
       requestRenderAndHover();
     });
 
     applyThemeMode(true);
+    function animate() {
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene, camera);
+    }
     if (layers.length > 0) {
       requestAnimationFrame(() => {
         fitCamera();
-        requestRender();
+        renderer.render(scene, camera);
       });
     }
-    requestRender();
+    animate();
   </script>
 </body>
 </html>
