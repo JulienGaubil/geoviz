@@ -495,6 +495,11 @@ class MeshViewerFigure(PointCloudViewerFigure):
       border: 1px solid rgba(255,255,255,0.05);
       background: rgba(255,255,255,0.02);
     }
+    .layer-row.master-toggle {
+      align-items: center;
+      background: rgba(99, 102, 241, 0.06);
+      border-color: rgba(99, 102, 241, 0.18);
+    }
     .layer-label {
       font-size: 12px;
       line-height: 1.35;
@@ -861,6 +866,10 @@ class MeshViewerFigure(PointCloudViewerFigure):
     </div>
     <div class=\"section\">
       <div class=\"section-title\">Layers</div>
+      <div class=\"layer-row master-toggle\">
+        <input id=\"toggle-all-layers\" type=\"checkbox\" checked>
+        <div class=\"layer-label\">Toggle all</div>
+      </div>
       <div id=\"layer-list\"></div>
     </div>
     <div class=\"section\">
@@ -1833,6 +1842,37 @@ class MeshViewerFigure(PointCloudViewerFigure):
 
       updateColorbars();
       updateInfoPanel();
+      updateToggleAllLayers();
+    }
+
+    function updateToggleAllLayers() {
+      const toggleAll = document.getElementById('toggle-all-layers');
+      if (!toggleAll) return;
+      if (layers.length === 0) {
+        toggleAll.checked = false;
+        toggleAll.indeterminate = false;
+        toggleAll.disabled = true;
+        return;
+      }
+
+      const visibleCount = layers.reduce((acc, entry) => acc + (entry.visible ? 1 : 0), 0);
+      toggleAll.disabled = false;
+      toggleAll.checked = visibleCount === layers.length;
+      toggleAll.indeterminate = visibleCount > 0 && visibleCount < layers.length;
+    }
+
+    function setAllLayersVisibility(visible) {
+      for (const entry of layers) {
+        entry.visible = visible;
+        entry.mesh.visible = visible;
+        if (entry.edgeLines) {
+          const edgeInput = document.getElementById('edge-overlay-mode');
+          entry.edgeLines.visible = visible && Boolean(edgeInput && edgeInput.checked);
+        }
+      }
+      rebuildLayerList();
+      hideHoverTooltip();
+      requestRender();
     }
 
     document.addEventListener('click', (ev) => {
@@ -1892,6 +1932,12 @@ class MeshViewerFigure(PointCloudViewerFigure):
       shareFieldScaleInput.disabled = !sharedFieldScaleRange;
       shareFieldScaleInput.addEventListener('change', () => {
         setShareFieldScale(shareFieldScaleInput.checked);
+      });
+    }
+    const toggleAllLayersInput = document.getElementById('toggle-all-layers');
+    if (toggleAllLayersInput) {
+      toggleAllLayersInput.addEventListener('change', () => {
+        setAllLayersVisibility(toggleAllLayersInput.checked);
       });
     }
 
