@@ -1,17 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 import threading
-import uuid
 import webbrowser
 from dataclasses import dataclass, field
 from html import escape
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import urlparse
 
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
@@ -141,9 +138,11 @@ def _prepare_layer(
 
     scalar_meta = None
     scalar_values: np.ndarray | None = None
+    raw_colors: np.ndarray | None = None
     if isinstance(point_color, str):
         rgb = np.asarray(mcolors.to_rgb(point_color), dtype=np.float32)
         colors = np.repeat(rgb[None, :], pts.shape[0], axis=0)
+        raw_colors = colors
     else:
         color_arr = _to_numpy(point_color)
         if color_arr is None:
@@ -164,6 +163,9 @@ def _prepare_layer(
             color_arr = color_arr[::downsampling_factor]
             if scalar_values is not None:
                 scalar_values = scalar_values[::downsampling_factor]
+        if scalar_values is None:
+            scalar_values = color_arr[:, 0].astype(np.float32, copy=False)
+        raw_colors = color_arr
 
         if cmap is not None:
             scalar_vals = color_arr[:, 0]
@@ -197,11 +199,14 @@ def _prepare_layer(
     if np.any(valid_mask):
         pts = pts[valid_mask]
         colors = colors[valid_mask]
+        if raw_colors is not None:
+            raw_colors = raw_colors[valid_mask]
         if scalar_values is not None:
             scalar_values = scalar_values[valid_mask]
     else:
         pts = np.zeros((0, 3), dtype=np.float32)
         colors = np.zeros((0, 3), dtype=np.float32)
+        raw_colors = np.zeros((0, 3), dtype=np.float32)
         scalar_values = np.zeros((0,), dtype=np.float32) if scalar_values is not None else None
 
     if edg is not None:
@@ -224,19 +229,22 @@ def _prepare_layer(
         else:
             edg = np.zeros((0, 2), dtype=np.int32)
 
-    if colors.size == 0:
-        colors_uint8 = np.zeros((0, 3), dtype=np.uint8)
-    else:
-        max_color = float(np.nanmax(colors))
+    def _to_uint8_rgb(arr: np.ndarray) -> np.ndarray:
+        if arr.size == 0:
+            return np.zeros((0, 3), dtype=np.uint8)
+        max_color = float(np.nanmax(arr))
         if max_color <= 1.0 + 1e-6:
-            colors_uint8 = np.clip(colors * 255.0, 0, 255).astype(np.uint8)
-        else:
-            colors_uint8 = np.clip(colors, 0, 255).astype(np.uint8)
+            return np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+        return np.clip(arr, 0, 255).astype(np.uint8)
+
+    colors_uint8 = _to_uint8_rgb(colors)
+    raw_colors_uint8 = _to_uint8_rgb(raw_colors if raw_colors is not None else colors)
 
     layer = {
         "label": label,
         "points": np.ascontiguousarray(pts, dtype=np.float32).tolist(),
         "colors": colors_uint8.tolist(),
+        "raw_colors": raw_colors_uint8.tolist(),
         "edges": None if edg is None else edg.tolist(),
         "scalar_meta": scalar_meta,
         "values": None if scalar_values is None else np.ascontiguousarray(scalar_values, dtype=np.float32).tolist(),
@@ -949,8 +957,14 @@ class PointCloudViewerFigure:
       return {{ min: minVal, max: maxVal }};
     }})();
 
+    const NO_CMAP = 'none';
+
     function getFallbackCmap() {{
       return availableCmaps[0] || 'viridis';
+    }}
+
+    function isNoCmap(cmapName) {{
+      return !cmapName || cmapName === NO_CMAP;
     }}
 
     function getColormapPreset(cmapName) {{
@@ -966,11 +980,79 @@ class PointCloudViewerFigure:
       return `linear-gradient(90deg, ${{gradient.join(', ')}})`;
     }}
 
-    function createCmapSwatch(cmapName) {{
+    function computeFiniteValueRange(values) {{
+      if (!values || typeof values.length !== 'number' || values.length === 0) return null;
+      let minVal = Infinity;
+      let maxVal = -Infinity;
+      for (let idx = 0; idx < values.length; idx += 1) {{
+        const value = Number(values[idx]);
+        if (!Number.isFinite(value)) continue;
+        minVal = Math.min(minVal, value);
+        maxVal = Math.max(maxVal, value);
+      }}
+      if (!Number.isFinite(minVal) || !Number.isFinite(maxVal)) return null;
+      return {{ min: minVal, max: maxVal }};
+    }}
+
+    function sampleRawGradientFromColors(colors, stepCount = 7) {{
+      const flat = colors instanceof Uint8Array ? colors : flattenColorArray(colors);
+      const colorCount = Math.floor(flat.length / 3);
+      if (!flat || colorCount === 0) return null;
+      const gradient = [];
+      for (let idx = 0; idx < stepCount; idx += 1) {{
+        const sampleIdx = stepCount <= 1 || colorCount <= 1
+          ? 0
+          : Math.round((idx * (colorCount - 1)) / (stepCount - 1));
+        gradient.push(`rgb(${{flat[sampleIdx * 3]}}, ${{flat[sampleIdx * 3 + 1]}}, ${{flat[sampleIdx * 3 + 2]}})`);
+      }}
+      return gradient;
+    }}
+
+    function buildRawScalarGradient(range, stepCount = 7) {{
+      if (!range) return null;
+      const useUnitScale = range.max <= 1.0 + 1e-6;
+      const gradient = [];
+      for (let idx = 0; idx < stepCount; idx += 1) {{
+        const t = stepCount <= 1 ? 0.0 : idx / (stepCount - 1);
+        const raw = range.min + (range.max - range.min) * t;
+        const intensity = useUnitScale ? raw * 255.0 : raw;
+        const clipped = Math.max(0, Math.min(255, Math.round(intensity)));
+        gradient.push(`rgb(${{clipped}}, ${{clipped}}, ${{clipped}})`);
+      }}
+      return gradient;
+    }}
+
+    function getEntryRawColors(entry, fieldIdx = entry.activeFieldIdx ?? 0) {{
+      const fieldColors = entry.layer.field_colors || null;
+      if (fieldColors && fieldIdx >= 0 && fieldIdx < fieldColors.length && fieldColors[fieldIdx]) {{
+        return fieldColors[fieldIdx];
+      }}
+      return entry.layer.raw_colors || entry.layer.colors || null;
+    }}
+
+    function getEntryColorModeOptions(entry, fieldIdx = entry.activeFieldIdx ?? 0) {{
+      const options = [NO_CMAP];
+      const values = getEntryDisplayedValues(entry, fieldIdx);
+      if (values && typeof values.length === 'number') {{
+        availableCmaps.forEach((cmapName) => options.push(cmapName));
+      }}
+      return Array.from(new Set(options));
+    }}
+
+    function getEntryRawGradient(entry, fieldIdx = entry.activeFieldIdx ?? 0) {{
+      const values = getEntryDisplayedValues(entry, fieldIdx);
+      const valueRange = computeFiniteValueRange(values);
+      if (valueRange) return buildRawScalarGradient(valueRange);
+      return sampleRawGradientFromColors(getEntryRawColors(entry, fieldIdx));
+    }}
+
+    function createCmapSwatch(entry, fieldIdx, cmapName) {{
       const swatch = document.createElement('span');
       swatch.className = 'cmap-swatch';
-      const preset = getColormapPreset(cmapName);
-      swatch.style.background = gradientCss(preset && preset.gradient ? preset.gradient : null);
+      const gradient = isNoCmap(cmapName)
+        ? getEntryRawGradient(entry, fieldIdx)
+        : (getColormapPreset(cmapName)?.gradient || null);
+      swatch.style.background = gradientCss(gradient);
       return swatch;
     }}
 
@@ -981,7 +1063,7 @@ class PointCloudViewerFigure:
       prefix.textContent = 'Colormap:';
       const value = document.createElement('span');
       value.className = 'layer-id';
-      value.textContent = cmapName;
+      value.textContent = isNoCmap(cmapName) ? NO_CMAP : cmapName;
       button.appendChild(prefix);
       button.appendChild(value);
     }}
@@ -1152,14 +1234,35 @@ class PointCloudViewerFigure:
     }}
 
     function getEntryCmap(entry, fieldIdx = entry.activeFieldIdx ?? 0) {{
-      return entry.activeCmap || getFallbackCmap();
+      return entry.activeCmap || NO_CMAP;
     }}
 
     function getScalarMeta(entry, fieldIdx = entry.activeFieldIdx ?? 0) {{
+      const values = getEntryDisplayedValues(entry, fieldIdx);
       const fieldMetas = entry.layer.field_scalar_meta || null;
       const baseMeta = fieldMetas ? fieldMetas[fieldIdx] : entry.layer.scalar_meta;
-      if (!baseMeta) return null;
       const cmapName = getEntryCmap(entry, fieldIdx);
+      if (isNoCmap(cmapName)) {{
+        const range = computeFiniteValueRange(values);
+        const gradient = getEntryRawGradient(entry, fieldIdx);
+        if (!range && !gradient) return null;
+        return {{
+          ...(range || {{}}),
+          cmap: NO_CMAP,
+          gradient,
+        }};
+      }}
+      if (!baseMeta) {{
+        const range = computeFiniteValueRange(values);
+        if (!range) return null;
+        const preset = getColormapPreset(cmapName);
+        return {{
+          min: range.min,
+          max: range.max,
+          cmap: cmapName,
+          gradient: preset && preset.gradient ? preset.gradient : null,
+        }};
+      }}
       const preset = getColormapPreset(cmapName);
       const resolved = {{
         ...baseMeta,
@@ -1171,11 +1274,6 @@ class PointCloudViewerFigure:
         resolved.max = sharedFieldScaleRange.max;
       }}
       return resolved;
-    }}
-
-    function getEntryDisplayedValues(entry, fieldIdx = entry.activeFieldIdx ?? 0) {{
-      const fieldValues = entry.layer.field_values || null;
-      return fieldValues ? fieldValues[fieldIdx] : entry.layer.values || null;
     }}
 
     function buildDistributionSvg(values, meta) {{
@@ -1324,21 +1422,21 @@ class PointCloudViewerFigure:
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'layer-select-button cmap-dropdown-button';
-        const currentCmap = meta.cmap || getFallbackCmap();
+        const currentCmap = getEntryCmap(entry, fieldIdx);
         setCmapButtonContent(button, currentCmap);
         const menu = document.createElement('div');
         menu.className = 'custom-dropdown-menu';
-        availableCmaps.forEach((cmapName) => {{
+        getEntryColorModeOptions(entry, fieldIdx).forEach((cmapName) => {{
           const item = document.createElement('div');
           item.className = 'custom-dropdown-item cmap-dropdown-item';
           if (cmapName === currentCmap) item.classList.add('selected');
           const prefix = document.createElement('span');
           prefix.className = 'cmap-dropdown-prefix';
-          prefix.appendChild(createCmapSwatch(cmapName));
+          prefix.appendChild(createCmapSwatch(entry, fieldIdx, cmapName));
           item.appendChild(prefix);
           const value = document.createElement('span');
           value.className = 'layer-id';
-          value.textContent = cmapName;
+          value.textContent = isNoCmap(cmapName) ? NO_CMAP : cmapName;
           item.appendChild(value);
           item.addEventListener('click', () => {{
             setLayerCmap(entry, cmapName);
@@ -1360,9 +1458,6 @@ class PointCloudViewerFigure:
         const gradient = document.createElement('div');
         gradient.className = 'colorbar-gradient';
         gradient.style.background = gradientCss(meta.gradient);
-        const range = document.createElement('div');
-        range.className = 'colorbar-range';
-        range.innerHTML = `<span>${{meta.min.toFixed(4)}}</span><span>${{meta.max.toFixed(4)}}</span>`;
         wrapper.appendChild(title);
         dropdown.appendChild(button);
         dropdown.appendChild(menu);
@@ -1373,7 +1468,12 @@ class PointCloudViewerFigure:
         }}
         visual.appendChild(gradient);
         wrapper.appendChild(visual);
-        wrapper.appendChild(range);
+        if (Number.isFinite(meta.min) && Number.isFinite(meta.max)) {{
+          const range = document.createElement('div');
+          range.className = 'colorbar-range';
+          range.innerHTML = `<span>${{meta.min.toFixed(4)}}</span><span>${{meta.max.toFixed(4)}}</span>`;
+          wrapper.appendChild(range);
+        }}
         container.appendChild(wrapper);
       }}
     }}
@@ -1482,24 +1582,23 @@ class PointCloudViewerFigure:
 
     function renderEntryColors(entry, fieldIdx = entry.activeFieldIdx ?? 0) {{
       const fieldValues = entry.layer.field_values || null;
-      const fieldColors = entry.layer.field_colors || null;
       const values = fieldValues ? fieldValues[fieldIdx] : entry.layer.values || null;
+      const rawColors = getEntryRawColors(entry, fieldIdx);
+      const cmapName = getEntryCmap(entry, fieldIdx);
       const meta = getScalarMeta(entry, fieldIdx);
-      const updatedFromValues = values && meta ? applyColorsFromValues(entry, values, meta) : false;
+      const updatedFromValues = !isNoCmap(cmapName) && values && meta ? applyColorsFromValues(entry, values, meta) : false;
 
       if (updatedFromValues) {{
         entry.objects.points.geometry.attributes.color.needsUpdate = true;
-      }} else if (fieldColors && fieldIdx >= 0 && fieldIdx < fieldColors.length && fieldColors[fieldIdx]) {{
-        applyStoredColors(entry, fieldColors[fieldIdx]);
+      }} else if (rawColors) {{
+        applyStoredColors(entry, rawColors);
       }} else {{
         applyStoredColors(entry, entry.layer.colors);
       }}
 
       entry.activeFieldIdx = fieldIdx;
       entry.activeValues = values;
-      if (!fieldValues) {{
-        entry.activeCmap = meta ? meta.cmap : entry.activeCmap;
-      }}
+      entry.activeCmap = cmapName;
     }}
 
     function setLayerCmap(entry, cmapName) {{
@@ -1704,8 +1803,15 @@ class PointCloudViewerFigure:
       const objects = buildPoints(layer);
       const fieldMetas = layer.field_scalar_meta || null;
       const fieldValues = layer.field_values || null;
-      const fieldCmaps = fieldMetas
-        ? fieldMetas.map((meta) => (meta && meta.cmap) ? meta.cmap : getFallbackCmap())
+      const fieldColorCount = Array.isArray(layer.field_colors) ? layer.field_colors.length : 0;
+      const fieldCount = Math.max(
+        Array.isArray(layer.field_names) ? layer.field_names.length : 0,
+        Array.isArray(fieldValues) ? fieldValues.length : 0,
+        Array.isArray(fieldMetas) ? fieldMetas.length : 0,
+        fieldColorCount,
+      );
+      const fieldCmaps = fieldCount > 0
+        ? Array.from({{ length: fieldCount }}, (_value, idx) => ((fieldMetas && fieldMetas[idx] && fieldMetas[idx].cmap) ? fieldMetas[idx].cmap : NO_CMAP))
         : null;
       const entry = {{
         layer,
@@ -1713,7 +1819,7 @@ class PointCloudViewerFigure:
         visible: true,
         activeFieldIdx: Number(layer.active_field_idx || 0),
         activeValues: layer.values || null,
-        activeCmap: layer.scalar_meta && layer.scalar_meta.cmap ? layer.scalar_meta.cmap : getFallbackCmap(),
+        activeCmap: layer.scalar_meta && layer.scalar_meta.cmap ? layer.scalar_meta.cmap : NO_CMAP,
         fieldCmaps,
       }};
       layers.push(entry);
@@ -1806,6 +1912,27 @@ class PointCloudViewerFigure:
         out.write_text(self.to_html(), encoding="utf-8")
         return out
 
+    def _notebook_iframe_html(
+      self,
+      *,
+      width: int | str = "100%",
+      height: int = 760,
+  ) -> str:
+      import base64
+      width_css = f"{width}px" if isinstance(width, int) else str(width)
+      b64 = base64.b64encode(self.to_html().encode("utf-8")).decode("ascii")
+      return (
+          f'<div style="width:{width_css};max-width:100%;">'
+          f'<iframe src="data:text/html;base64,{b64}"'
+          f' style="display:block;width:100%;height:{int(height)}px;border:0;border-radius:8px;"'
+          f' referrerpolicy="no-referrer">'
+          f'</iframe>'
+          f'</div>'
+      )
+
+    def _repr_html_(self) -> str:
+        return self._notebook_iframe_html()
+
     def _serve(self, host: str = "127.0.0.1", port: int = 0, path: str | Path | None = None) -> str:
         if self._server is not None:
             self.close_server()
@@ -1893,112 +2020,19 @@ class PointCloudViewerFigure:
 
         if inline and shell is None:
             raise RuntimeError("inline=True requires an IPython notebook environment")
-
-        url = self._serve(host=host, port=port, path=path)
+        if inline and open_browser:
+            raise ValueError("inline=True and open_browser=True are mutually exclusive")
 
         if inline:
             from IPython.display import HTML, display
 
-            parsed = urlparse(url)
-            if notebook_proxy is None:
-                notebook_proxy = False
+            # Preserve the argument for backward compatibility; notebook rendering
+            # is now self-contained and does not rely on a local HTTP server.
+            _ = notebook_proxy
+            display(HTML(self._notebook_iframe_html(width=width, height=height)))
+            return None
 
-            candidates: list[str] = []
-            if notebook_proxy:
-                service_prefixes: list[str] = ["/"]
-                if isinstance(notebook_proxy, str):
-                    service_prefixes = [notebook_proxy]
-                elif os.environ.get("JUPYTERHUB_SERVICE_PREFIX"):
-                    service_prefixes.append(os.environ["JUPYTERHUB_SERVICE_PREFIX"])
-
-                for pref in service_prefixes:
-                    service_prefix = pref
-                    if not service_prefix.startswith("/"):
-                        service_prefix = "/" + service_prefix
-                    if not service_prefix.endswith("/"):
-                        service_prefix = service_prefix + "/"
-                    candidates.append(f"{service_prefix}proxy/{parsed.port}{parsed.path}")
-
-                # Generic local Jupyter proxy paths.
-                candidates.append(f"/proxy/{parsed.port}{parsed.path}")
-
-            candidates.append(url)
-
-            # Preserve order but deduplicate.
-            deduped_candidates: list[str] = []
-            seen: set[str] = set()
-            for c in candidates:
-                if c not in seen:
-                    deduped_candidates.append(c)
-                    seen.add(c)
-
-            width_css = f"{width}px" if isinstance(width, int) else str(width)
-            iframe_id = f"pcv_iframe_{uuid.uuid4().hex}"
-            status_id = f"{iframe_id}_status"
-            html = f"""
-<div style="width:{escape(width_css)};max-width:100%;">
-  <iframe id="{iframe_id}" style="width:100%;height:{int(height)}px;border:0;border-radius:8px;"></iframe>
-  <div id="{status_id}" style="font-family:monospace;font-size:11px;margin-top:6px;color:#666;"></div>
-</div>
-<script>
-(() => {{
-  const candidates = {json.dumps(deduped_candidates)};
-  const expectedPath = {json.dumps(parsed.path)};
-  const iframe = document.getElementById({json.dumps(iframe_id)});
-  const status = document.getElementById({json.dumps(status_id)});
-  if (!iframe || !status || candidates.length === 0) return;
-
-  let idx = 0;
-  let timer = null;
-  const tryNext = () => {{
-    if (idx >= candidates.length) {{
-      status.innerHTML = `Viewer not reachable inline. Open directly: <a href="${{candidates[candidates.length - 1]}}" target="_blank" rel="noopener noreferrer">${{candidates[candidates.length - 1]}}</a>`;
-      return;
-    }}
-    const src = candidates[idx++];
-    status.textContent = `Trying: ${{src}}`;
-    let done = false;
-    iframe.onload = () => {{
-      if (done) return;
-      done = true;
-      if (timer) clearTimeout(timer);
-      let looksWrong = false;
-      try {{
-        const locPath = iframe.contentWindow?.location?.pathname || '';
-        if (locPath && expectedPath && !locPath.endsWith(expectedPath)) {{
-          looksWrong = true;
-        }}
-        const marker = iframe.contentDocument?.querySelector?.('meta[name="pointcloud-viewer"][content="1"]');
-        if (!marker) {{
-          looksWrong = true;
-        }}
-        const preview = (iframe.contentDocument?.body?.innerText || '').slice(0, 800);
-        if (!preview.trim()) {{
-          looksWrong = true;
-        }}
-        if (/404\\b|not found|directory listing|sign in|login/i.test(preview)) {{
-          looksWrong = true;
-        }}
-      }} catch (_err) {{
-        // Cross-origin frame; cannot inspect content. Treat as loaded.
-      }}
-      if (looksWrong) {{
-        tryNext();
-        return;
-      }}
-      status.innerHTML = `Viewer loaded. <a href="${{src}}" target="_blank" rel="noopener noreferrer">Open in new tab</a>`;
-    }};
-    iframe.src = src;
-    timer = setTimeout(() => {{
-      if (!done) tryNext();
-    }}, 1500);
-  }};
-
-  tryNext();
-}})();
-</script>
-"""
-            display(HTML(html))
+        url = self._serve(host=host, port=port, path=path)
 
         if open_browser:
             webbrowser.open(url, new=2)
@@ -2077,14 +2111,10 @@ def plot_pointcloud_viewer(
             "points": base_layer["points"],
             "edges": base_layer["edges"],
             "colors": base_layer["colors"],
+            "raw_colors": base_layer["raw_colors"],
             "values": base_layer["values"],
             "field_names": [name for name, _ in prepared_fields],
-            "field_colors": [
-                None
-                if layer_data["values"] is not None and layer_data["scalar_meta"] is not None
-                else layer_data["colors"]
-                for _, layer_data in prepared_fields
-            ],
+            "field_colors": [layer_data["raw_colors"] for _, layer_data in prepared_fields],
             "field_values": [layer_data["values"] for _, layer_data in prepared_fields],
             "field_scalar_meta": [layer_data["scalar_meta"] for _, layer_data in prepared_fields],
             "active_field_idx": 0,

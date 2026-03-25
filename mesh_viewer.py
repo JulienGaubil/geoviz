@@ -145,13 +145,14 @@ def _prepare_vertex_colors(
     vertex_count: int,
     show_colorbar: bool,
     cmap: str | None,
-) -> tuple[np.ndarray, np.ndarray | None, dict[str, Any] | None]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, dict[str, Any] | None]:
     scalar_meta = None
     scalar_values: np.ndarray | None = None
 
     if isinstance(vertex_color, str):
         rgb = np.asarray(mcolors.to_rgb(vertex_color), dtype=np.float32)
         colors = np.repeat(rgb[None, :], vertex_count, axis=0)
+        raw_colors = colors
     else:
         color_arr = _to_numpy(vertex_color)
         if color_arr is None:
@@ -170,6 +171,9 @@ def _prepare_vertex_colors(
                 raise ValueError(f"Unrecognized vertex_color shape {color_arr.shape}")
 
         color_arr = np.asarray(color_arr, dtype=np.float32).reshape(-1, 3)
+        if scalar_values is None:
+            scalar_values = color_arr[:, 0].astype(np.float32, copy=False)
+        raw_colors = color_arr
 
         if cmap is not None:
             scalar_vals = color_arr[:, 0]
@@ -195,7 +199,7 @@ def _prepare_vertex_colors(
         else:
             colors = color_arr
 
-    return colors, scalar_values, scalar_meta
+    return colors, raw_colors, scalar_values, scalar_meta
 
 
 def _filter_mesh_geometry(
@@ -237,26 +241,30 @@ def _encode_mesh_layer(
     verts: np.ndarray,
     tri: np.ndarray,
     colors: np.ndarray,
+    raw_colors: np.ndarray,
     scalar_meta: dict[str, Any] | None,
     scalar_values: np.ndarray | None,
 ) -> dict[str, Any]:
     if scalar_values is not None and scalar_values.shape[0] != verts.shape[0]:
         raise ValueError("scalar_values must match filtered vertex count")
 
-    if colors.size == 0:
-        colors_uint8 = np.zeros((0, 3), dtype=np.uint8)
-    else:
-        max_color = float(np.nanmax(colors))
+    def _to_uint8_rgb(arr: np.ndarray) -> np.ndarray:
+        if arr.size == 0:
+            return np.zeros((0, 3), dtype=np.uint8)
+        max_color = float(np.nanmax(arr))
         if max_color <= 1.0 + 1e-6:
-            colors_uint8 = np.clip(colors * 255.0, 0, 255).astype(np.uint8)
-        else:
-            colors_uint8 = np.clip(colors, 0, 255).astype(np.uint8)
+            return np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+        return np.clip(arr, 0, 255).astype(np.uint8)
+
+    colors_uint8 = _to_uint8_rgb(colors)
+    raw_colors_uint8 = _to_uint8_rgb(raw_colors)
 
     return {
         "label": label,
         "vertices": _encode_array_payload(verts, dtype=np.float32),
         "faces": _encode_array_payload(tri, dtype=np.uint32),
         "colors": _encode_array_payload(colors_uint8, dtype=np.uint8),
+        "raw_colors": _encode_array_payload(raw_colors_uint8, dtype=np.uint8),
         "vertex_count": int(verts.shape[0]),
         "face_count": int(tri.shape[0]),
         "scalar_meta": scalar_meta,
@@ -276,7 +284,7 @@ def _prepare_mesh_layer(
     label: str,
 ) -> dict[str, Any]:
     verts, raw_vertex_shape, tri, valid_vertices = _prepare_mesh_inputs(vertices, faces)
-    colors, scalar_values, scalar_meta = _prepare_vertex_colors(
+    colors, raw_colors, scalar_values, scalar_meta = _prepare_vertex_colors(
         vertex_color,
         raw_vertex_shape=raw_vertex_shape,
         vertex_count=verts.shape[0],
@@ -289,10 +297,12 @@ def _prepare_mesh_layer(
 
     if np.any(valid_mask):
         colors = colors[valid_mask]
+        raw_colors = raw_colors[valid_mask]
         if scalar_values is not None:
             scalar_values = scalar_values[valid_mask]
     else:
         colors = np.zeros((0, 3), dtype=np.float32)
+        raw_colors = np.zeros((0, 3), dtype=np.float32)
         scalar_values = np.zeros((0,), dtype=np.float32) if scalar_values is not None else None
 
     return _encode_mesh_layer(
@@ -300,6 +310,7 @@ def _prepare_mesh_layer(
         verts=verts,
         tri=tri,
         colors=colors,
+        raw_colors=raw_colors,
         scalar_meta=scalar_meta,
         scalar_values=scalar_values,
     )
@@ -951,6 +962,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
       layer.vertices = decodeArraySpec(layer.vertices, Float32Array) || new Float32Array(0);
       layer.faces = decodeArraySpec(layer.faces, Uint32Array) || new Uint32Array(0);
       layer.colors = decodeArraySpec(layer.colors, Uint8Array) || new Uint8Array(0);
+      layer.raw_colors = decodeArraySpec(layer.raw_colors, Uint8Array) || layer.colors;
       layer.values = decodeArraySpec(layer.values, Float32Array);
       layer.field_colors = Array.isArray(layer.field_colors)
         ? layer.field_colors.map((colors) => decodeArraySpec(colors, Uint8Array) || new Uint8Array(0))
@@ -1168,8 +1180,14 @@ class MeshViewerFigure(PointCloudViewerFigure):
       requestRender();
     }
 
+    const NO_CMAP = 'none';
+
     function getFallbackCmap() {
       return availableCmaps[0] || 'viridis';
+    }
+
+    function isNoCmap(cmapName) {
+      return !cmapName || cmapName === NO_CMAP;
     }
 
     function getColormapPreset(cmapName) {
@@ -1188,6 +1206,72 @@ class MeshViewerFigure(PointCloudViewerFigure):
     function getEntryDisplayedValues(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
       const fieldValues = entry.layer.field_values || null;
       return fieldValues ? fieldValues[fieldIdx] : entry.layer.values || null;
+    }
+
+    function computeFiniteValueRange(values) {
+      if (!values || typeof values.length !== 'number' || values.length === 0) return null;
+      let minVal = Infinity;
+      let maxVal = -Infinity;
+      for (let idx = 0; idx < values.length; idx += 1) {
+        const value = Number(values[idx]);
+        if (!Number.isFinite(value)) continue;
+        minVal = Math.min(minVal, value);
+        maxVal = Math.max(maxVal, value);
+      }
+      if (!Number.isFinite(minVal) || !Number.isFinite(maxVal)) return null;
+      return { min: minVal, max: maxVal };
+    }
+
+    function sampleRawGradientFromColors(colors, stepCount = 7) {
+      const flat = decodeArraySpec(colors, Uint8Array) || new Uint8Array(0);
+      const colorCount = Math.floor(flat.length / 3);
+      if (colorCount === 0) return null;
+      const gradient = [];
+      for (let idx = 0; idx < stepCount; idx += 1) {
+        const sampleIdx = stepCount <= 1 || colorCount <= 1
+          ? 0
+          : Math.round((idx * (colorCount - 1)) / (stepCount - 1));
+        gradient.push(`rgb(${flat[sampleIdx * 3]}, ${flat[sampleIdx * 3 + 1]}, ${flat[sampleIdx * 3 + 2]})`);
+      }
+      return gradient;
+    }
+
+    function buildRawScalarGradient(range, stepCount = 7) {
+      if (!range) return null;
+      const useUnitScale = range.max <= 1.0 + 1e-6;
+      const gradient = [];
+      for (let idx = 0; idx < stepCount; idx += 1) {
+        const t = stepCount <= 1 ? 0.0 : idx / (stepCount - 1);
+        const raw = range.min + (range.max - range.min) * t;
+        const intensity = useUnitScale ? raw * 255.0 : raw;
+        const clipped = Math.max(0, Math.min(255, Math.round(intensity)));
+        gradient.push(`rgb(${clipped}, ${clipped}, ${clipped})`);
+      }
+      return gradient;
+    }
+
+    function getEntryRawColors(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
+      const fieldColors = entry.layer.field_colors || null;
+      if (fieldColors && fieldIdx >= 0 && fieldIdx < fieldColors.length && fieldColors[fieldIdx]) {
+        return fieldColors[fieldIdx];
+      }
+      return entry.layer.raw_colors || entry.layer.colors || null;
+    }
+
+    function getEntryColorModeOptions(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
+      const options = [NO_CMAP];
+      const values = getEntryDisplayedValues(entry, fieldIdx);
+      if (values && typeof values.length === 'number') {
+        availableCmaps.forEach((cmapName) => options.push(cmapName));
+      }
+      return Array.from(new Set(options));
+    }
+
+    function getEntryRawGradient(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
+      const values = getEntryDisplayedValues(entry, fieldIdx);
+      const valueRange = computeFiniteValueRange(values);
+      if (valueRange) return buildRawScalarGradient(valueRange);
+      return sampleRawGradientFromColors(getEntryRawColors(entry, fieldIdx));
     }
 
     function buildDistributionSvg(values, meta) {
@@ -1260,11 +1344,13 @@ class MeshViewerFigure(PointCloudViewerFigure):
       return svg;
     }
 
-    function createCmapSwatch(cmapName) {
+    function createCmapSwatch(entry, fieldIdx, cmapName) {
       const swatch = document.createElement('span');
       swatch.className = 'cmap-swatch';
-      const preset = getColormapPreset(cmapName);
-      swatch.style.background = gradientCss(preset && preset.gradient ? preset.gradient : null);
+      const gradient = isNoCmap(cmapName)
+        ? getEntryRawGradient(entry, fieldIdx)
+        : (getColormapPreset(cmapName)?.gradient || null);
+      swatch.style.background = gradientCss(gradient);
       return swatch;
     }
 
@@ -1275,7 +1361,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
       prefix.textContent = 'Colormap:';
       const value = document.createElement('span');
       value.className = 'layer-id';
-      value.textContent = cmapName;
+      value.textContent = isNoCmap(cmapName) ? NO_CMAP : cmapName;
       button.appendChild(prefix);
       button.appendChild(value);
     }
@@ -1360,14 +1446,35 @@ class MeshViewerFigure(PointCloudViewerFigure):
     }
 
     function getEntryCmap(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
-      return entry.activeCmap || getFallbackCmap();
+      return entry.activeCmap || NO_CMAP;
     }
 
     function getScalarMeta(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
+      const values = getEntryDisplayedValues(entry, fieldIdx);
       const fieldMetas = entry.layer.field_scalar_meta || null;
       const baseMeta = fieldMetas ? fieldMetas[fieldIdx] : entry.layer.scalar_meta;
-      if (!baseMeta) return null;
       const cmapName = getEntryCmap(entry, fieldIdx);
+      if (isNoCmap(cmapName)) {
+        const range = computeFiniteValueRange(values);
+        const gradient = getEntryRawGradient(entry, fieldIdx);
+        if (!range && !gradient) return null;
+        return {
+          ...(range || {}),
+          cmap: NO_CMAP,
+          gradient,
+        };
+      }
+      if (!baseMeta) {
+        const range = computeFiniteValueRange(values);
+        if (!range) return null;
+        const preset = getColormapPreset(cmapName);
+        return {
+          min: range.min,
+          max: range.max,
+          cmap: cmapName,
+          gradient: (preset && preset.gradient) ? preset.gradient : null,
+        };
+      }
       const preset = getColormapPreset(cmapName);
       const resolved = {
         ...baseMeta,
@@ -1435,24 +1542,23 @@ class MeshViewerFigure(PointCloudViewerFigure):
 
     function renderEntryColors(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
       const fieldValues = entry.layer.field_values || null;
-      const fieldColors = entry.layer.field_colors || null;
       const values = fieldValues ? fieldValues[fieldIdx] : entry.layer.values || null;
+      const rawColors = getEntryRawColors(entry, fieldIdx);
+      const cmapName = getEntryCmap(entry, fieldIdx);
       const meta = getScalarMeta(entry, fieldIdx);
-      const updatedFromValues = values && meta ? applyColorsFromValues(entry, values, meta) : false;
+      const updatedFromValues = !isNoCmap(cmapName) && values && meta ? applyColorsFromValues(entry, values, meta) : false;
 
       if (updatedFromValues) {
         entry.mesh.geometry.attributes.color.needsUpdate = true;
-      } else if (fieldColors && fieldIdx >= 0 && fieldIdx < fieldColors.length) {
-        applyStoredColors(entry, fieldColors[fieldIdx]);
+      } else if (rawColors) {
+        applyStoredColors(entry, rawColors);
       } else {
         applyStoredColors(entry, entry.layer.colors);
       }
 
       entry.activeFieldIdx = fieldIdx;
       entry.activeValues = values;
-      if (!fieldValues) {
-        entry.activeCmap = meta ? meta.cmap : entry.activeCmap;
-      }
+      entry.activeCmap = cmapName;
       requestRenderAndHover();
     }
 
@@ -1533,21 +1639,21 @@ class MeshViewerFigure(PointCloudViewerFigure):
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'layer-select-button cmap-dropdown-button';
-        const currentCmap = meta.cmap || getFallbackCmap();
+        const currentCmap = getEntryCmap(entry, fieldIdx);
         setCmapButtonContent(button, currentCmap);
         const menu = document.createElement('div');
         menu.className = 'custom-dropdown-menu';
-        availableCmaps.forEach((cmapName) => {
+        getEntryColorModeOptions(entry, fieldIdx).forEach((cmapName) => {
           const item = document.createElement('div');
           item.className = 'custom-dropdown-item cmap-dropdown-item';
           if (cmapName === currentCmap) item.classList.add('selected');
           const prefix = document.createElement('span');
           prefix.className = 'cmap-dropdown-prefix';
-          prefix.appendChild(createCmapSwatch(cmapName));
+          prefix.appendChild(createCmapSwatch(entry, fieldIdx, cmapName));
           item.appendChild(prefix);
           const value = document.createElement('span');
           value.className = 'layer-id';
-          value.textContent = cmapName;
+          value.textContent = isNoCmap(cmapName) ? NO_CMAP : cmapName;
           item.appendChild(value);
           item.addEventListener('click', () => {
             setLayerCmap(entry, cmapName);
@@ -1569,9 +1675,6 @@ class MeshViewerFigure(PointCloudViewerFigure):
         const gradient = document.createElement('div');
         gradient.className = 'colorbar-gradient';
         gradient.style.background = gradientCss(meta.gradient);
-        const range = document.createElement('div');
-        range.className = 'colorbar-range';
-        range.innerHTML = `<span>${meta.min.toFixed(4)}</span><span>${meta.max.toFixed(4)}</span>`;
         dropdown.appendChild(button);
         dropdown.appendChild(menu);
         dropdownWrap.appendChild(dropdown);
@@ -1582,7 +1685,12 @@ class MeshViewerFigure(PointCloudViewerFigure):
         }
         visual.appendChild(gradient);
         wrapper.appendChild(visual);
-        wrapper.appendChild(range);
+        if (Number.isFinite(meta.min) && Number.isFinite(meta.max)) {
+          const range = document.createElement('div');
+          range.className = 'colorbar-range';
+          range.innerHTML = `<span>${meta.min.toFixed(4)}</span><span>${meta.max.toFixed(4)}</span>`;
+          wrapper.appendChild(range);
+        }
         container.appendChild(wrapper);
       }
     }
@@ -1886,8 +1994,15 @@ class MeshViewerFigure(PointCloudViewerFigure):
       const built = buildMesh(layer);
       const fieldMetas = layer.field_scalar_meta || null;
       const fieldValues = layer.field_values || null;
-      const fieldCmaps = fieldMetas
-        ? fieldMetas.map((meta) => (meta && meta.cmap) ? meta.cmap : getFallbackCmap())
+      const fieldColorCount = Array.isArray(layer.field_colors) ? layer.field_colors.length : 0;
+      const fieldCount = Math.max(
+        Array.isArray(layer.field_names) ? layer.field_names.length : 0,
+        Array.isArray(fieldValues) ? fieldValues.length : 0,
+        Array.isArray(fieldMetas) ? fieldMetas.length : 0,
+        fieldColorCount,
+      );
+      const fieldCmaps = fieldCount > 0
+        ? Array.from({ length: fieldCount }, (_value, idx) => ((fieldMetas && fieldMetas[idx] && fieldMetas[idx].cmap) ? fieldMetas[idx].cmap : NO_CMAP))
         : null;
       const entry = {
         layer,
@@ -1896,7 +2011,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
         visible: layer.visible !== false,
         activeFieldIdx: Number.isInteger(layer.active_field_idx) ? layer.active_field_idx : 0,
         activeValues: layer.values || null,
-        activeCmap: layer.scalar_meta && layer.scalar_meta.cmap ? layer.scalar_meta.cmap : getFallbackCmap(),
+        activeCmap: layer.scalar_meta && layer.scalar_meta.cmap ? layer.scalar_meta.cmap : NO_CMAP,
         fieldCmaps,
       };
       entry.mesh.visible = entry.visible;
@@ -2047,7 +2162,7 @@ def plot_mesh_viewer(
         base_valid_mask: np.ndarray | None = None
 
         for field_name, field_values in scalar_fields.items():
-            colors, scalar_values, scalar_meta = _prepare_vertex_colors(
+            colors, raw_colors, scalar_values, scalar_meta = _prepare_vertex_colors(
                 field_values,
                 raw_vertex_shape=raw_vertex_shape,
                 vertex_count=verts.shape[0],
@@ -2065,7 +2180,7 @@ def plot_mesh_viewer(
                     "Ensure all scalar fields are finite on the same vertices."
                 )
 
-            prepared_fields.append((field_name, colors, scalar_values, scalar_meta))
+            prepared_fields.append((field_name, colors, raw_colors, scalar_values, scalar_meta))
 
         if base_valid_mask is None or base_field_name is None:
             raise ValueError("scalar_fields cannot be empty")
@@ -2074,8 +2189,9 @@ def plot_mesh_viewer(
         encoded_fields: list[tuple[str, dict[str, Any]]] = []
         has_valid_vertices = bool(np.any(base_valid_mask))
 
-        for field_name, colors, scalar_values, scalar_meta in prepared_fields:
+        for field_name, colors, raw_colors, scalar_values, scalar_meta in prepared_fields:
             filtered_colors = colors[base_valid_mask] if has_valid_vertices else np.zeros((0, 3), dtype=np.float32)
+            filtered_raw_colors = raw_colors[base_valid_mask] if has_valid_vertices else np.zeros((0, 3), dtype=np.float32)
             if scalar_values is None:
                 filtered_values = None
             elif has_valid_vertices:
@@ -2091,6 +2207,7 @@ def plot_mesh_viewer(
                         verts=filtered_verts,
                         tri=filtered_faces,
                         colors=filtered_colors,
+                        raw_colors=filtered_raw_colors,
                         scalar_meta=scalar_meta,
                         scalar_values=filtered_values,
                     ),
@@ -2104,16 +2221,12 @@ def plot_mesh_viewer(
             "vertices": base_layer["vertices"],
             "faces": base_layer["faces"],
             "colors": base_layer["colors"],
+            "raw_colors": base_layer["raw_colors"],
             "vertex_count": base_layer["vertex_count"],
             "face_count": base_layer["face_count"],
             "values": base_layer["values"],
             "field_names": [name for name, _ in encoded_fields],
-            "field_colors": [
-                None
-                if layer_data["values"] is not None and layer_data["scalar_meta"] is not None
-                else layer_data["colors"]
-                for _, layer_data in encoded_fields
-            ],
+            "field_colors": [layer_data["raw_colors"] for _, layer_data in encoded_fields],
             "field_values": [layer_data["values"] for _, layer_data in encoded_fields],
             "field_scalar_meta": [layer_data["scalar_meta"] for _, layer_data in encoded_fields],
             "active_field_idx": 0,
