@@ -889,7 +889,6 @@ class PointCloudViewerFigure:
     let isDayMode = false;
     let commandsVisible = true;
     let shareFieldScale = Boolean(payload.initial_share_field_scale);
-
     const vertexShader = `
       attribute vec3 color;
       varying vec3 vColor;
@@ -1578,6 +1577,7 @@ class PointCloudViewerFigure:
           if (entry.objects.lines) entry.objects.lines.visible = entry.visible;
           updateColorbars();
           updateInfoPanel();
+          requestRenderAndHover();
         }});
         const info = document.createElement('div');
         const label = document.createElement('div');
@@ -2063,6 +2063,7 @@ class PointCloudViewerFigure:
         self,
         *,
         inline: bool | None = None,
+        in_browser: bool | None = None,
         open_browser: bool | None = None,
         notebook_proxy: bool | str | None = None,
         width: int | str = "100%",
@@ -2080,15 +2081,26 @@ class PointCloudViewerFigure:
         except Exception:
             shell = None
 
-        if inline is None:
-            inline = shell is not None
-        if open_browser is None:
-            open_browser = not inline
+        if open_browser is not None:
+            if in_browser is not None and bool(in_browser) != bool(open_browser):
+                raise ValueError("in_browser and open_browser must match when both are provided")
+            in_browser = open_browser
+
+        if inline is None and in_browser is None:
+            inline = False
+            in_browser = True
+        elif inline is None:
+            inline = not bool(in_browser)
+        elif in_browser is None:
+            in_browser = not bool(inline)
+
+        inline = bool(inline)
+        in_browser = bool(in_browser)
 
         if inline and shell is None:
             raise RuntimeError("inline=True requires an IPython notebook environment")
-        if inline and open_browser:
-            raise ValueError("inline=True and open_browser=True are mutually exclusive")
+        if inline and in_browser:
+            raise ValueError("inline=True and in_browser=True are mutually exclusive")
 
         if inline:
             from IPython.display import HTML, display
@@ -2101,7 +2113,7 @@ class PointCloudViewerFigure:
 
         url = self._serve(host=host, port=port, path=path)
 
-        if open_browser:
+        if in_browser:
             webbrowser.open(url, new=2)
 
         if block and self._server_thread is not None:
