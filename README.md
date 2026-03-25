@@ -7,7 +7,7 @@ Browser-based, notebook compatible, interactive 3D/mesh plotting utils.
 ```python
 import numpy as np
 
-from pointcloud_viewer import plot_pointcloud_viewer
+from pointcloud_viewer import plot_pointcloud
 
 # Build a noisy sphere point cloud.
 n = 5000
@@ -26,11 +26,10 @@ scalar_fields = {
     "radius": np.linalg.norm(points, axis=1),
 }
 
-fig = plot_pointcloud_viewer(
+fig = plot_pointcloud(
     points,
     scalar_fields=scalar_fields,
     cmap="viridis",
-    show_colorbar=True,
     title="Noisy Sphere",
     label="Sphere cloud",
 )
@@ -48,7 +47,7 @@ fig.show(inline=True)
 ```python
 import numpy as np
 
-from mesh_viewer import plot_mesh_viewer
+from mesh_viewer import plot_mesh
 
 # Cube vertices.
 vertices = np.array(
@@ -84,12 +83,11 @@ scalar_fields = {
     "radius": np.linalg.norm(vertices, axis=1),
 }
 
-fig = plot_mesh_viewer(
+fig = plot_mesh(
     vertices,
     faces,
     scalar_fields=scalar_fields,
     cmap="plasma",
-    show_colorbar=True,
     title="Cube Mesh",
     label="Cube",
 )

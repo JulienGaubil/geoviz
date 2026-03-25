@@ -40,6 +40,18 @@ def _sample_cmap_rgb(cmap: str, n: int = 64) -> list[list[int]]:
     return np.clip(np.round(rgb * 255.0), 0, 255).astype(np.uint8).tolist()
 
 
+def _raw_scalar_gradient(min_val: float, max_val: float, n: int = 7) -> list[str]:
+    use_unit_scale = max_val <= 1.0 + 1e-6
+    gradient: list[str] = []
+    for idx in range(n):
+        t = 0.0 if n <= 1 else idx / (n - 1)
+        raw = min_val + (max_val - min_val) * t
+        intensity = raw * 255.0 if use_unit_scale else raw
+        clipped = int(np.clip(np.round(intensity), 0, 255))
+        gradient.append(f"rgb({clipped}, {clipped}, {clipped})")
+    return gradient
+
+
 def _available_cmaps(preferred: str | None = None) -> list[str]:
     options: list[str] = []
     if preferred is not None:
@@ -115,7 +127,6 @@ def _prepare_layer(
     edges: np.ndarray | torch.Tensor | None,
     point_color: np.ndarray | torch.Tensor | str,
     downsampling_factor: int,
-    show_colorbar: bool,
     cmap: str | None,
     label: str,
 ) -> dict[str, Any]:
@@ -167,26 +178,30 @@ def _prepare_layer(
             scalar_values = color_arr[:, 0].astype(np.float32, copy=False)
         raw_colors = color_arr
 
+        scalar_vals = scalar_values.astype(np.float32, copy=False)
+        finite_scalar = np.isfinite(scalar_vals)
+        if np.any(finite_scalar):
+            finite_vals = scalar_vals[finite_scalar]
+            min_val = float(np.min(finite_vals))
+            max_val = float(np.max(finite_vals))
+        else:
+            min_val, max_val = 0.0, 1.0
+        scalar_meta = {
+            "min": min_val,
+            "max": max_val,
+            "cmap": cmap,
+            "gradient": _sample_cmap(cmap) if cmap is not None else _raw_scalar_gradient(min_val, max_val),
+        }
+
         if cmap is not None:
-            scalar_vals = color_arr[:, 0]
-            scalar_values = scalar_vals.astype(np.float32, copy=False)
             finite_scalar = np.isfinite(scalar_vals)
             if np.any(finite_scalar):
                 finite_vals = scalar_vals[finite_scalar]
                 min_val = float(np.min(finite_vals))
                 max_val = float(np.max(finite_vals))
-            else:
-                min_val, max_val = 0.0, 1.0
             norm = (scalar_vals - min_val) / max(max_val - min_val, 1e-8)
             norm = np.nan_to_num(norm, nan=0.0, posinf=1.0, neginf=0.0)
             colors = plt.get_cmap(cmap)(norm)[:, :3].astype(np.float32)
-            if show_colorbar:
-                scalar_meta = {
-                    "min": min_val,
-                    "max": max_val,
-                    "cmap": cmap,
-                    "gradient": _sample_cmap(cmap),
-                }
         else:
             colors = color_arr
 
@@ -269,7 +284,6 @@ class PointCloudViewerFigure:
         edges: np.ndarray | torch.Tensor | None = None,
         point_color: np.ndarray | torch.Tensor | str = "blue",
         downsampling_factor: int = 1,
-        show_colorbar: bool = False,
         cmap: str | None = None,
         title: str | None = None,
         label: str = "Points",
@@ -280,7 +294,6 @@ class PointCloudViewerFigure:
                 edges=edges,
                 point_color=point_color,
                 downsampling_factor=downsampling_factor,
-                show_colorbar=show_colorbar,
                 cmap=cmap,
                 label=label,
             )
@@ -809,7 +822,7 @@ class PointCloudViewerFigure:
     </div>
     <div class="section">
       <div class="section-title">Fields</div>
-      <div class="control">
+      <div id="share-field-scale-control" class="control">
         <label><input id="share-field-scale" type="checkbox"> Share field colormap scale</label>
       </div>
       <div id="colorbars"></div>
@@ -941,22 +954,6 @@ class PointCloudViewerFigure:
       return metas;
     }}
 
-    const sharedFieldScaleRange = (() => {{
-      let minVal = Infinity;
-      let maxVal = -Infinity;
-      payload.layers.forEach((layer) => {{
-        collectScalarMetas(layer).forEach((meta) => {{
-          const metaMin = Number(meta && meta.min);
-          const metaMax = Number(meta && meta.max);
-          if (!Number.isFinite(metaMin) || !Number.isFinite(metaMax)) return;
-          minVal = Math.min(minVal, metaMin);
-          maxVal = Math.max(maxVal, metaMax);
-        }});
-      }});
-      if (!Number.isFinite(minVal) || !Number.isFinite(maxVal)) return null;
-      return {{ min: minVal, max: maxVal }};
-    }})();
-
     const NO_CMAP = 'none';
 
     function getFallbackCmap() {{
@@ -978,6 +975,11 @@ class PointCloudViewerFigure:
         return 'linear-gradient(90deg, #64748b, #e2e8f0)';
       }}
       return `linear-gradient(90deg, ${{gradient.join(', ')}})`;
+    }}
+
+    function getEntryDisplayedValues(entry, fieldIdx = entry.activeFieldIdx ?? 0) {{
+      const fieldValues = entry.layer.field_values || null;
+      return fieldValues ? fieldValues[fieldIdx] : entry.layer.values || null;
     }}
 
     function computeFiniteValueRange(values) {{
@@ -1237,39 +1239,101 @@ class PointCloudViewerFigure:
       return entry.activeCmap || NO_CMAP;
     }}
 
+    function getEntryScaleRange(entry, fieldIdx = entry.activeFieldIdx ?? 0) {{
+      const values = getEntryDisplayedValues(entry, fieldIdx);
+      const fieldMetas = entry.layer.field_scalar_meta || null;
+      const baseMeta = fieldMetas ? fieldMetas[fieldIdx] : entry.layer.scalar_meta;
+      const metaMin = Number(baseMeta && baseMeta.min);
+      const metaMax = Number(baseMeta && baseMeta.max);
+      if (Number.isFinite(metaMin) && Number.isFinite(metaMax)) {{
+        return {{ min: metaMin, max: metaMax }};
+      }}
+      return computeFiniteValueRange(values);
+    }}
+
+    function getEntryAllScaleRanges(entry) {{
+      const ranges = [];
+      const fieldValues = entry.layer.field_values || null;
+      const fieldMetas = entry.layer.field_scalar_meta || null;
+      if (fieldValues && fieldValues.length > 0) {{
+        for (let fieldIdx = 0; fieldIdx < fieldValues.length; fieldIdx += 1) {{
+          const values = fieldValues[fieldIdx];
+          const meta = fieldMetas ? fieldMetas[fieldIdx] : null;
+          const metaMin = Number(meta && meta.min);
+          const metaMax = Number(meta && meta.max);
+          if (Number.isFinite(metaMin) && Number.isFinite(metaMax)) {{
+            ranges.push({{ min: metaMin, max: metaMax }});
+            continue;
+          }}
+          const range = computeFiniteValueRange(values);
+          if (range) ranges.push(range);
+        }}
+        return ranges;
+      }}
+      const range = getEntryScaleRange(entry);
+      return range ? [range] : [];
+    }}
+
+    function getSharedFieldScaleRange() {{
+      let minVal = Infinity;
+      let maxVal = -Infinity;
+      for (const entry of layers) {{
+        if (!entry.visible || isNoCmap(getEntryCmap(entry))) continue;
+        for (const range of getEntryAllScaleRanges(entry)) {{
+          minVal = Math.min(minVal, range.min);
+          maxVal = Math.max(maxVal, range.max);
+        }}
+      }}
+      if (!Number.isFinite(minVal) || !Number.isFinite(maxVal)) return null;
+      return {{ min: minVal, max: maxVal }};
+    }}
+
+    function hasVisibleColormapSelection() {{
+      return layers.some((entry) => entry.visible && !isNoCmap(getEntryCmap(entry)));
+    }}
+
+    function updateShareFieldScaleControl() {{
+      const control = document.getElementById('share-field-scale-control');
+      const input = document.getElementById('share-field-scale');
+      if (!control || !input) return;
+      const sharedFieldScaleRange = getSharedFieldScaleRange();
+      control.style.display = hasVisibleColormapSelection() ? '' : 'none';
+      input.checked = shareFieldScale;
+      input.disabled = !sharedFieldScaleRange;
+    }}
+
     function getScalarMeta(entry, fieldIdx = entry.activeFieldIdx ?? 0) {{
       const values = getEntryDisplayedValues(entry, fieldIdx);
       const fieldMetas = entry.layer.field_scalar_meta || null;
       const baseMeta = fieldMetas ? fieldMetas[fieldIdx] : entry.layer.scalar_meta;
       const cmapName = getEntryCmap(entry, fieldIdx);
-      if (isNoCmap(cmapName)) {{
-        const range = computeFiniteValueRange(values);
-        const gradient = getEntryRawGradient(entry, fieldIdx);
-        if (!range && !gradient) return null;
-        return {{
-          ...(range || {{}}),
-          cmap: NO_CMAP,
-          gradient,
-        }};
-      }}
       if (!baseMeta) {{
         const range = computeFiniteValueRange(values);
         if (!range) return null;
-        const preset = getColormapPreset(cmapName);
-        return {{
+        const resolved = {{
           min: range.min,
           max: range.max,
           cmap: cmapName,
-          gradient: preset && preset.gradient ? preset.gradient : null,
+          gradient: isNoCmap(cmapName)
+            ? getEntryRawGradient(entry, fieldIdx)
+            : (getColormapPreset(cmapName)?.gradient || null),
         }};
+        const sharedFieldScaleRange = getSharedFieldScaleRange();
+        if (!isNoCmap(cmapName) && shareFieldScale && sharedFieldScaleRange) {{
+          resolved.min = sharedFieldScaleRange.min;
+          resolved.max = sharedFieldScaleRange.max;
+        }}
+        return resolved;
       }}
-      const preset = getColormapPreset(cmapName);
       const resolved = {{
         ...baseMeta,
         cmap: cmapName,
-        gradient: (preset && preset.gradient) ? preset.gradient : baseMeta.gradient,
+        gradient: isNoCmap(cmapName)
+          ? (baseMeta.gradient || getEntryRawGradient(entry, fieldIdx))
+          : (getColormapPreset(cmapName)?.gradient || baseMeta.gradient),
       }};
-      if (shareFieldScale && sharedFieldScaleRange) {{
+      const sharedFieldScaleRange = getSharedFieldScaleRange();
+      if (!isNoCmap(cmapName) && shareFieldScale && sharedFieldScaleRange) {{
         resolved.min = sharedFieldScaleRange.min;
         resolved.max = sharedFieldScaleRange.max;
       }}
@@ -1401,6 +1465,7 @@ class PointCloudViewerFigure:
     function updateColorbars() {{
       const container = document.getElementById('colorbars');
       container.innerHTML = '';
+      updateShareFieldScaleControl();
       for (const entry of layers) {{
         if (!entry.visible) continue;
         const fieldIdx = entry.activeFieldIdx ?? 0;
@@ -1853,7 +1918,7 @@ class PointCloudViewerFigure:
     const shareFieldScaleInput = document.getElementById('share-field-scale');
     if (shareFieldScaleInput) {{
       shareFieldScaleInput.checked = shareFieldScale;
-      shareFieldScaleInput.disabled = !sharedFieldScaleRange;
+      shareFieldScaleInput.disabled = !getSharedFieldScaleRange();
       shareFieldScaleInput.addEventListener('change', () => {{
         setShareFieldScale(shareFieldScaleInput.checked);
       }});
@@ -2057,14 +2122,13 @@ class PointCloudViewerFigure:
         return url
 
 
-def plot_pointcloud_viewer(
+def plot_pointcloud(
     points: np.ndarray | torch.Tensor,
     edges: np.ndarray | torch.Tensor | None = None,
     init_fig: PointCloudViewerFigure | None = None,
     point_color: np.ndarray | torch.Tensor | str = "blue",
     scalar_fields: Mapping[str, np.ndarray | torch.Tensor] | None = None,
     downsampling_factor: int = 1,
-    show_colorbar: bool = False,
     cmap: str | None = None,
     title: str | None = None,
     label: str = "Points",
@@ -2084,7 +2148,6 @@ def plot_pointcloud_viewer(
                         edges=edges,
                         point_color=field_values,
                         downsampling_factor=downsampling_factor,
-                        show_colorbar=show_colorbar,
                         cmap=cmap,
                         label=label,
                     ),
@@ -2131,7 +2194,6 @@ def plot_pointcloud_viewer(
         edges=edges,
         point_color=point_color,
         downsampling_factor=downsampling_factor,
-        show_colorbar=show_colorbar,
         cmap=cmap,
         title=title,
         label=label,
