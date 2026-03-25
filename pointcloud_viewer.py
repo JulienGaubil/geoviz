@@ -273,6 +273,7 @@ class PointCloudViewerFigure:
     layers: list[dict[str, Any]] = field(default_factory=list)
     title: str | None = None
     point_size: float = 5.0
+    share_colormap_scale: bool = False
     _server: ThreadingHTTPServer | None = field(default=None, init=False, repr=False)
     _server_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _served_html_path: Path | None = field(default=None, init=False, repr=False)
@@ -311,6 +312,7 @@ class PointCloudViewerFigure:
         return {
             "title": self.title or "Point Cloud Viewer",
             "point_size": self.point_size,
+            "initial_share_field_scale": self.share_colormap_scale,
             "layers": self.layers,
             "available_cmaps": cmap_names,
             "colormap_presets": _colormap_catalog(cmap_names),
@@ -886,7 +888,7 @@ class PointCloudViewerFigure:
     const dropdownPortal = document.getElementById('dropdown-portal');
     let isDayMode = false;
     let commandsVisible = true;
-    let shareFieldScale = false;
+    let shareFieldScale = Boolean(payload.initial_share_field_scale);
 
     const vertexShader = `
       attribute vec3 color;
@@ -2129,11 +2131,17 @@ def plot_pointcloud(
     point_color: np.ndarray | torch.Tensor | str = "blue",
     scalar_fields: Mapping[str, np.ndarray | torch.Tensor] | None = None,
     downsampling_factor: int = 1,
+    point_size: float | None = None,
+    share_colormap_scale: bool | None = None,
     cmap: str | None = None,
     title: str | None = None,
     label: str = "Points",
 ) -> PointCloudViewerFigure:
     fig = init_fig if init_fig is not None else PointCloudViewerFigure()
+    if point_size is not None:
+        fig.point_size = float(point_size)
+    if share_colormap_scale is not None:
+        fig.share_colormap_scale = bool(share_colormap_scale)
     if scalar_fields is not None:
         if len(scalar_fields) == 0:
             raise ValueError("scalar_fields cannot be empty")

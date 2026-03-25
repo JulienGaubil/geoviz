@@ -329,8 +329,9 @@ class MeshViewerFigure(PointCloudViewerFigure):
         *,
         title: str | None = None,
         mesh_opacity: float = 1.0,
+        share_colormap_scale: bool = False,
     ) -> None:
-        super().__init__(title=title, point_size=1.0)
+        super().__init__(title=title, point_size=1.0, share_colormap_scale=share_colormap_scale)
         self.mesh_opacity = float(np.clip(mesh_opacity, 0.05, 1.0))
 
     def add_mesh(
@@ -364,6 +365,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
         return {
             "title": self.title or "Mesh Viewer",
             "mesh_opacity": self.mesh_opacity,
+            "initial_share_field_scale": self.share_colormap_scale,
             "layers": self.layers,
             "available_cmaps": cmap_names,
             "colormap_presets": _colormap_catalog(cmap_names),
@@ -1029,7 +1031,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
     const layers = [];
     let isDayMode = false;
     let commandsVisible = true;
-    let shareFieldScale = false;
+    let shareFieldScale = Boolean(payload.initial_share_field_scale);
     const raycaster = new THREE.Raycaster();
     raycaster.firstHitOnly = true;
     const pointerNdc = new THREE.Vector2();
@@ -2068,6 +2070,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
       };
       entry.mesh.visible = entry.visible;
       if (entry.edgeLines) entry.edgeLines.visible = false;
+      layers.push(entry);
 
       const fieldNames = layer.field_names || null;
       if (fieldNames && fieldNames.length > 0) {
@@ -2075,8 +2078,6 @@ class MeshViewerFigure(PointCloudViewerFigure):
       } else if (fieldValues || layer.values) {
         renderEntryColors(entry, entry.activeFieldIdx);
       }
-
-      layers.push(entry);
     });
 
     const opacityInput = document.getElementById('mesh-opacity');
@@ -2197,11 +2198,14 @@ def plot_mesh(
     init_fig: MeshViewerFigure | None = None,
     vertex_color: np.ndarray | torch.Tensor | str = "#94a3b8",
     scalar_fields: Mapping[str, np.ndarray | torch.Tensor] | None = None,
+    share_colormap_scale: bool | None = None,
     cmap: str | None = None,
     title: str | None = None,
     label: str = "Mesh",
 ) -> MeshViewerFigure:
     fig = init_fig if init_fig is not None else MeshViewerFigure()
+    if share_colormap_scale is not None:
+        fig.share_colormap_scale = bool(share_colormap_scale)
 
     if scalar_fields is not None:
         if len(scalar_fields) == 0:
