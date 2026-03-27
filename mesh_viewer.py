@@ -253,6 +253,7 @@ def _encode_mesh_layer(
     raw_colors: np.ndarray,
     scalar_meta: dict[str, Any] | None,
     scalar_values: np.ndarray | None,
+    visible: bool,
 ) -> dict[str, Any]:
     if scalar_values is not None and scalar_values.shape[0] != verts.shape[0]:
         raise ValueError("scalar_values must match filtered vertex count")
@@ -280,7 +281,7 @@ def _encode_mesh_layer(
         "values": None
         if scalar_values is None
         else _encode_array_payload(scalar_values, dtype=np.float32),
-        "visible": True,
+        "visible": bool(visible),
     }
 
 
@@ -290,6 +291,7 @@ def _prepare_mesh_layer(
     vertex_color: np.ndarray | torch.Tensor | str,
     cmap: str | None,
     label: str,
+    visible: bool,
 ) -> dict[str, Any]:
     verts, raw_vertex_shape, tri, valid_vertices = _prepare_mesh_inputs(vertices, faces)
     colors, raw_colors, scalar_values, scalar_meta = _prepare_vertex_colors(
@@ -320,6 +322,7 @@ def _prepare_mesh_layer(
         raw_colors=raw_colors,
         scalar_meta=scalar_meta,
         scalar_values=scalar_values,
+        visible=visible,
     )
 
 
@@ -342,6 +345,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
         cmap: str | None = None,
         title: str | None = None,
         label: str = "Mesh",
+        visible: bool = True,
     ) -> "MeshViewerFigure":
         self.layers.append(
             _prepare_mesh_layer(
@@ -350,6 +354,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
                 vertex_color=vertex_color,
                 cmap=cmap,
                 label=label,
+                visible=visible,
             )
         )
         if title is not None:
@@ -504,7 +509,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
     }
     .layer-row {
       display: grid;
-      grid-template-columns: 20px 1fr;
+      grid-template-columns: 20px minmax(0, 1fr);
       gap: 8px;
       align-items: start;
       margin-bottom: 10px;
@@ -526,9 +531,48 @@ class MeshViewerFigure(PointCloudViewerFigure):
       position: relative;
       margin-top: 6px;
     }
+    .layer-field-controls {
+      grid-column: 1 / -1;
+      margin-top: 8px;
+    }
+    .field-select-inline {
+      display: grid;
+      grid-template-columns: 40px minmax(0, 1fr) 40px;
+      gap: 6px;
+      align-items: center;
+      width: 100%;
+    }
     .custom-dropdown {
       position: relative;
       width: 100%;
+      min-width: 0;
+    }
+    .field-nav-button {
+      width: 40px;
+      min-width: 40px;
+      height: 36px;
+      padding: 0;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      font-weight: 500;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text-primary);
+      cursor: pointer;
+      transition: all 0.2s;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      line-height: 1;
+    }
+    .field-nav-button:hover {
+      background: rgba(99, 102, 241, 0.15);
+      border-color: var(--accent-primary);
+    }
+    .field-nav-button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
     }
     .layer-select-button {
       width: 100%;
@@ -549,6 +593,8 @@ class MeshViewerFigure(PointCloudViewerFigure):
       display: flex;
       align-items: center;
       gap: 8px;
+      min-width: 0;
+      overflow: hidden;
       background-image: url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2322d3ee' d='M6 9L1 4h10z'/%3E%3C/svg%3E\");
       background-repeat: no-repeat;
       background-position: right 8px center;
@@ -557,6 +603,10 @@ class MeshViewerFigure(PointCloudViewerFigure):
     .layer-select-button .layer-id {
       flex: 1;
       text-align: center;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .layer-select-button:hover {
       background: rgba(99, 102, 241, 0.15);
@@ -616,6 +666,10 @@ class MeshViewerFigure(PointCloudViewerFigure):
     .custom-dropdown-item .layer-id {
       flex: 1;
       text-align: center;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .custom-dropdown-item:last-child {
       border-bottom: none;
@@ -726,6 +780,9 @@ class MeshViewerFigure(PointCloudViewerFigure):
       letter-spacing: 0.2px;
       flex: 0 0 72px;
     }
+    .field-dropdown-label {
+      flex: 0 0 auto;
+    }
     .cmap-swatch {
       width: 30px;
       height: 10px;
@@ -747,9 +804,14 @@ class MeshViewerFigure(PointCloudViewerFigure):
       justify-content: flex-start;
     }
     .colorbar-visual {
-      position: relative;
-      height: 44px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
       margin-bottom: 6px;
+    }
+    .colorbar-distribution-wrap {
+      position: relative;
+      height: 32px;
     }
     .colorbar-distribution {
       position: absolute;
@@ -770,12 +832,19 @@ class MeshViewerFigure(PointCloudViewerFigure):
       stroke-linejoin: round;
       vector-effect: non-scaling-stroke;
     }
+    .colorbar-distribution-fill.faded {
+      opacity: 0.07;
+    }
+    .colorbar-distribution-line.faded {
+      opacity: 0.28;
+    }
+    .colorbar-gradient-wrap {
+      position: relative;
+      height: 12px;
+    }
     .colorbar-gradient {
       position: absolute;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      height: 12px;
+      inset: 0;
       border-radius: 999px;
       box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
     }
@@ -783,6 +852,68 @@ class MeshViewerFigure(PointCloudViewerFigure):
       display: flex;
       justify-content: space-between;
       font-size: 11px;
+    }
+    .colorbar-clip {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+    .colorbar-clip-slider {
+      position: relative;
+      height: 14px;
+    }
+    .colorbar-clip-track,
+    .colorbar-clip-fill {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 50%;
+      height: 6px;
+      border-radius: 3px;
+      transform: translateY(-50%);
+    }
+    .colorbar-clip-track {
+      background: rgba(255, 255, 255, 0.08);
+    }
+    .colorbar-clip-fill {
+      left: 0;
+      right: auto;
+      width: 100%;
+      background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
+      opacity: 0.8;
+    }
+    .colorbar-clip-slider input[type="range"] {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      margin: 0;
+      background: none;
+      opacity: 1;
+      pointer-events: none;
+      z-index: 1;
+    }
+    .colorbar-clip-slider input[type="range"]::-webkit-slider-runnable-track {
+      height: 6px;
+      background: transparent;
+      border: none;
+    }
+    .colorbar-clip-slider input[type="range"]::-moz-range-track {
+      height: 6px;
+      background: transparent;
+      border: none;
+    }
+    .colorbar-clip-slider input[type="range"]::-moz-range-progress {
+      background: transparent;
+    }
+    .colorbar-clip-slider input[type="range"]::-webkit-slider-thumb {
+      pointer-events: auto;
+      width: 14px;
+      height: 14px;
+    }
+    .colorbar-clip-slider input[type="range"]::-moz-range-thumb {
+      pointer-events: auto;
+      width: 14px;
+      height: 14px;
     }
     #info-panel {
       position: fixed;
@@ -1032,6 +1163,8 @@ class MeshViewerFigure(PointCloudViewerFigure):
     let isDayMode = false;
     let commandsVisible = true;
     let shareFieldScale = Boolean(payload.initial_share_field_scale);
+    const CLIP_SLIDER_MAX = 1000;
+    let sharedFieldClip = { minFrac: 0.0, maxFrac: 1.0 };
     const raycaster = new THREE.Raycaster();
     raycaster.firstHitOnly = true;
     const pointerNdc = new THREE.Vector2();
@@ -1067,6 +1200,101 @@ class MeshViewerFigure(PointCloudViewerFigure):
     function requestRenderAndHover() {
       requestRender();
       scheduleHoverRefresh();
+    }
+
+    function clampUnit(value, fallback = 0.0) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return fallback;
+      return Math.min(1.0, Math.max(0.0, numeric));
+    }
+
+    function createClipState(minFrac = 0.0, maxFrac = 1.0) {
+      const start = clampUnit(minFrac, 0.0);
+      const end = clampUnit(maxFrac, 1.0);
+      return {
+        minFrac: Math.min(start, end),
+        maxFrac: Math.max(start, end),
+      };
+    }
+
+    function getEntryFieldCount(entry) {
+      return Math.max(
+        Array.isArray(entry.layer.field_names) ? entry.layer.field_names.length : 0,
+        Array.isArray(entry.layer.field_values) ? entry.layer.field_values.length : 0,
+        Array.isArray(entry.layer.field_scalar_meta) ? entry.layer.field_scalar_meta.length : 0,
+        Array.isArray(entry.layer.field_colors) ? entry.layer.field_colors.length : 0,
+        1,
+      );
+    }
+
+    function ensureFieldClipStates(entry) {
+      const fieldCount = getEntryFieldCount(entry);
+      if (!Array.isArray(entry.fieldClipStates)) {
+        entry.fieldClipStates = [];
+      }
+      while (entry.fieldClipStates.length < fieldCount) {
+        entry.fieldClipStates.push(createClipState());
+      }
+      return entry.fieldClipStates;
+    }
+
+    function getClipState(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
+      if (shareFieldScale) return sharedFieldClip;
+      const states = ensureFieldClipStates(entry);
+      const clampedIdx = Math.max(0, Math.min(states.length - 1, fieldIdx));
+      if (!states[clampedIdx]) {
+        states[clampedIdx] = createClipState();
+      }
+      return states[clampedIdx];
+    }
+
+    function sliderValueToClip(value, fallback = 0.0) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return fallback;
+      return clampUnit(numeric / CLIP_SLIDER_MAX, fallback);
+    }
+
+    function clipToSliderValue(value, fallback = 0.0) {
+      return Math.round(clampUnit(value, fallback) * CLIP_SLIDER_MAX);
+    }
+
+    function setClipBoundary(state, boundary, nextFrac) {
+      if (!state) return;
+      const clamped = clampUnit(nextFrac, boundary === 'max' ? 1.0 : 0.0);
+      if (boundary === 'max') {
+        state.maxFrac = Math.max(clamped, state.minFrac);
+      } else {
+        state.minFrac = Math.min(clamped, state.maxFrac);
+      }
+    }
+
+    function applyClipToRange(range, clipState) {
+      if (!range) return null;
+      const minVal = Number(range.min);
+      const maxVal = Number(range.max);
+      if (!Number.isFinite(minVal) || !Number.isFinite(maxVal)) return null;
+      const span = maxVal - minVal;
+      if (!(Math.abs(span) > 1e-12)) {
+        return { min: minVal, max: maxVal };
+      }
+      const startFrac = clampUnit(clipState && clipState.minFrac, 0.0);
+      const endFrac = clampUnit(clipState && clipState.maxFrac, 1.0);
+      return {
+        min: minVal + span * Math.min(startFrac, endFrac),
+        max: minVal + span * Math.max(startFrac, endFrac),
+      };
+    }
+
+    function formatScalarValue(value) {
+      return Number.isFinite(value) ? Number(value).toFixed(4) : 'n/a';
+    }
+
+    function syncAllColorbarClipControls() {
+      document.querySelectorAll('.colorbar').forEach((node) => {
+        if (typeof node.__syncClipControl === 'function') {
+          node.__syncClipControl();
+        }
+      });
     }
 
     function collectScalarMetas(layer) {
@@ -1302,9 +1530,9 @@ class MeshViewerFigure(PointCloudViewerFigure):
       if (!(peak > 0)) return null;
 
       const width = 100;
-      const height = 44;
-      const baselineY = 29;
-      const curveTopY = 4;
+      const height = 32;
+      const baselineY = 30;
+      const curveTopY = 3;
       const curveHeight = baselineY - curveTopY;
       const strokeInset = 0.7;
       const xStep = (width - 2 * strokeInset) / (bins - 1);
@@ -1322,17 +1550,75 @@ class MeshViewerFigure(PointCloudViewerFigure):
       svg.setAttribute('preserveAspectRatio', 'none');
       svg.classList.add('colorbar-distribution');
 
-      const fillPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      fillPath.setAttribute('d', areaPath.trim());
-      fillPath.setAttribute('class', 'colorbar-distribution-fill');
+      const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+      const clipIdBase = `dist-clip-${Math.random().toString(36).slice(2)}`;
 
-      const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      line.setAttribute('d', linePath.trim());
-      line.setAttribute('class', 'colorbar-distribution-line');
+      const centerClip = document.createElementNS('http://www.w3.org/2000/svg', 'clipPath');
+      centerClip.setAttribute('id', `${clipIdBase}-center`);
+      const centerRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      centerRect.setAttribute('y', '0');
+      centerRect.setAttribute('height', String(height));
+      centerClip.appendChild(centerRect);
 
-      svg.appendChild(fillPath);
-      svg.appendChild(line);
-      return svg;
+      const leftClip = document.createElementNS('http://www.w3.org/2000/svg', 'clipPath');
+      leftClip.setAttribute('id', `${clipIdBase}-left`);
+      const leftRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      leftRect.setAttribute('x', '0');
+      leftRect.setAttribute('y', '0');
+      leftRect.setAttribute('height', String(height));
+      leftClip.appendChild(leftRect);
+
+      const rightClip = document.createElementNS('http://www.w3.org/2000/svg', 'clipPath');
+      rightClip.setAttribute('id', `${clipIdBase}-right`);
+      const rightRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      rightRect.setAttribute('y', '0');
+      rightRect.setAttribute('height', String(height));
+      rightClip.appendChild(rightRect);
+
+      defs.appendChild(centerClip);
+      defs.appendChild(leftClip);
+      defs.appendChild(rightClip);
+      svg.appendChild(defs);
+
+      const buildGroup = (fillClass, lineClass, clipId) => {
+        const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+        group.setAttribute('clip-path', `url(#${clipId})`);
+
+        const fillPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        fillPath.setAttribute('d', areaPath.trim());
+        fillPath.setAttribute('class', fillClass);
+
+        const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        line.setAttribute('d', linePath.trim());
+        line.setAttribute('class', lineClass);
+
+        group.appendChild(fillPath);
+        group.appendChild(line);
+        return group;
+      };
+
+      svg.appendChild(buildGroup('colorbar-distribution-fill faded', 'colorbar-distribution-line faded', `${clipIdBase}-left`));
+      svg.appendChild(buildGroup('colorbar-distribution-fill', 'colorbar-distribution-line', `${clipIdBase}-center`));
+      svg.appendChild(buildGroup('colorbar-distribution-fill faded', 'colorbar-distribution-line faded', `${clipIdBase}-right`));
+
+      const setClipFractions = (startFrac = 0.0, endFrac = 1.0) => {
+        const start = Math.min(1.0, Math.max(0.0, Number(startFrac) || 0.0));
+        const end = Math.min(1.0, Math.max(start, Number(endFrac) || 0.0));
+        const leftWidth = width * start;
+        const centerX = leftWidth;
+        const centerWidth = width * Math.max(0.0, end - start);
+        const rightX = width * end;
+        const rightWidth = Math.max(0.0, width - rightX);
+
+        leftRect.setAttribute('width', leftWidth.toFixed(2));
+        centerRect.setAttribute('x', centerX.toFixed(2));
+        centerRect.setAttribute('width', centerWidth.toFixed(2));
+        rightRect.setAttribute('x', rightX.toFixed(2));
+        rightRect.setAttribute('width', rightWidth.toFixed(2));
+      };
+
+      setClipFractions(0.0, 1.0);
+      return { svg, setClipFractions };
     }
 
     function createCmapSwatch(entry, fieldIdx, cmapName) {
@@ -1360,7 +1646,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
     function setFieldButtonContent(button, fieldName) {
       button.replaceChildren();
       const prefix = document.createElement('span');
-      prefix.className = 'dropdown-label';
+      prefix.className = 'dropdown-label field-dropdown-label';
       prefix.textContent = 'Field:';
       const value = document.createElement('span');
       value.className = 'layer-id';
@@ -1524,6 +1810,23 @@ class MeshViewerFigure(PointCloudViewerFigure):
           resolved.min = sharedFieldScaleRange.min;
           resolved.max = sharedFieldScaleRange.max;
         }
+        resolved.fullMin = resolved.min;
+        resolved.fullMax = resolved.max;
+        if (!isNoCmap(cmapName)) {
+          const clippedRange = applyClipToRange(
+            { min: resolved.fullMin, max: resolved.fullMax },
+            getClipState(entry, fieldIdx),
+          );
+          if (clippedRange) {
+            resolved.min = clippedRange.min;
+            resolved.max = clippedRange.max;
+          }
+        }
+        resolved.clipState = createClipState(
+          getClipState(entry, fieldIdx).minFrac,
+          getClipState(entry, fieldIdx).maxFrac,
+        );
+        resolved.clipEnabled = !isNoCmap(cmapName) && Math.abs(resolved.fullMax - resolved.fullMin) > 1e-12;
         return resolved;
       }
       const resolved = {
@@ -1538,6 +1841,23 @@ class MeshViewerFigure(PointCloudViewerFigure):
         resolved.min = sharedFieldScaleRange.min;
         resolved.max = sharedFieldScaleRange.max;
       }
+      resolved.fullMin = resolved.min;
+      resolved.fullMax = resolved.max;
+      if (!isNoCmap(cmapName)) {
+        const clippedRange = applyClipToRange(
+          { min: resolved.fullMin, max: resolved.fullMax },
+          getClipState(entry, fieldIdx),
+        );
+        if (clippedRange) {
+          resolved.min = clippedRange.min;
+          resolved.max = clippedRange.max;
+        }
+      }
+      resolved.clipState = createClipState(
+        getClipState(entry, fieldIdx).minFrac,
+        getClipState(entry, fieldIdx).maxFrac,
+      );
+      resolved.clipEnabled = !isNoCmap(cmapName) && Math.abs(resolved.fullMax - resolved.fullMin) > 1e-12;
       return resolved;
     }
 
@@ -1638,6 +1958,21 @@ class MeshViewerFigure(PointCloudViewerFigure):
       hideHoverTooltip();
     }
 
+    function setColorClipBoundary(entry, fieldIdx, boundary, value) {
+      const state = getClipState(entry, fieldIdx);
+      setClipBoundary(state, boundary, sliderValueToClip(value, boundary === 'max' ? 1.0 : 0.0));
+      if (shareFieldScale) {
+        for (const layerEntry of layers) {
+          const targetFieldIdx = Math.max(0, Math.min(getEntryFieldCount(layerEntry) - 1, layerEntry.activeFieldIdx ?? 0));
+          renderEntryColors(layerEntry, targetFieldIdx);
+        }
+      } else {
+        renderEntryColors(entry, fieldIdx);
+      }
+      syncAllColorbarClipControls();
+      hideHoverTooltip();
+    }
+
     function fitCamera() {
       const box = new THREE.Box3();
       let hasBox = false;
@@ -1725,7 +2060,15 @@ class MeshViewerFigure(PointCloudViewerFigure):
         });
         const visual = document.createElement('div');
         visual.className = 'colorbar-visual';
-        const distribution = buildDistributionSvg(getEntryDisplayedValues(entry, fieldIdx), meta);
+        const distributionWrap = document.createElement('div');
+        distributionWrap.className = 'colorbar-distribution-wrap';
+        const distributionViz = buildDistributionSvg(
+          getEntryDisplayedValues(entry, fieldIdx),
+          { min: meta.fullMin, max: meta.fullMax },
+        );
+        const distribution = distributionViz ? distributionViz.svg : null;
+        const gradientWrap = document.createElement('div');
+        gradientWrap.className = 'colorbar-gradient-wrap';
         const gradient = document.createElement('div');
         gradient.className = 'colorbar-gradient';
         gradient.style.background = gradientCss(meta.gradient);
@@ -1735,15 +2078,128 @@ class MeshViewerFigure(PointCloudViewerFigure):
         wrapper.appendChild(title);
         wrapper.appendChild(dropdownWrap);
         if (distribution) {
-          visual.appendChild(distribution);
+          distributionWrap.appendChild(distribution);
         }
-        visual.appendChild(gradient);
+        visual.appendChild(distributionWrap);
+        gradientWrap.appendChild(gradient);
         wrapper.appendChild(visual);
         if (Number.isFinite(meta.min) && Number.isFinite(meta.max)) {
           const range = document.createElement('div');
           range.className = 'colorbar-range';
-          range.innerHTML = `<span>${meta.min.toFixed(4)}</span><span>${meta.max.toFixed(4)}</span>`;
+          const minLabel = document.createElement('span');
+          const maxLabel = document.createElement('span');
+          range.appendChild(minLabel);
+          range.appendChild(maxLabel);
           wrapper.appendChild(range);
+
+          const currentCmapIsClipped = !isNoCmap(currentCmap);
+          if (currentCmapIsClipped) {
+            const clipWrap = document.createElement('div');
+            clipWrap.className = 'colorbar-clip';
+            const clipSlider = document.createElement('div');
+            clipSlider.className = 'colorbar-clip-slider';
+            const clipTrack = document.createElement('div');
+            clipTrack.className = 'colorbar-clip-track';
+            const clipFill = document.createElement('div');
+            clipFill.className = 'colorbar-clip-fill';
+            const minInput = document.createElement('input');
+            minInput.type = 'range';
+            minInput.min = '0';
+            minInput.max = String(CLIP_SLIDER_MAX);
+            minInput.step = '1';
+            minInput.setAttribute('aria-label', `Minimum clip for ${colorbarLabel}`);
+            const maxInput = document.createElement('input');
+            maxInput.type = 'range';
+            maxInput.min = '0';
+            maxInput.max = String(CLIP_SLIDER_MAX);
+            maxInput.step = '1';
+            maxInput.setAttribute('aria-label', `Maximum clip for ${colorbarLabel}`);
+
+            clipSlider.appendChild(clipTrack);
+            clipSlider.appendChild(clipFill);
+            clipSlider.appendChild(minInput);
+            clipSlider.appendChild(maxInput);
+            clipWrap.appendChild(clipSlider);
+            visual.appendChild(clipWrap);
+
+            const setActiveClipHandle = (handleName) => {
+              const activeHandle = handleName === 'min' ? 'min' : 'max';
+              clipSlider.dataset.activeHandle = activeHandle;
+              minInput.style.zIndex = activeHandle === 'min' ? '3' : '2';
+              maxInput.style.zIndex = activeHandle === 'max' ? '3' : '2';
+            };
+
+            const updateClipHandlePriority = (clientX = null) => {
+              const rect = clipSlider.getBoundingClientRect();
+              if (!(rect.width > 0)) {
+                setActiveClipHandle(clipSlider.dataset.activeHandle || 'max');
+                return;
+              }
+              const currentMeta = getScalarMeta(entry, fieldIdx);
+              const clipState = currentMeta?.clipState || createClipState();
+              const minPos = rect.width * clampUnit(clipState.minFrac, 0.0);
+              const maxPos = rect.width * clampUnit(clipState.maxFrac, 1.0);
+              let activeHandle = clipSlider.dataset.activeHandle || 'max';
+
+              if (Number.isFinite(clientX)) {
+                const x = Math.max(0.0, Math.min(rect.width, clientX - rect.left));
+                if (Math.abs(maxPos - minPos) <= 14) {
+                  activeHandle = x <= minPos ? 'min' : 'max';
+                } else {
+                  activeHandle = Math.abs(x - minPos) <= Math.abs(x - maxPos) ? 'min' : 'max';
+                }
+              }
+
+              setActiveClipHandle(activeHandle);
+            };
+
+            clipSlider.addEventListener('pointerdown', (ev) => {
+              updateClipHandlePriority(ev.clientX);
+            });
+            clipSlider.addEventListener('pointermove', (ev) => {
+              if ((ev.buttons || 0) === 0) {
+                updateClipHandlePriority(ev.clientX);
+              }
+            });
+            minInput.addEventListener('pointerdown', () => {
+              setActiveClipHandle('min');
+            });
+            maxInput.addEventListener('pointerdown', () => {
+              setActiveClipHandle('max');
+            });
+
+            const syncClipControl = () => {
+              const currentMeta = getScalarMeta(entry, fieldIdx);
+              const clipState = currentMeta?.clipState || createClipState();
+              const startPct = clampUnit(clipState.minFrac, 0.0) * 100.0;
+              const endPct = clampUnit(clipState.maxFrac, 1.0) * 100.0;
+              clipFill.style.left = `${startPct}%`;
+              clipFill.style.width = `${Math.max(0.0, endPct - startPct)}%`;
+              distributionViz?.setClipFractions(clipState.minFrac, clipState.maxFrac);
+              minInput.value = String(clipToSliderValue(clipState.minFrac, 0.0));
+              maxInput.value = String(clipToSliderValue(clipState.maxFrac, 1.0));
+              minInput.disabled = !currentMeta?.clipEnabled;
+              maxInput.disabled = !currentMeta?.clipEnabled;
+              minLabel.textContent = formatScalarValue(currentMeta?.min);
+              maxLabel.textContent = formatScalarValue(currentMeta?.max);
+              updateClipHandlePriority();
+            };
+
+            minInput.addEventListener('input', () => {
+              setColorClipBoundary(entry, fieldIdx, 'min', minInput.value);
+            });
+            maxInput.addEventListener('input', () => {
+              setColorClipBoundary(entry, fieldIdx, 'max', maxInput.value);
+            });
+
+            wrapper.__syncClipControl = syncClipControl;
+            syncClipControl();
+          } else {
+            minLabel.textContent = formatScalarValue(meta.min);
+            maxLabel.textContent = formatScalarValue(meta.max);
+            distributionViz?.setClipFractions(0.0, 1.0);
+          }
+          visual.appendChild(gradientWrap);
         }
         container.appendChild(wrapper);
       }
@@ -1931,6 +2387,8 @@ class MeshViewerFigure(PointCloudViewerFigure):
       layers.forEach((entry, idx) => {
         const row = document.createElement('div');
         row.className = 'layer-row';
+        let refreshFieldControls = null;
+        let fieldControlsWrap = null;
 
         const checkbox = document.createElement('input');
         checkbox.type = 'checkbox';
@@ -1942,6 +2400,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
             const edgeInput = document.getElementById('edge-overlay-mode');
             entry.edgeLines.visible = entry.visible && Boolean(edgeInput && edgeInput.checked);
           }
+          refreshFieldControls?.();
           updateColorbars();
           updateInfoPanel();
           hideHoverTooltip();
@@ -1957,15 +2416,42 @@ class MeshViewerFigure(PointCloudViewerFigure):
         const fieldNames = entry.layer.field_names || [];
         if (fieldNames.length > 1) {
           const wrap = document.createElement('div');
-          wrap.className = 'layer-select-wrapper';
+          wrap.className = 'layer-select-wrapper layer-field-controls';
+          const controls = document.createElement('div');
+          controls.className = 'field-select-inline';
+          const prevButton = document.createElement('button');
+          prevButton.type = 'button';
+          prevButton.className = 'field-nav-button';
+          prevButton.textContent = '←';
+          prevButton.setAttribute('aria-label', 'Previous field');
           const dropdown = document.createElement('div');
           dropdown.className = 'custom-dropdown';
           const button = document.createElement('button');
           button.type = 'button';
           button.className = 'layer-select-button';
-          setFieldButtonContent(button, fieldNames[entry.activeFieldIdx ?? 0]);
           const menu = document.createElement('div');
           menu.className = 'custom-dropdown-menu';
+          const nextButton = document.createElement('button');
+          nextButton.type = 'button';
+          nextButton.className = 'field-nav-button';
+          nextButton.textContent = '→';
+          nextButton.setAttribute('aria-label', 'Next field');
+
+          const updateFieldControls = (fieldIdx) => {
+            setFieldButtonContent(button, fieldNames[fieldIdx]);
+            menu.querySelectorAll('.custom-dropdown-item').forEach((el, idx2) => {
+              el.classList.toggle('selected', idx2 === fieldIdx);
+            });
+            prevButton.disabled = !entry.visible || fieldIdx <= 0;
+            nextButton.disabled = !entry.visible || fieldIdx >= fieldNames.length - 1;
+          };
+          refreshFieldControls = () => updateFieldControls(Math.max(0, Math.min(fieldNames.length - 1, entry.activeFieldIdx ?? 0)));
+
+          const selectField = (fieldIdx) => {
+            const nextFieldIdx = Math.max(0, Math.min(fieldNames.length - 1, fieldIdx));
+            setLayerField(entry, nextFieldIdx);
+            updateFieldControls(nextFieldIdx);
+          };
 
           fieldNames.forEach((name, fieldIdx) => {
             const item = document.createElement('div');
@@ -1976,29 +2462,40 @@ class MeshViewerFigure(PointCloudViewerFigure):
             value.textContent = name;
             item.appendChild(value);
             item.addEventListener('click', () => {
-              setLayerField(entry, fieldIdx);
-              setFieldButtonContent(button, name);
-              menu.querySelectorAll('.custom-dropdown-item').forEach((el, idx2) => {
-                el.classList.toggle('selected', idx2 === fieldIdx);
-              });
+              selectField(fieldIdx);
               closeDropdownMenu(menu);
             });
             menu.appendChild(item);
           });
 
+          prevButton.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            closeDropdownMenu(menu);
+            selectField((entry.activeFieldIdx ?? 0) - 1);
+          });
           button.addEventListener('click', (ev) => {
             ev.stopPropagation();
             toggleDropdownMenu(button, menu);
           });
+          nextButton.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            closeDropdownMenu(menu);
+            selectField((entry.activeFieldIdx ?? 0) + 1);
+          });
 
+          updateFieldControls(Math.max(0, Math.min(fieldNames.length - 1, entry.activeFieldIdx ?? 0)));
+          controls.appendChild(prevButton);
           dropdown.appendChild(button);
           dropdown.appendChild(menu);
-          wrap.appendChild(dropdown);
-          info.appendChild(wrap);
+          controls.appendChild(dropdown);
+          controls.appendChild(nextButton);
+          wrap.appendChild(controls);
+          fieldControlsWrap = wrap;
         }
 
         row.appendChild(checkbox);
         row.appendChild(info);
+        if (fieldControlsWrap) row.appendChild(fieldControlsWrap);
         container.appendChild(row);
       });
 
@@ -2067,6 +2564,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
         activeValues: layer.values || null,
         activeCmap: layer.scalar_meta && layer.scalar_meta.cmap ? layer.scalar_meta.cmap : NO_CMAP,
         fieldCmaps,
+        fieldClipStates: Array.from({ length: Math.max(fieldCount, 1) }, () => createClipState()),
       };
       entry.mesh.visible = entry.visible;
       if (entry.edgeLines) entry.edgeLines.visible = false;
@@ -2202,6 +2700,7 @@ def plot_mesh(
     cmap: str | None = None,
     title: str | None = None,
     label: str = "Mesh",
+    visible: bool = True,
 ) -> MeshViewerFigure:
     fig = init_fig if init_fig is not None else MeshViewerFigure()
     if share_colormap_scale is not None:
@@ -2264,6 +2763,7 @@ def plot_mesh(
                         raw_colors=filtered_raw_colors,
                         scalar_meta=scalar_meta,
                         scalar_values=filtered_values,
+                        visible=visible,
                     ),
                 )
             )
@@ -2285,7 +2785,7 @@ def plot_mesh(
             "field_scalar_meta": [layer_data["scalar_meta"] for _, layer_data in encoded_fields],
             "active_field_idx": 0,
             "scalar_meta": base_layer["scalar_meta"],
-            "visible": True,
+            "visible": bool(visible),
         }
         fig.layers.append(combined_layer)
         if title is not None:
@@ -2299,4 +2799,5 @@ def plot_mesh(
         cmap=cmap,
         title=title,
         label=label,
+        visible=visible,
     )

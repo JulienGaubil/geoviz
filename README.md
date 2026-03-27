@@ -35,7 +35,7 @@ fig = plot_pointcloud(
 )
 
 # Opens in your browser when run as a script.
-fig.show(open_browser=True)
+fig.show(in_browser=True)
 
 # In a notebook, render inline without spawning a local server.
 # You can also just evaluate `fig` in the last cell output.
@@ -91,7 +91,7 @@ fig = plot_mesh(
     title="Cube Mesh",
     label="Cube",
 )
-fig.show(open_browser=True)
+fig.show(in_browser=True)
 
 # In a notebook, render inline without spawning a local server.
 # You can also just evaluate `fig` in the last cell output.
