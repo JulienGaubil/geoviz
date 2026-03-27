@@ -509,7 +509,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
     }
     .layer-row {
       display: grid;
-      grid-template-columns: 20px minmax(0, 1fr);
+      grid-template-columns: 20px minmax(0, 1fr) auto;
       gap: 8px;
       align-items: start;
       margin-bottom: 10px;
@@ -519,21 +519,106 @@ class MeshViewerFigure(PointCloudViewerFigure):
       background: rgba(255,255,255,0.02);
     }
     .layer-row.master-toggle {
+      grid-template-columns: 20px minmax(0, 1fr);
       align-items: center;
       background: rgba(99, 102, 241, 0.06);
       border-color: rgba(99, 102, 241, 0.18);
     }
+    .layer-main {
+      min-width: 0;
+    }
     .layer-label {
       font-size: 12px;
       line-height: 1.35;
+    }
+    .layer-options-toggle {
+      width: 32px;
+      min-width: 32px;
+      height: 32px;
+      padding: 0;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: all 0.2s;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      line-height: 1;
+    }
+    .layer-options-toggle:hover {
+      background: rgba(99, 102, 241, 0.15);
+      border-color: var(--accent-primary);
+      color: var(--accent-primary);
+    }
+    .layer-options-toggle[aria-expanded="true"] {
+      background: rgba(99, 102, 241, 0.15);
+      border-color: var(--accent-primary);
+      color: var(--accent-primary);
+    }
+    .layer-controls-body {
+      grid-column: 1 / -1;
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .layer-controls-body.hidden {
+      display: none;
+    }
+    .layer-controls-body.disabled {
+      opacity: 0.45;
+    }
+    .layer-controls-body.disabled .layer-option-toggle,
+    .layer-controls-body.disabled .layer-option-control label,
+    .layer-controls-body.disabled .layer-select-wrapper,
+    .layer-controls-body.disabled .colorbar,
+    .layer-controls-body.disabled input:disabled,
+    .layer-controls-body.disabled button:disabled {
+      cursor: not-allowed;
+    }
+    .layer-option-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .layer-option-control {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .layer-option-control label {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .layer-option-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .layer-option-toggle input[type="checkbox"] {
+      margin: 0;
     }
     .layer-select-wrapper {
       position: relative;
       margin-top: 6px;
     }
     .layer-field-controls {
-      grid-column: 1 / -1;
-      margin-top: 8px;
+      margin-top: 0;
+    }
+    .layer-colorbar-host {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .layer-controls-body .colorbar {
+      margin-top: 0;
     }
     .field-select-inline {
       display: grid;
@@ -685,6 +770,10 @@ class MeshViewerFigure(PointCloudViewerFigure):
     .custom-dropdown-item.selected {
       background: rgba(99, 102, 241, 0.25);
       color: var(--accent-primary);
+    }
+    .custom-dropdown-item.disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
     }
     .custom-dropdown-menu::-webkit-scrollbar {
       width: 8px;
@@ -1007,13 +1096,6 @@ class MeshViewerFigure(PointCloudViewerFigure):
     <div class=\"section\">
       <div class=\"section-title\">Display</div>
       <div class=\"control\">
-        <label for=\"mesh-opacity\">Mesh opacity</label>
-        <input id=\"mesh-opacity\" type=\"range\" min=\"0.05\" max=\"1\" step=\"0.05\" value=\"__OPACITY__\">
-      </div>
-      <div class=\"control\">
-        <label><input id=\"edge-overlay-mode\" type=\"checkbox\"> Show mesh edges</label>
-      </div>
-      <div class=\"control\">
         <button id=\"btn-reset-camera\" type=\"button\">Reset camera</button>
       </div>
     </div>
@@ -1024,13 +1106,6 @@ class MeshViewerFigure(PointCloudViewerFigure):
         <div class=\"layer-label\">Toggle all</div>
       </div>
       <div id=\"layer-list\"></div>
-    </div>
-    <div class=\"section\">
-      <div class=\"section-title\">Fields</div>
-      <div id=\"share-field-scale-control\" class=\"control\">
-        <label><input id=\"share-field-scale\" type=\"checkbox\"> Share field colormap scale</label>
-      </div>
-      <div id=\"colorbars\"></div>
     </div>
   </div>
   <div id=\"info-panel\">
@@ -1166,9 +1241,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
     const layers = [];
     let isDayMode = false;
     let commandsVisible = true;
-    let shareFieldScale = Boolean(payload.initial_share_field_scale);
     const CLIP_SLIDER_MAX = 1000;
-    let sharedFieldClip = { minFrac: 0.0, maxFrac: 1.0 };
     const raycaster = new THREE.Raycaster();
     raycaster.firstHitOnly = true;
     const pointerNdc = new THREE.Vector2();
@@ -1243,7 +1316,12 @@ class MeshViewerFigure(PointCloudViewerFigure):
     }
 
     function getClipState(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
-      if (shareFieldScale) return sharedFieldClip;
+      if (entry.shareFieldScale) {
+        if (!entry.sharedFieldClip) {
+          entry.sharedFieldClip = createClipState();
+        }
+        return entry.sharedFieldClip;
+      }
       const states = ensureFieldClipStates(entry);
       const clampedIdx = Math.max(0, Math.min(states.length - 1, fieldIdx));
       if (!states[clampedIdx]) {
@@ -1390,15 +1468,26 @@ class MeshViewerFigure(PointCloudViewerFigure):
       return { mesh, edgeLines };
     }
 
-    function refreshEdgeOverlay() {
-      const edgeInput = document.getElementById('edge-overlay-mode');
-      const showEdges = Boolean(edgeInput && edgeInput.checked);
+    function updateEntryOpacity(entry, opacity) {
+      const nextOpacity = Math.min(1.0, Math.max(0.05, Number(opacity) || 1.0));
+      entry.opacity = nextOpacity;
+      entry.mesh.material.opacity = nextOpacity;
+      entry.mesh.material.transparent = nextOpacity < 0.999;
+      entry.mesh.material.depthWrite = nextOpacity >= 0.999;
+      entry.mesh.material.needsUpdate = true;
+    }
+
+    function updateEntryEdgeOverlay(entry) {
+      if (!entry.edgeLines) return;
       const color = edgeColorHex();
+      entry.edgeLines.visible = entry.visible && entry.showEdges;
+      entry.edgeLines.material.color.setHex(color);
+      entry.edgeLines.material.opacity = isDayMode ? 0.82 : 0.92;
+    }
+
+    function refreshEdgeOverlay() {
       for (const entry of layers) {
-        if (!entry.edgeLines) continue;
-        entry.edgeLines.visible = entry.visible && showEdges;
-        entry.edgeLines.material.color.setHex(color);
-        entry.edgeLines.material.opacity = isDayMode ? 0.82 : 0.92;
+        updateEntryEdgeOverlay(entry);
       }
       requestRender();
     }
@@ -1765,32 +1854,16 @@ class MeshViewerFigure(PointCloudViewerFigure):
       return range ? [range] : [];
     }
 
-    function getSharedFieldScaleRange() {
+    function getSharedFieldScaleRange(entry) {
+      if (!entry || isNoCmap(getEntryCmap(entry))) return null;
       let minVal = Infinity;
       let maxVal = -Infinity;
-      for (const entry of layers) {
-        if (!entry.visible || isNoCmap(getEntryCmap(entry))) continue;
-        for (const range of getEntryAllScaleRanges(entry)) {
-          minVal = Math.min(minVal, range.min);
-          maxVal = Math.max(maxVal, range.max);
-        }
+      for (const range of getEntryAllScaleRanges(entry)) {
+        minVal = Math.min(minVal, range.min);
+        maxVal = Math.max(maxVal, range.max);
       }
       if (!Number.isFinite(minVal) || !Number.isFinite(maxVal)) return null;
       return { min: minVal, max: maxVal };
-    }
-
-    function hasVisibleColormapSelection() {
-      return layers.some((entry) => entry.visible && !isNoCmap(getEntryCmap(entry)));
-    }
-
-    function updateShareFieldScaleControl() {
-      const control = document.getElementById('share-field-scale-control');
-      const input = document.getElementById('share-field-scale');
-      if (!control || !input) return;
-      const sharedFieldScaleRange = getSharedFieldScaleRange();
-      control.style.display = hasVisibleColormapSelection() ? '' : 'none';
-      input.checked = shareFieldScale;
-      input.disabled = !sharedFieldScaleRange;
     }
 
     function getScalarMeta(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
@@ -1809,8 +1882,8 @@ class MeshViewerFigure(PointCloudViewerFigure):
             ? getEntryRawGradient(entry, fieldIdx)
             : (getColormapPreset(cmapName)?.gradient || null),
         };
-        const sharedFieldScaleRange = getSharedFieldScaleRange();
-        if (!isNoCmap(cmapName) && shareFieldScale && sharedFieldScaleRange) {
+        const sharedFieldScaleRange = getSharedFieldScaleRange(entry);
+        if (!isNoCmap(cmapName) && entry.shareFieldScale && sharedFieldScaleRange) {
           resolved.min = sharedFieldScaleRange.min;
           resolved.max = sharedFieldScaleRange.max;
         }
@@ -1840,8 +1913,8 @@ class MeshViewerFigure(PointCloudViewerFigure):
           ? (baseMeta.gradient || getEntryRawGradient(entry, fieldIdx))
           : (getColormapPreset(cmapName)?.gradient || baseMeta.gradient),
       };
-      const sharedFieldScaleRange = getSharedFieldScaleRange();
-      if (!isNoCmap(cmapName) && shareFieldScale && sharedFieldScaleRange) {
+      const sharedFieldScaleRange = getSharedFieldScaleRange(entry);
+      if (!isNoCmap(cmapName) && entry.shareFieldScale && sharedFieldScaleRange) {
         resolved.min = sharedFieldScaleRange.min;
         resolved.max = sharedFieldScaleRange.max;
       }
@@ -1946,18 +2019,16 @@ class MeshViewerFigure(PointCloudViewerFigure):
       updateColorbars();
     }
 
-    function setShareFieldScale(enabled) {
-      shareFieldScale = Boolean(enabled);
-      for (const entry of layers) {
-        const fieldIdx = Math.max(
-          0,
-          Math.min(
-            entry.activeFieldIdx ?? 0,
-            entry.fieldCmaps && entry.fieldCmaps.length > 0 ? entry.fieldCmaps.length - 1 : 0,
-          ),
-        );
-        renderEntryColors(entry, fieldIdx);
-      }
+    function setLayerShareFieldScale(entry, enabled) {
+      entry.shareFieldScale = Boolean(enabled);
+      const fieldIdx = Math.max(
+        0,
+        Math.min(
+          entry.activeFieldIdx ?? 0,
+          entry.fieldCmaps && entry.fieldCmaps.length > 0 ? entry.fieldCmaps.length - 1 : 0,
+        ),
+      );
+      renderEntryColors(entry, fieldIdx);
       updateColorbars();
       hideHoverTooltip();
     }
@@ -1965,14 +2036,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
     function setColorClipBoundary(entry, fieldIdx, boundary, value) {
       const state = getClipState(entry, fieldIdx);
       setClipBoundary(state, boundary, sliderValueToClip(value, boundary === 'max' ? 1.0 : 0.0));
-      if (shareFieldScale) {
-        for (const layerEntry of layers) {
-          const targetFieldIdx = Math.max(0, Math.min(getEntryFieldCount(layerEntry) - 1, layerEntry.activeFieldIdx ?? 0));
-          renderEntryColors(layerEntry, targetFieldIdx);
-        }
-      } else {
-        renderEntryColors(entry, fieldIdx);
-      }
+      renderEntryColors(entry, fieldIdx);
       syncAllColorbarClipControls();
       hideHoverTooltip();
     }
@@ -2005,207 +2069,215 @@ class MeshViewerFigure(PointCloudViewerFigure):
       requestRenderAndHover();
     }
 
-    function updateColorbars() {
-      const container = document.getElementById('colorbars');
-      container.innerHTML = '';
-      updateShareFieldScaleControl();
-      for (const entry of layers) {
-        if (!entry.visible) continue;
-        const fieldIdx = entry.activeFieldIdx ?? 0;
-        const fieldNames = entry.layer.field_names || null;
-        const meta = getScalarMeta(entry, fieldIdx);
-        if (!meta) continue;
+    function createEntryFieldPanel(entry) {
+      const fieldIdx = entry.activeFieldIdx ?? 0;
+      const fieldNames = entry.layer.field_names || null;
+      const meta = getScalarMeta(entry, fieldIdx);
+      if (!meta) return null;
 
-        const colorbarLabel = fieldNames
-          ? `${entry.layer.label} - ${fieldNames[fieldIdx]}`
-          : entry.layer.label;
+      const fieldLabel = fieldNames ? fieldNames[fieldIdx] : null;
+      const colorbarLabel = fieldLabel ? `Field: ${fieldLabel}` : 'Field colors';
+      const controlsEnabled = entry.visible;
 
-        const wrapper = document.createElement('div');
-        wrapper.className = 'colorbar';
-        const title = document.createElement('div');
-        title.className = 'colorbar-title';
-        title.textContent = colorbarLabel;
-        const dropdownWrap = document.createElement('div');
-        dropdownWrap.className = 'layer-select-wrapper';
-        const dropdown = document.createElement('div');
-        dropdown.className = 'custom-dropdown';
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'layer-select-button cmap-dropdown-button';
-        const currentCmap = getEntryCmap(entry, fieldIdx);
-        setCmapButtonContent(button, currentCmap);
-        const menu = document.createElement('div');
-        menu.className = 'custom-dropdown-menu';
-        getEntryColorModeOptions(entry, fieldIdx).forEach((cmapName) => {
-          const item = document.createElement('div');
-          item.className = 'custom-dropdown-item cmap-dropdown-item';
-          if (cmapName === currentCmap) item.classList.add('selected');
-          const prefix = document.createElement('span');
-          prefix.className = 'cmap-dropdown-prefix';
-          prefix.appendChild(createCmapSwatch(entry, fieldIdx, cmapName));
-          item.appendChild(prefix);
-          const value = document.createElement('span');
-          value.className = 'layer-id';
-          value.textContent = isNoCmap(cmapName) ? NO_CMAP : cmapName;
-          item.appendChild(value);
-          item.addEventListener('click', () => {
-            setLayerCmap(entry, cmapName);
-            setCmapButtonContent(button, cmapName);
-            menu.querySelectorAll('.custom-dropdown-item').forEach((el) => {
-              el.classList.toggle('selected', el === item);
-            });
-            closeDropdownMenu(menu);
+      const wrapper = document.createElement('div');
+      wrapper.className = 'colorbar';
+      const title = document.createElement('div');
+      title.className = 'colorbar-title';
+      title.textContent = colorbarLabel;
+      const dropdownWrap = document.createElement('div');
+      dropdownWrap.className = 'layer-select-wrapper';
+      const dropdown = document.createElement('div');
+      dropdown.className = 'custom-dropdown';
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'layer-select-button cmap-dropdown-button';
+      button.disabled = !controlsEnabled;
+      const currentCmap = getEntryCmap(entry, fieldIdx);
+      setCmapButtonContent(button, currentCmap);
+      const menu = document.createElement('div');
+      menu.className = 'custom-dropdown-menu';
+      getEntryColorModeOptions(entry, fieldIdx).forEach((cmapName) => {
+        const item = document.createElement('div');
+        item.className = 'custom-dropdown-item cmap-dropdown-item';
+        if (!controlsEnabled) item.classList.add('disabled');
+        if (cmapName === currentCmap) item.classList.add('selected');
+        const prefix = document.createElement('span');
+        prefix.className = 'cmap-dropdown-prefix';
+        prefix.appendChild(createCmapSwatch(entry, fieldIdx, cmapName));
+        item.appendChild(prefix);
+        const value = document.createElement('span');
+        value.className = 'layer-id';
+        value.textContent = isNoCmap(cmapName) ? NO_CMAP : cmapName;
+        item.appendChild(value);
+        item.addEventListener('click', () => {
+          if (!controlsEnabled) return;
+          setLayerCmap(entry, cmapName);
+          setCmapButtonContent(button, cmapName);
+          menu.querySelectorAll('.custom-dropdown-item').forEach((el) => {
+            el.classList.toggle('selected', el === item);
           });
-          menu.appendChild(item);
+          closeDropdownMenu(menu);
         });
-        button.addEventListener('click', (ev) => {
-          ev.stopPropagation();
-          toggleDropdownMenu(button, menu);
-        });
-        const visual = document.createElement('div');
-        visual.className = 'colorbar-visual';
-        const distributionWrap = document.createElement('div');
-        distributionWrap.className = 'colorbar-distribution-wrap';
-        const distributionViz = buildDistributionSvg(
-          getEntryDisplayedValues(entry, fieldIdx),
-          { min: meta.fullMin, max: meta.fullMax },
-        );
-        const distribution = distributionViz ? distributionViz.svg : null;
-        const gradientWrap = document.createElement('div');
-        gradientWrap.className = 'colorbar-gradient-wrap';
-        const gradient = document.createElement('div');
-        gradient.className = 'colorbar-gradient';
-        gradient.style.background = gradientCss(meta.gradient);
-        dropdown.appendChild(button);
-        dropdown.appendChild(menu);
-        dropdownWrap.appendChild(dropdown);
-        wrapper.appendChild(title);
-        wrapper.appendChild(dropdownWrap);
-        if (distribution) {
-          distributionWrap.appendChild(distribution);
-        }
-        visual.appendChild(distributionWrap);
-        gradientWrap.appendChild(gradient);
-        wrapper.appendChild(visual);
-        if (Number.isFinite(meta.min) && Number.isFinite(meta.max)) {
-          const range = document.createElement('div');
-          range.className = 'colorbar-range';
-          const minLabel = document.createElement('span');
-          const maxLabel = document.createElement('span');
-          range.appendChild(minLabel);
-          range.appendChild(maxLabel);
-          wrapper.appendChild(range);
+        menu.appendChild(item);
+      });
+      button.addEventListener('click', (ev) => {
+        if (!controlsEnabled) return;
+        ev.stopPropagation();
+        toggleDropdownMenu(button, menu);
+      });
+      const visual = document.createElement('div');
+      visual.className = 'colorbar-visual';
+      const distributionWrap = document.createElement('div');
+      distributionWrap.className = 'colorbar-distribution-wrap';
+      const distributionViz = buildDistributionSvg(
+        getEntryDisplayedValues(entry, fieldIdx),
+        { min: meta.fullMin, max: meta.fullMax },
+      );
+      const distribution = distributionViz ? distributionViz.svg : null;
+      const gradientWrap = document.createElement('div');
+      gradientWrap.className = 'colorbar-gradient-wrap';
+      const gradient = document.createElement('div');
+      gradient.className = 'colorbar-gradient';
+      gradient.style.background = gradientCss(meta.gradient);
+      dropdown.appendChild(button);
+      dropdown.appendChild(menu);
+      dropdownWrap.appendChild(dropdown);
+      wrapper.appendChild(title);
+      wrapper.appendChild(dropdownWrap);
+      if (distribution) {
+        distributionWrap.appendChild(distribution);
+      }
+      visual.appendChild(distributionWrap);
+      gradientWrap.appendChild(gradient);
+      wrapper.appendChild(visual);
+      if (Number.isFinite(meta.min) && Number.isFinite(meta.max)) {
+        const range = document.createElement('div');
+        range.className = 'colorbar-range';
+        const minLabel = document.createElement('span');
+        const maxLabel = document.createElement('span');
+        range.appendChild(minLabel);
+        range.appendChild(maxLabel);
+        wrapper.appendChild(range);
 
-          const currentCmapIsClipped = !isNoCmap(currentCmap);
-          if (currentCmapIsClipped) {
-            const clipWrap = document.createElement('div');
-            clipWrap.className = 'colorbar-clip';
-            const clipSlider = document.createElement('div');
-            clipSlider.className = 'colorbar-clip-slider';
-            const clipTrack = document.createElement('div');
-            clipTrack.className = 'colorbar-clip-track';
-            const clipFill = document.createElement('div');
-            clipFill.className = 'colorbar-clip-fill';
-            const minInput = document.createElement('input');
-            minInput.type = 'range';
-            minInput.min = '0';
-            minInput.max = String(CLIP_SLIDER_MAX);
-            minInput.step = '1';
-            minInput.setAttribute('aria-label', `Minimum clip for ${colorbarLabel}`);
-            const maxInput = document.createElement('input');
-            maxInput.type = 'range';
-            maxInput.min = '0';
-            maxInput.max = String(CLIP_SLIDER_MAX);
-            maxInput.step = '1';
-            maxInput.setAttribute('aria-label', `Maximum clip for ${colorbarLabel}`);
+        const currentCmapIsClipped = !isNoCmap(currentCmap);
+        if (currentCmapIsClipped) {
+          const clipWrap = document.createElement('div');
+          clipWrap.className = 'colorbar-clip';
+          const clipSlider = document.createElement('div');
+          clipSlider.className = 'colorbar-clip-slider';
+          const clipTrack = document.createElement('div');
+          clipTrack.className = 'colorbar-clip-track';
+          const clipFill = document.createElement('div');
+          clipFill.className = 'colorbar-clip-fill';
+          const minInput = document.createElement('input');
+          minInput.type = 'range';
+          minInput.min = '0';
+          minInput.max = String(CLIP_SLIDER_MAX);
+          minInput.step = '1';
+          minInput.setAttribute('aria-label', `Minimum clip for ${colorbarLabel}`);
+          const maxInput = document.createElement('input');
+          maxInput.type = 'range';
+          maxInput.min = '0';
+          maxInput.max = String(CLIP_SLIDER_MAX);
+          maxInput.step = '1';
+          maxInput.setAttribute('aria-label', `Maximum clip for ${colorbarLabel}`);
 
-            clipSlider.appendChild(clipTrack);
-            clipSlider.appendChild(clipFill);
-            clipSlider.appendChild(minInput);
-            clipSlider.appendChild(maxInput);
-            clipWrap.appendChild(clipSlider);
-            visual.appendChild(clipWrap);
+          clipSlider.appendChild(clipTrack);
+          clipSlider.appendChild(clipFill);
+          clipSlider.appendChild(minInput);
+          clipSlider.appendChild(maxInput);
+          clipWrap.appendChild(clipSlider);
+          visual.appendChild(clipWrap);
 
-            const setActiveClipHandle = (handleName) => {
-              const activeHandle = handleName === 'min' ? 'min' : 'max';
-              clipSlider.dataset.activeHandle = activeHandle;
-              minInput.style.zIndex = activeHandle === 'min' ? '3' : '2';
-              maxInput.style.zIndex = activeHandle === 'max' ? '3' : '2';
-            };
+          const setActiveClipHandle = (handleName) => {
+            const activeHandle = handleName === 'min' ? 'min' : 'max';
+            clipSlider.dataset.activeHandle = activeHandle;
+            minInput.style.zIndex = activeHandle === 'min' ? '3' : '2';
+            maxInput.style.zIndex = activeHandle === 'max' ? '3' : '2';
+          };
 
-            const updateClipHandlePriority = (clientX = null) => {
-              const rect = clipSlider.getBoundingClientRect();
-              if (!(rect.width > 0)) {
-                setActiveClipHandle(clipSlider.dataset.activeHandle || 'max');
-                return;
+          const updateClipHandlePriority = (clientX = null) => {
+            const rect = clipSlider.getBoundingClientRect();
+            if (!(rect.width > 0)) {
+              setActiveClipHandle(clipSlider.dataset.activeHandle || 'max');
+              return;
+            }
+            const currentMeta = getScalarMeta(entry, fieldIdx);
+            const clipState = currentMeta?.clipState || createClipState();
+            const minPos = rect.width * clampUnit(clipState.minFrac, 0.0);
+            const maxPos = rect.width * clampUnit(clipState.maxFrac, 1.0);
+            let activeHandle = clipSlider.dataset.activeHandle || 'max';
+
+            if (Number.isFinite(clientX)) {
+              const x = Math.max(0.0, Math.min(rect.width, clientX - rect.left));
+              if (Math.abs(maxPos - minPos) <= 14) {
+                activeHandle = x <= minPos ? 'min' : 'max';
+              } else {
+                activeHandle = Math.abs(x - minPos) <= Math.abs(x - maxPos) ? 'min' : 'max';
               }
-              const currentMeta = getScalarMeta(entry, fieldIdx);
-              const clipState = currentMeta?.clipState || createClipState();
-              const minPos = rect.width * clampUnit(clipState.minFrac, 0.0);
-              const maxPos = rect.width * clampUnit(clipState.maxFrac, 1.0);
-              let activeHandle = clipSlider.dataset.activeHandle || 'max';
+            }
 
-              if (Number.isFinite(clientX)) {
-                const x = Math.max(0.0, Math.min(rect.width, clientX - rect.left));
-                if (Math.abs(maxPos - minPos) <= 14) {
-                  activeHandle = x <= minPos ? 'min' : 'max';
-                } else {
-                  activeHandle = Math.abs(x - minPos) <= Math.abs(x - maxPos) ? 'min' : 'max';
-                }
-              }
+            setActiveClipHandle(activeHandle);
+          };
 
-              setActiveClipHandle(activeHandle);
-            };
-
-            clipSlider.addEventListener('pointerdown', (ev) => {
+          clipSlider.addEventListener('pointerdown', (ev) => {
+            updateClipHandlePriority(ev.clientX);
+          });
+          clipSlider.addEventListener('pointermove', (ev) => {
+            if ((ev.buttons || 0) === 0) {
               updateClipHandlePriority(ev.clientX);
-            });
-            clipSlider.addEventListener('pointermove', (ev) => {
-              if ((ev.buttons || 0) === 0) {
-                updateClipHandlePriority(ev.clientX);
-              }
-            });
-            minInput.addEventListener('pointerdown', () => {
-              setActiveClipHandle('min');
-            });
-            maxInput.addEventListener('pointerdown', () => {
-              setActiveClipHandle('max');
-            });
+            }
+          });
+          minInput.addEventListener('pointerdown', () => {
+            setActiveClipHandle('min');
+          });
+          maxInput.addEventListener('pointerdown', () => {
+            setActiveClipHandle('max');
+          });
 
-            const syncClipControl = () => {
-              const currentMeta = getScalarMeta(entry, fieldIdx);
-              const clipState = currentMeta?.clipState || createClipState();
-              const startPct = clampUnit(clipState.minFrac, 0.0) * 100.0;
-              const endPct = clampUnit(clipState.maxFrac, 1.0) * 100.0;
-              clipFill.style.left = `${startPct}%`;
-              clipFill.style.width = `${Math.max(0.0, endPct - startPct)}%`;
-              distributionViz?.setClipFractions(clipState.minFrac, clipState.maxFrac);
-              minInput.value = String(clipToSliderValue(clipState.minFrac, 0.0));
-              maxInput.value = String(clipToSliderValue(clipState.maxFrac, 1.0));
-              minInput.disabled = !currentMeta?.clipEnabled;
-              maxInput.disabled = !currentMeta?.clipEnabled;
-              minLabel.textContent = formatScalarValue(currentMeta?.min);
-              maxLabel.textContent = formatScalarValue(currentMeta?.max);
-              updateClipHandlePriority();
-            };
+          const syncClipControl = () => {
+            const currentMeta = getScalarMeta(entry, fieldIdx);
+            const clipState = currentMeta?.clipState || createClipState();
+            const startPct = clampUnit(clipState.minFrac, 0.0) * 100.0;
+            const endPct = clampUnit(clipState.maxFrac, 1.0) * 100.0;
+            clipFill.style.left = `${startPct}%`;
+            clipFill.style.width = `${Math.max(0.0, endPct - startPct)}%`;
+            distributionViz?.setClipFractions(clipState.minFrac, clipState.maxFrac);
+            minInput.value = String(clipToSliderValue(clipState.minFrac, 0.0));
+            maxInput.value = String(clipToSliderValue(clipState.maxFrac, 1.0));
+            minInput.disabled = !controlsEnabled || !currentMeta?.clipEnabled;
+            maxInput.disabled = !controlsEnabled || !currentMeta?.clipEnabled;
+            minLabel.textContent = formatScalarValue(currentMeta?.min);
+            maxLabel.textContent = formatScalarValue(currentMeta?.max);
+            updateClipHandlePriority();
+          };
 
-            minInput.addEventListener('input', () => {
-              setColorClipBoundary(entry, fieldIdx, 'min', minInput.value);
-            });
-            maxInput.addEventListener('input', () => {
-              setColorClipBoundary(entry, fieldIdx, 'max', maxInput.value);
-            });
+          minInput.addEventListener('input', () => {
+            setColorClipBoundary(entry, fieldIdx, 'min', minInput.value);
+          });
+          maxInput.addEventListener('input', () => {
+            setColorClipBoundary(entry, fieldIdx, 'max', maxInput.value);
+          });
 
-            wrapper.__syncClipControl = syncClipControl;
-            syncClipControl();
-          } else {
-            minLabel.textContent = formatScalarValue(meta.min);
-            maxLabel.textContent = formatScalarValue(meta.max);
-            distributionViz?.setClipFractions(0.0, 1.0);
-          }
-          visual.appendChild(gradientWrap);
+          wrapper.__syncClipControl = syncClipControl;
+          syncClipControl();
+        } else {
+          minLabel.textContent = formatScalarValue(meta.min);
+          maxLabel.textContent = formatScalarValue(meta.max);
+          distributionViz?.setClipFractions(0.0, 1.0);
         }
-        container.appendChild(wrapper);
+        visual.appendChild(gradientWrap);
+      }
+
+      return wrapper;
+    }
+
+    function updateColorbars() {
+      for (const entry of layers) {
+        if (!entry.fieldOptionsContainer) continue;
+        entry.fieldOptionsContainer.innerHTML = '';
+        const panel = createEntryFieldPanel(entry);
+        if (panel) entry.fieldOptionsContainer.appendChild(panel);
       }
     }
 
@@ -2391,8 +2463,11 @@ class MeshViewerFigure(PointCloudViewerFigure):
       layers.forEach((entry, idx) => {
         const row = document.createElement('div');
         row.className = 'layer-row';
+        const hasFieldOptions = true;
+        const hasScalarOptions = getEntryFieldCount(entry) > 0 || Boolean(entry.layer.scalar_meta) || Boolean(entry.layer.values);
         let refreshFieldControls = null;
-        let fieldControlsWrap = null;
+        let controlsBody = null;
+        let toggleButton = null;
 
         const checkbox = document.createElement('input');
         checkbox.type = 'checkbox';
@@ -2400,22 +2475,91 @@ class MeshViewerFigure(PointCloudViewerFigure):
         checkbox.addEventListener('change', () => {
           entry.visible = checkbox.checked;
           entry.mesh.visible = entry.visible;
-          if (entry.edgeLines) {
-            const edgeInput = document.getElementById('edge-overlay-mode');
-            entry.edgeLines.visible = entry.visible && Boolean(edgeInput && edgeInput.checked);
-          }
-          refreshFieldControls?.();
-          updateColorbars();
-          updateInfoPanel();
+          updateEntryEdgeOverlay(entry);
+          rebuildLayerList();
           hideHoverTooltip();
           requestRender();
         });
 
         const info = document.createElement('div');
+        info.className = 'layer-main';
         const label = document.createElement('div');
         label.className = 'layer-label';
         label.textContent = `${idx + 1}. ${entry.layer.label}`;
         info.appendChild(label);
+
+        if (hasFieldOptions) {
+          const toggle = document.createElement('button');
+          toggle.type = 'button';
+          toggle.className = 'layer-options-toggle';
+          toggle.setAttribute('aria-label', `Toggle field options for ${entry.layer.label}`);
+          toggle.setAttribute('aria-expanded', entry.optionsExpanded ? 'true' : 'false');
+          toggle.textContent = entry.optionsExpanded ? '▾' : '▸';
+          toggle.addEventListener('click', () => {
+            entry.optionsExpanded = !entry.optionsExpanded;
+            toggle.setAttribute('aria-expanded', entry.optionsExpanded ? 'true' : 'false');
+            toggle.textContent = entry.optionsExpanded ? '▾' : '▸';
+            controlsBody?.classList.toggle('hidden', !entry.optionsExpanded);
+            if (!entry.optionsExpanded) closeAllDropdownMenus();
+          });
+          toggleButton = toggle;
+        }
+
+        controlsBody = document.createElement('div');
+        controlsBody.className = 'layer-controls-body';
+        controlsBody.classList.toggle('hidden', !entry.optionsExpanded);
+        controlsBody.classList.toggle('disabled', !entry.visible);
+
+        const optionGrid = document.createElement('div');
+        optionGrid.className = 'layer-option-grid';
+
+        const opacityWrap = document.createElement('div');
+        opacityWrap.className = 'layer-option-control';
+        const opacityLabel = document.createElement('label');
+        opacityLabel.textContent = 'Mesh opacity';
+        const opacityInput = document.createElement('input');
+        opacityInput.type = 'range';
+        opacityInput.min = '0.05';
+        opacityInput.max = '1';
+        opacityInput.step = '0.05';
+        opacityInput.value = String(entry.opacity);
+        opacityInput.disabled = !entry.visible;
+        opacityInput.addEventListener('input', () => {
+          updateEntryOpacity(entry, opacityInput.value);
+          requestRender();
+        });
+        opacityWrap.appendChild(opacityLabel);
+        opacityWrap.appendChild(opacityInput);
+        optionGrid.appendChild(opacityWrap);
+
+        const edgeToggleLabel = document.createElement('label');
+        edgeToggleLabel.className = 'layer-option-toggle';
+        const edgeToggleInput = document.createElement('input');
+        edgeToggleInput.type = 'checkbox';
+        edgeToggleInput.checked = Boolean(entry.showEdges);
+        edgeToggleInput.disabled = !entry.visible;
+        edgeToggleInput.addEventListener('change', () => {
+          entry.showEdges = edgeToggleInput.checked;
+          updateEntryEdgeOverlay(entry);
+        });
+        edgeToggleLabel.appendChild(edgeToggleInput);
+        edgeToggleLabel.appendChild(document.createTextNode('Show mesh edges'));
+        optionGrid.appendChild(edgeToggleLabel);
+
+        const shareScaleLabel = document.createElement('label');
+        shareScaleLabel.className = 'layer-option-toggle';
+        const shareScaleInput = document.createElement('input');
+        shareScaleInput.type = 'checkbox';
+        shareScaleInput.checked = Boolean(entry.shareFieldScale);
+        shareScaleInput.disabled = !entry.visible || !getSharedFieldScaleRange(entry);
+        shareScaleInput.addEventListener('change', () => {
+          setLayerShareFieldScale(entry, shareScaleInput.checked);
+        });
+        shareScaleLabel.appendChild(shareScaleInput);
+        shareScaleLabel.appendChild(document.createTextNode('Share field colormap scale'));
+        optionGrid.appendChild(shareScaleLabel);
+
+        controlsBody.appendChild(optionGrid);
 
         const fieldNames = entry.layer.field_names || [];
         if (fieldNames.length > 1) {
@@ -2496,12 +2640,22 @@ class MeshViewerFigure(PointCloudViewerFigure):
           controls.appendChild(dropdown);
           controls.appendChild(nextButton);
           wrap.appendChild(controls);
-          fieldControlsWrap = wrap;
+          controlsBody.appendChild(wrap);
+        }
+
+        if (hasScalarOptions) {
+          const colorbarHost = document.createElement('div');
+          colorbarHost.className = 'layer-colorbar-host';
+          controlsBody.appendChild(colorbarHost);
+          entry.fieldOptionsContainer = colorbarHost;
+        } else {
+          entry.fieldOptionsContainer = null;
         }
 
         row.appendChild(checkbox);
         row.appendChild(info);
-        if (fieldControlsWrap) row.appendChild(fieldControlsWrap);
+        if (toggleButton) row.appendChild(toggleButton);
+        if (hasFieldOptions) row.appendChild(controlsBody);
         container.appendChild(row);
       });
 
@@ -2530,10 +2684,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
       for (const entry of layers) {
         entry.visible = visible;
         entry.mesh.visible = visible;
-        if (entry.edgeLines) {
-          const edgeInput = document.getElementById('edge-overlay-mode');
-          entry.edgeLines.visible = visible && Boolean(edgeInput && edgeInput.checked);
-        }
+        updateEntryEdgeOverlay(entry);
       }
       rebuildLayerList();
       hideHoverTooltip();
@@ -2571,9 +2722,16 @@ class MeshViewerFigure(PointCloudViewerFigure):
         activeCmap: layer.scalar_meta && layer.scalar_meta.cmap ? layer.scalar_meta.cmap : NO_CMAP,
         fieldCmaps,
         fieldClipStates: Array.from({ length: Math.max(fieldCount, 1) }, () => createClipState()),
+        sharedFieldClip: createClipState(),
+        shareFieldScale: Boolean(payload.initial_share_field_scale),
+        opacity: Math.min(1.0, Math.max(0.05, Number(payload.mesh_opacity) || 1.0)),
+        showEdges: false,
+        optionsExpanded: layer.visible !== false,
+        fieldOptionsContainer: null,
       };
       entry.mesh.visible = entry.visible;
-      if (entry.edgeLines) entry.edgeLines.visible = false;
+      updateEntryOpacity(entry, entry.opacity);
+      updateEntryEdgeOverlay(entry);
       layers.push(entry);
 
       const fieldNames = layer.field_names || null;
@@ -2584,28 +2742,6 @@ class MeshViewerFigure(PointCloudViewerFigure):
       }
     });
 
-    const opacityInput = document.getElementById('mesh-opacity');
-    const edgeOverlayInput = document.getElementById('edge-overlay-mode');
-    const shareFieldScaleInput = document.getElementById('share-field-scale');
-    opacityInput.addEventListener('input', () => {
-      const opacity = Number(opacityInput.value);
-      layers.forEach((entry) => {
-        entry.mesh.material.opacity = opacity;
-        entry.mesh.material.transparent = opacity < 0.999;
-        entry.mesh.material.depthWrite = opacity >= 0.999;
-        entry.mesh.material.needsUpdate = true;
-      });
-      requestRender();
-    });
-
-    edgeOverlayInput.addEventListener('change', refreshEdgeOverlay);
-    if (shareFieldScaleInput) {
-      shareFieldScaleInput.checked = shareFieldScale;
-      shareFieldScaleInput.disabled = !getSharedFieldScaleRange();
-      shareFieldScaleInput.addEventListener('change', () => {
-        setShareFieldScale(shareFieldScaleInput.checked);
-      });
-    }
     const toggleAllLayersInput = document.getElementById('toggle-all-layers');
     if (toggleAllLayersInput) {
       toggleAllLayersInput.addEventListener('change', () => {
