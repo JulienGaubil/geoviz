@@ -2484,15 +2484,21 @@ class PointCloudViewerFigure:
       *,
       width: int | str = "100%",
       height: int = 760,
-  ) -> str:
-      import base64
+    ) -> str:
       width_css = f"{width}px" if isinstance(width, int) else str(width)
-      b64 = base64.b64encode(self.to_html().encode("utf-8")).decode("ascii")
+      html_content = self.to_html()
+      # Escape characters that would break the srcdoc attribute value
+      srcdoc = (
+          html_content
+          .replace("&", "&amp;")
+          .replace('"', "&quot;")
+      )
       return (
           f'<div style="width:{width_css};max-width:100%;">'
-          f'<iframe src="data:text/html;base64,{b64}"'
+          f'<iframe srcdoc="{srcdoc}"'
           f' style="display:block;width:100%;height:{int(height)}px;border:0;border-radius:8px;"'
-          f' referrerpolicy="no-referrer">'
+          f' referrerpolicy="no-referrer"'
+          f' sandbox="allow-scripts allow-same-origin">'
           f'</iframe>'
           f'</div>'
       )
