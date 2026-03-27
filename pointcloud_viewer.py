@@ -129,6 +129,7 @@ def _prepare_layer(
     downsampling_factor: int,
     cmap: str | None,
     label: str,
+    opacity: float,
 ) -> dict[str, Any]:
     raw_points = _to_numpy(points)
     pts = raw_points
@@ -264,6 +265,7 @@ def _prepare_layer(
         "scalar_meta": scalar_meta,
         "values": None if scalar_values is None else np.ascontiguousarray(scalar_values, dtype=np.float32).tolist(),
         "visible": True,
+        "opacity": float(np.clip(opacity, 0.05, 1.0)),
     }
     return layer
 
@@ -273,6 +275,7 @@ class PointCloudViewerFigure:
     layers: list[dict[str, Any]] = field(default_factory=list)
     title: str | None = None
     point_size: float = 5.0
+    opacity: float = 1.0
     share_colormap_scale: bool = False
     _server: ThreadingHTTPServer | None = field(default=None, init=False, repr=False)
     _server_thread: threading.Thread | None = field(default=None, init=False, repr=False)
@@ -288,6 +291,7 @@ class PointCloudViewerFigure:
         cmap: str | None = None,
         title: str | None = None,
         label: str = "Points",
+        opacity: float | None = None,
     ) -> "PointCloudViewerFigure":
         self.layers.append(
             _prepare_layer(
@@ -297,6 +301,7 @@ class PointCloudViewerFigure:
                 downsampling_factor=downsampling_factor,
                 cmap=cmap,
                 label=label,
+                opacity=float(np.clip(self.opacity if opacity is None else opacity, 0.05, 1.0)),
             )
         )
         if title is not None:
@@ -312,6 +317,7 @@ class PointCloudViewerFigure:
         return {
             "title": self.title or "Point Cloud Viewer",
             "point_size": self.point_size,
+            "opacity": float(np.clip(self.opacity, 0.05, 1.0)),
             "initial_share_field_scale": self.share_colormap_scale,
             "layers": self.layers,
             "available_cmaps": cmap_names,
@@ -1084,10 +1090,11 @@ class PointCloudViewerFigure:
 
     const fragmentShader = `
       varying vec3 vColor;
+      uniform float opacity;
       void main() {{
         vec2 center = gl_PointCoord - vec2(0.5);
         if (length(center) > 0.5) discard;
-        gl_FragColor = vec4(vColor, 1.0);
+        gl_FragColor = vec4(vColor, opacity);
       }}
     `;
 
@@ -1426,6 +1433,11 @@ class PointCloudViewerFigure:
       positionDropdownMenu(button, menu);
     }}
 
+    function getLayerOpacity(layer) {{
+      const value = Number(layer?.opacity ?? payload.opacity);
+      return Number.isFinite(value) ? Math.min(1.0, Math.max(0.05, value)) : 1.0;
+    }}
+
     function applyThemeMode(dayMode) {{
       isDayMode = Boolean(dayMode);
       document.body.classList.toggle('day-mode', isDayMode);
@@ -1442,17 +1454,19 @@ class PointCloudViewerFigure:
       for (const entry of layers) {{
         if (!entry.objects.lines) continue;
         entry.objects.lines.material.color.setHex(lineColor);
-        entry.objects.lines.material.opacity = isDayMode ? 0.28 : 0.35;
+        entry.objects.lines.material.opacity = (isDayMode ? 0.28 : 0.35) * entry.opacity;
       }}
     }}
 
     function buildPoints(layer) {{
+      const baseOpacity = getLayerOpacity(layer);
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.Float32BufferAttribute(layer.points.flat(), 3));
       geometry.setAttribute('color', createStoredColorAttribute(flattenColorArray(layer.colors)));
       const material = new THREE.ShaderMaterial({{
         uniforms: {{
           size: {{ value: payload.point_size }},
+          opacity: {{ value: baseOpacity }},
         }},
         vertexShader: vertexShader,
         fragmentShader: fragmentShader,
@@ -1474,7 +1488,7 @@ class PointCloudViewerFigure:
         lineGeometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
         const lineMaterial = new THREE.LineBasicMaterial({{
           color: isDayMode ? 0x0f172a : 0xe4e4e7,
-          opacity: isDayMode ? 0.28 : 0.35,
+          opacity: (isDayMode ? 0.28 : 0.35) * baseOpacity,
           transparent: true,
         }});
         lines = new THREE.LineSegments(lineGeometry, lineMaterial);
@@ -2475,6 +2489,7 @@ class PointCloudViewerFigure:
         layer,
         objects,
         visible: layer.visible !== false,
+        opacity: getLayerOpacity(layer),
         activeFieldIdx: Number(layer.active_field_idx || 0),
         activeValues: layer.values || null,
         activeCmap: layer.scalar_meta && layer.scalar_meta.cmap ? layer.scalar_meta.cmap : NO_CMAP,
@@ -2746,6 +2761,7 @@ def plot_pointcloud(
     scalar_fields: Mapping[str, np.ndarray | torch.Tensor] | None = None,
     downsampling_factor: int = 1,
     point_size: float | None = None,
+    opacity: float | None = None,
     share_colormap_scale: bool | None = None,
     cmap: str | None = None,
     title: str | None = None,
@@ -2756,6 +2772,7 @@ def plot_pointcloud(
         fig.point_size = float(point_size)
     if share_colormap_scale is not None:
         fig.share_colormap_scale = bool(share_colormap_scale)
+    resolved_opacity = float(np.clip(fig.opacity if opacity is None else opacity, 0.05, 1.0))
     if scalar_fields is not None:
         if len(scalar_fields) == 0:
             raise ValueError("scalar_fields cannot be empty")
@@ -2772,6 +2789,7 @@ def plot_pointcloud(
                         downsampling_factor=downsampling_factor,
                         cmap=cmap,
                         label=label,
+                        opacity=resolved_opacity,
                     ),
                 )
             )
@@ -2805,6 +2823,7 @@ def plot_pointcloud(
             "active_field_idx": 0,
             "scalar_meta": base_layer["scalar_meta"],
             "visible": True,
+            "opacity": resolved_opacity,
         }
         fig.layers.append(combined_layer)
         if title is not None:
@@ -2819,4 +2838,5 @@ def plot_pointcloud(
         cmap=cmap,
         title=title,
         label=label,
+        opacity=resolved_opacity,
     )

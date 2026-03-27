@@ -254,6 +254,7 @@ def _encode_mesh_layer(
     scalar_meta: dict[str, Any] | None,
     scalar_values: np.ndarray | None,
     visible: bool,
+    opacity: float,
 ) -> dict[str, Any]:
     if scalar_values is not None and scalar_values.shape[0] != verts.shape[0]:
         raise ValueError("scalar_values must match filtered vertex count")
@@ -282,6 +283,7 @@ def _encode_mesh_layer(
         if scalar_values is None
         else _encode_array_payload(scalar_values, dtype=np.float32),
         "visible": bool(visible),
+        "opacity": float(np.clip(opacity, 0.05, 1.0)),
     }
 
 
@@ -292,6 +294,7 @@ def _prepare_mesh_layer(
     cmap: str | None,
     label: str,
     visible: bool,
+    opacity: float,
 ) -> dict[str, Any]:
     verts, raw_vertex_shape, tri, valid_vertices = _prepare_mesh_inputs(vertices, faces)
     colors, raw_colors, scalar_values, scalar_meta = _prepare_vertex_colors(
@@ -323,6 +326,7 @@ def _prepare_mesh_layer(
         scalar_meta=scalar_meta,
         scalar_values=scalar_values,
         visible=visible,
+        opacity=opacity,
     )
 
 
@@ -331,11 +335,10 @@ class MeshViewerFigure(PointCloudViewerFigure):
         self,
         *,
         title: str | None = None,
-        mesh_opacity: float = 1.0,
+        opacity: float = 1.0,
         share_colormap_scale: bool = False,
     ) -> None:
-        super().__init__(title=title, point_size=1.0, share_colormap_scale=share_colormap_scale)
-        self.mesh_opacity = float(np.clip(mesh_opacity, 0.05, 1.0))
+        super().__init__(title=title, point_size=1.0, opacity=float(np.clip(opacity, 0.05, 1.0)), share_colormap_scale=share_colormap_scale)
 
     def add_mesh(
         self,
@@ -346,6 +349,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
         title: str | None = None,
         label: str = "Mesh",
         visible: bool = True,
+        opacity: float | None = None,
     ) -> "MeshViewerFigure":
         self.layers.append(
             _prepare_mesh_layer(
@@ -355,6 +359,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
                 cmap=cmap,
                 label=label,
                 visible=visible,
+                opacity=float(np.clip(self.opacity if opacity is None else opacity, 0.05, 1.0)),
             )
         )
         if title is not None:
@@ -369,7 +374,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
                 cmap_names.insert(0, cmap_name)
         return {
             "title": self.title or "Mesh Viewer",
-            "mesh_opacity": self.mesh_opacity,
+            "opacity": float(np.clip(self.opacity, 0.05, 1.0)),
             "initial_share_field_scale": self.share_colormap_scale,
             "layers": self.layers,
             "available_cmaps": cmap_names,
@@ -1437,7 +1442,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
         geometry.computeBoundsTree();
       }
 
-      const initialOpacity = Number(payload.mesh_opacity) || 1.0;
+      const initialOpacity = Number(layer.opacity ?? payload.opacity) || 1.0;
       const material = new THREE.MeshLambertMaterial({
         vertexColors: true,
         side: THREE.DoubleSide,
@@ -2724,7 +2729,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
         fieldClipStates: Array.from({ length: Math.max(fieldCount, 1) }, () => createClipState()),
         sharedFieldClip: createClipState(),
         shareFieldScale: Boolean(payload.initial_share_field_scale),
-        opacity: Math.min(1.0, Math.max(0.05, Number(payload.mesh_opacity) || 1.0)),
+        opacity: Math.min(1.0, Math.max(0.05, Number(layer.opacity ?? payload.opacity) || 1.0)),
         showEdges: false,
         optionsExpanded: layer.visible !== false,
         fieldOptionsContainer: null,
@@ -2828,7 +2833,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
         return (
             html.replace("__PAYLOAD__", payload)
             .replace("__TITLE__", page_title)
-            .replace("__OPACITY__", f"{self.mesh_opacity:.2f}")
+            .replace("__OPACITY__", f"{self.opacity:.2f}")
         )
 
 
@@ -2838,6 +2843,7 @@ def plot_mesh(
     init_fig: MeshViewerFigure | None = None,
     vertex_color: np.ndarray | torch.Tensor | str = "#94a3b8",
     scalar_fields: Mapping[str, np.ndarray | torch.Tensor] | None = None,
+    opacity: float | None = None,
     share_colormap_scale: bool | None = None,
     cmap: str | None = None,
     title: str | None = None,
@@ -2847,6 +2853,7 @@ def plot_mesh(
     fig = init_fig if init_fig is not None else MeshViewerFigure()
     if share_colormap_scale is not None:
         fig.share_colormap_scale = bool(share_colormap_scale)
+    resolved_opacity = float(np.clip(fig.opacity if opacity is None else opacity, 0.05, 1.0))
 
     if scalar_fields is not None:
         if len(scalar_fields) == 0:
@@ -2906,6 +2913,7 @@ def plot_mesh(
                         scalar_meta=scalar_meta,
                         scalar_values=filtered_values,
                         visible=visible,
+                        opacity=resolved_opacity,
                     ),
                 )
             )
@@ -2928,6 +2936,7 @@ def plot_mesh(
             "active_field_idx": 0,
             "scalar_meta": base_layer["scalar_meta"],
             "visible": bool(visible),
+            "opacity": resolved_opacity,
         }
         fig.layers.append(combined_layer)
         if title is not None:
@@ -2942,4 +2951,5 @@ def plot_mesh(
         title=title,
         label=label,
         visible=visible,
+        opacity=resolved_opacity,
     )

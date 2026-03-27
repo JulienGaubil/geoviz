@@ -29,6 +29,7 @@ scalar_fields = {
 fig = plot_pointcloud(
     points,
     scalar_fields=scalar_fields,
+    opacity=0.7,
     cmap="viridis",
     title="Noisy Sphere",
     label="Sphere cloud",
@@ -87,6 +88,7 @@ fig = plot_mesh(
     vertices,
     faces,
     scalar_fields=scalar_fields,
+    opacity=0.75,
     cmap="plasma",
     title="Cube Mesh",
     label="Cube",
