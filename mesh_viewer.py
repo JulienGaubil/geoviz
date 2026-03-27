@@ -255,6 +255,7 @@ def _encode_mesh_layer(
     scalar_values: np.ndarray | None,
     visible: bool,
     opacity: float,
+    show_edges: bool,
 ) -> dict[str, Any]:
     if scalar_values is not None and scalar_values.shape[0] != verts.shape[0]:
         raise ValueError("scalar_values must match filtered vertex count")
@@ -284,6 +285,7 @@ def _encode_mesh_layer(
         else _encode_array_payload(scalar_values, dtype=np.float32),
         "visible": bool(visible),
         "opacity": float(np.clip(opacity, 0.05, 1.0)),
+        "show_edges": bool(show_edges),
     }
 
 
@@ -295,6 +297,7 @@ def _prepare_mesh_layer(
     label: str,
     visible: bool,
     opacity: float,
+    show_edges: bool,
 ) -> dict[str, Any]:
     verts, raw_vertex_shape, tri, valid_vertices = _prepare_mesh_inputs(vertices, faces)
     colors, raw_colors, scalar_values, scalar_meta = _prepare_vertex_colors(
@@ -327,6 +330,7 @@ def _prepare_mesh_layer(
         scalar_values=scalar_values,
         visible=visible,
         opacity=opacity,
+        show_edges=show_edges,
     )
 
 
@@ -350,6 +354,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
         label: str = "Mesh",
         visible: bool = True,
         opacity: float | None = None,
+        show_edges: bool = False,
     ) -> "MeshViewerFigure":
         self.layers.append(
             _prepare_mesh_layer(
@@ -360,6 +365,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
                 label=label,
                 visible=visible,
                 opacity=float(np.clip(self.opacity if opacity is None else opacity, 0.05, 1.0)),
+                show_edges=show_edges,
             )
         )
         if title is not None:
@@ -1462,7 +1468,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
         color: edgeColorHex(),
         transparent: true,
         opacity: isDayMode ? 0.92 : 1.0,
-        depthTest: false,
+        depthTest: true,
         depthWrite: false,
       });
       const edgeLines = new THREE.LineSegments(edgeGeometry, edgeMaterial);
@@ -2730,7 +2736,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
         sharedFieldClip: createClipState(),
         shareFieldScale: Boolean(payload.initial_share_field_scale),
         opacity: Math.min(1.0, Math.max(0.05, Number(layer.opacity ?? payload.opacity) || 1.0)),
-        showEdges: false,
+        showEdges: layer.show_edges === true,
         optionsExpanded: layer.visible !== false,
         fieldOptionsContainer: null,
       };
@@ -2849,6 +2855,7 @@ def plot_mesh(
     title: str | None = None,
     label: str = "Mesh",
     visible: bool = True,
+    show_edges: bool = False,
 ) -> MeshViewerFigure:
     fig = init_fig if init_fig is not None else MeshViewerFigure()
     if share_colormap_scale is not None:
@@ -2914,6 +2921,7 @@ def plot_mesh(
                         scalar_values=filtered_values,
                         visible=visible,
                         opacity=resolved_opacity,
+                        show_edges=show_edges,
                     ),
                 )
             )
@@ -2937,6 +2945,7 @@ def plot_mesh(
             "scalar_meta": base_layer["scalar_meta"],
             "visible": bool(visible),
             "opacity": resolved_opacity,
+            "show_edges": bool(show_edges),
         }
         fig.layers.append(combined_layer)
         if title is not None:
@@ -2952,4 +2961,5 @@ def plot_mesh(
         label=label,
         visible=visible,
         opacity=resolved_opacity,
+        show_edges=show_edges,
     )
