@@ -618,6 +618,10 @@ class MeshViewerFigure(PointCloudViewerFigure):
       border-color: var(--accent-primary);
       box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.1);
     }
+    .layer-select-button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
     .custom-dropdown-menu {
       position: absolute;
       top: 100%;
@@ -2442,6 +2446,8 @@ class MeshViewerFigure(PointCloudViewerFigure):
             menu.querySelectorAll('.custom-dropdown-item').forEach((el, idx2) => {
               el.classList.toggle('selected', idx2 === fieldIdx);
             });
+            button.disabled = !entry.visible;
+            if (!entry.visible) closeDropdownMenu(menu);
             prevButton.disabled = !entry.visible || fieldIdx <= 0;
             nextButton.disabled = !entry.visible || fieldIdx >= fieldNames.length - 1;
           };
