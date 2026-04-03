@@ -15,10 +15,14 @@ __INLINE_CSS__
   <div id="top-actions">
     <button id="btn-quit-top" class="top-action-btn danger" title="Quit viewer" aria-label="Quit viewer">Quit Viewer</button>
     <button id="btn-toggle-commands" class="top-action-btn text-btn" title="Hide commands" aria-label="Hide commands">Hide Commands</button>
+    <button id="btn-filter-panel" class="top-action-btn text-btn" title="Show filters" aria-label="Show filters">Filters</button>
     <button id="btn-theme-mode" class="top-action-btn" title="Switch to day mode" aria-label="Switch to day mode">☾</button>
   </div>
   <div id="controls">
-    <h1>__TITLE__</h1>
+    <div class="panel-header controls-header">
+      <h1>__TITLE__</h1>
+      <button id="btn-controls-close" type="button" class="panel-close-btn controls-close-btn" title="Close commands" aria-label="Close commands">✕</button>
+    </div>
     <div class="section">
       <div class="section-title">Display</div>
       <div class="control">
@@ -32,6 +36,25 @@ __INLINE_CSS__
         <div class="layer-label">Toggle all</div>
       </div>
       <div id="layer-list"></div>
+    </div>
+  </div>
+  <div id="filter-panel" class="collapsed" aria-hidden="true">
+    <div class="filter-panel-header">
+      <div class="filter-panel-title">Filtration</div>
+      <button id="btn-filter-close" type="button" class="panel-close-btn filter-close-btn" title="Close filters" aria-label="Close filters">✕</button>
+    </div>
+    <div class="section">
+      <div class="section-title">Rules</div>
+      <div id="filter-rules-list" class="filter-rules-list"></div>
+      <button id="btn-filter-add-rule" type="button" class="filter-add-rule-btn">Add Rule</button>
+    </div>
+    <div class="section">
+      <div class="section-title">Masked Region</div>
+      <div class="filter-control">
+        <label for="filter-masked-opacity">Visibility</label>
+        <input id="filter-masked-opacity" type="range" min="0" max="1" step="0.01" value="0">
+        <div id="filter-masked-opacity-value" class="filter-value-label">0.00</div>
+      </div>
     </div>
   </div>
   <div id="info-panel">

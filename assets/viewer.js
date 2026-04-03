@@ -128,6 +128,14 @@ raycaster.firstHitOnly = true;
 const pointerNdc = new THREE.Vector2();
 const hoverTooltip = document.getElementById('hover-tooltip');
 const dropdownPortal = document.getElementById('dropdown-portal');
+const filterPanel = document.getElementById('filter-panel');
+const filterRulesList = document.getElementById('filter-rules-list');
+const filterMaskedOpacityInput = document.getElementById('filter-masked-opacity');
+const filterMaskedOpacityValue = document.getElementById('filter-masked-opacity-value');
+const filterAddRuleButton = document.getElementById('btn-filter-add-rule');
+const filterToggleButton = document.getElementById('btn-filter-panel');
+const filterCloseButton = document.getElementById('btn-filter-close');
+const controlsCloseButton = document.getElementById('btn-controls-close');
 const ambientLight = new THREE.AmbientLight(0xffffff, 0.55);
 const hemisphereLight = new THREE.HemisphereLight(0xe0f2fe, 0x111827, 0.7);
 const keyLight = new THREE.DirectionalLight(0xffffff, 1.15);
@@ -141,6 +149,15 @@ const pointerState = {
   clientY: 0,
 };
 let hoverRefreshQueued = false;
+let filterRuleCounter = 0;
+const FILTER_SLIDER_MAX = 1000;
+const FILTER_POSITION = 'position';
+const FILTER_SCOPE_ALL_KEY = '__all__';
+const filterState = {
+  open: false,
+  maskedOpacity: 0.0,
+  rules: [],
+};
 const pointVertexShader = `
   attribute vec3 color;
   varying vec3 vColor;
@@ -328,21 +345,43 @@ function refreshLineMaterialResolutions() {
   }
 }
 
-function buildMesh(layer) {
-  const geometry = new THREE.BufferGeometry();
-  const positionAttr = new THREE.BufferAttribute(layer.vertices, 3);
-  positionAttr.setUsage(THREE.StaticDrawUsage);
-  geometry.setAttribute('position', positionAttr);
-  geometry.setAttribute('color', createStoredColorAttribute(layer.colors));
-  const indexAttr = new THREE.BufferAttribute(layer.faces, 1);
-  indexAttr.setUsage(THREE.StaticDrawUsage);
-  geometry.setIndex(indexAttr);
+function createPositionAttribute(values) {
+  const attr = new THREE.BufferAttribute(values, 3);
+  attr.setUsage(THREE.DynamicDrawUsage);
+  return attr;
+}
+
+function setPositionAttribute(geometry, values) {
+  const attr = createPositionAttribute(values);
+  geometry.setAttribute('position', attr);
+  return attr;
+}
+
+function setIndexAttribute(geometry, indices) {
+  const typed = indices instanceof Uint32Array ? indices : new Uint32Array(indices || []);
+  const attr = new THREE.BufferAttribute(typed, 1);
+  attr.setUsage(THREE.DynamicDrawUsage);
+  geometry.setIndex(attr);
+  return attr;
+}
+
+function refreshMeshBounds(geometry) {
   geometry.computeVertexNormals();
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
-  if (layer.face_count > 0) {
-    geometry.computeBoundsTree();
+  geometry.disposeBoundsTree?.();
+  const index = geometry.getIndex();
+  if (index && index.count > 0) {
+    geometry.computeBoundsTree?.();
   }
+}
+
+function buildMesh(layer) {
+  const geometry = new THREE.BufferGeometry();
+  setPositionAttribute(geometry, layer.vertices);
+  geometry.setAttribute('color', createStoredColorAttribute(layer.colors));
+  setIndexAttribute(geometry, layer.faces);
+  refreshMeshBounds(geometry);
 
   const initialOpacity = Number(layer.opacity ?? payload.opacity) || 1.0;
   const material = new THREE.MeshLambertMaterial({
@@ -358,6 +397,26 @@ function buildMesh(layer) {
   const mesh = new THREE.Mesh(geometry, material);
   mesh.frustumCulled = true;
   scene.add(mesh);
+
+  const maskedGeometry = new THREE.BufferGeometry();
+  setPositionAttribute(maskedGeometry, layer.vertices.slice());
+  maskedGeometry.setAttribute('color', createStoredColorAttribute(layer.colors.slice()));
+  setIndexAttribute(maskedGeometry, new Uint32Array(0));
+  refreshMeshBounds(maskedGeometry);
+  const maskedMaterial = new THREE.MeshLambertMaterial({
+    vertexColors: true,
+    side: THREE.DoubleSide,
+    transparent: true,
+    opacity: 0.0,
+    depthWrite: false,
+    polygonOffset: true,
+    polygonOffsetFactor: 1,
+    polygonOffsetUnits: 1,
+  });
+  const maskedMesh = new THREE.Mesh(maskedGeometry, maskedMaterial);
+  maskedMesh.frustumCulled = true;
+  maskedMesh.visible = false;
+  scene.add(maskedMesh);
 
   const wireframeGeometry = new THREE.WireframeGeometry(geometry);
   const wirePositionsAttr = wireframeGeometry.getAttribute('position');
@@ -385,12 +444,12 @@ function buildMesh(layer) {
   } else {
     edgeMaterial.dispose();
   }
-  return { mesh, edgeLines };
+  return { mesh, maskedMesh, edgeLines };
 }
 
 function buildPoints(layer) {
   const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(layer.points, 3));
+  setPositionAttribute(geometry, layer.points);
   geometry.setAttribute('color', createStoredColorAttribute(layer.colors));
 
   const pointSize = Math.min(12.0, Math.max(1.0, Number(layer.point_size ?? payload.point_size) || 5.0));
@@ -407,6 +466,24 @@ function buildPoints(layer) {
   const points = new THREE.Points(geometry, material);
   points.frustumCulled = false;
   scene.add(points);
+
+  const maskedGeometry = new THREE.BufferGeometry();
+  setPositionAttribute(maskedGeometry, new Float32Array(0));
+  maskedGeometry.setAttribute('color', createStoredColorAttribute(new Uint8Array(0)));
+  const maskedMaterial = new THREE.ShaderMaterial({
+    uniforms: {
+      size: { value: pointSize },
+      opacity: { value: 0.0 },
+    },
+    vertexShader: pointVertexShader,
+    fragmentShader: pointFragmentShader,
+    transparent: true,
+    depthWrite: false,
+  });
+  const maskedPoints = new THREE.Points(maskedGeometry, maskedMaterial);
+  maskedPoints.frustumCulled = false;
+  maskedPoints.visible = false;
+  scene.add(maskedPoints);
 
   let lines = null;
   if (layer.edges && layer.edges.length >= 2) {
@@ -439,7 +516,14 @@ function buildPoints(layer) {
       scene.add(lines);
     }
   }
-  return { points, lines };
+  return { points, maskedPoints, lines };
+}
+
+function updateMaskedObjectVisibility(entry) {
+  const hasMaskedData = (entry.maskedPointCount || 0) > 0 || (entry.maskedFaceCount || 0) > 0;
+  const maskedVisible = entry.visible && hasMaskedData && filterState.maskedOpacity > 0.0;
+  if (entry.maskedMesh) entry.maskedMesh.visible = maskedVisible;
+  if (entry.maskedPoints) entry.maskedPoints.visible = maskedVisible;
 }
 
 function updateEntryOpacity(entry, opacity) {
@@ -451,12 +535,21 @@ function updateEntryOpacity(entry, opacity) {
     entry.mesh.material.depthWrite = nextOpacity >= 0.999;
     entry.mesh.material.needsUpdate = true;
   }
+  if (entry.maskedMesh) {
+    entry.maskedMesh.material.opacity = nextOpacity * filterState.maskedOpacity;
+    entry.maskedMesh.material.transparent = entry.maskedMesh.material.opacity < 0.999;
+    entry.maskedMesh.material.needsUpdate = true;
+  }
   if (entry.points) {
     entry.points.material.uniforms.opacity.value = nextOpacity;
+  }
+  if (entry.maskedPoints) {
+    entry.maskedPoints.material.uniforms.opacity.value = nextOpacity * filterState.maskedOpacity;
   }
   if (entry.pointLines) {
     entry.pointLines.material.opacity = (isDayMode ? 0.28 : 0.35) * nextOpacity;
   }
+  updateMaskedObjectVisibility(entry);
 }
 
 function updateEntryEdgeThickness(entry, thickness) {
@@ -473,12 +566,12 @@ function updateEntryEdgeThickness(entry, thickness) {
 function updateEntryEdgeOverlay(entry) {
   if (entry.edgeLines) {
     const color = edgeColorHex();
-    entry.edgeLines.visible = entry.visible && entry.showEdges;
+    entry.edgeLines.visible = entry.visible && entry.showEdges && (entry.unmaskedFaceCount || 0) > 0;
     entry.edgeLines.material.color.setHex(color);
     entry.edgeLines.material.opacity = isDayMode ? 0.82 : 0.92;
   }
   if (entry.pointLines) {
-    entry.pointLines.visible = entry.visible;
+    entry.pointLines.visible = entry.visible && (entry.unmaskedPointCount || 0) > 0;
     entry.pointLines.material.color.setHex(isDayMode ? 0x0f172a : 0xe4e4e7);
     entry.pointLines.material.opacity = (isDayMode ? 0.28 : 0.35) * entry.opacity;
   }
@@ -746,6 +839,184 @@ function setFieldButtonContent(button, fieldName) {
   button.appendChild(value);
 }
 
+function setFilterDropdownButtonContent(button, prefixText, valueText) {
+  button.replaceChildren();
+  const prefix = document.createElement('span');
+  prefix.className = 'dropdown-label field-dropdown-label';
+  prefix.textContent = prefixText;
+  const value = document.createElement('span');
+  value.className = 'layer-id';
+  value.textContent = valueText;
+  button.appendChild(prefix);
+  button.appendChild(value);
+}
+
+function createFilterDropdownControl({
+  prefixText,
+  options,
+  selectedValue,
+  onSelect,
+  hostClassName = '',
+}) {
+  const wrap = document.createElement('div');
+  wrap.className = `layer-select-wrapper ${hostClassName}`.trim();
+  const dropdown = document.createElement('div');
+  dropdown.className = 'custom-dropdown';
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'layer-select-button';
+  const menu = document.createElement('div');
+  menu.className = 'custom-dropdown-menu';
+
+  const selectedOption = options.find((option) => option.value === selectedValue) || options[0];
+  setFilterDropdownButtonContent(button, prefixText, selectedOption ? selectedOption.label : '');
+
+  options.forEach((option) => {
+    const item = document.createElement('div');
+    item.className = 'custom-dropdown-item';
+    if (option.value === selectedValue) item.classList.add('selected');
+    const value = document.createElement('span');
+    value.className = 'layer-id';
+    value.textContent = option.label;
+    item.appendChild(value);
+    item.addEventListener('click', () => {
+      setFilterDropdownButtonContent(button, prefixText, option.label);
+      menu.querySelectorAll('.custom-dropdown-item').forEach((el) => {
+        el.classList.toggle('selected', el === item);
+      });
+      onSelect(option.value);
+      closeDropdownMenu(menu);
+    });
+    menu.appendChild(item);
+  });
+
+  button.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    toggleDropdownMenu(button, menu);
+  });
+
+  dropdown.appendChild(button);
+  dropdown.appendChild(menu);
+  wrap.appendChild(dropdown);
+  return wrap;
+}
+
+function summarizeMultiSelectOptions(options, selectedSet) {
+  if (selectedSet.has(FILTER_SCOPE_ALL_KEY)) return 'All';
+  const selected = options.filter((option) => selectedSet.has(option.value));
+  if (selected.length === 0) return 'None';
+  if (selected.length === options.length) return 'All';
+  if (selected.length === 1) return selected[0].label;
+  return `${selected.length} selected`;
+}
+
+function createFilterMultiSelectDropdownControl({
+  prefixText,
+  options,
+  selectedValues,
+  onChange,
+  hostClassName = '',
+}) {
+  const wrap = document.createElement('div');
+  wrap.className = `layer-select-wrapper ${hostClassName}`.trim();
+  const dropdown = document.createElement('div');
+  dropdown.className = 'custom-dropdown';
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'layer-select-button';
+  const menu = document.createElement('div');
+  menu.className = 'custom-dropdown-menu';
+
+  const validValues = new Set(options.map((option) => option.value));
+  validValues.add(FILTER_SCOPE_ALL_KEY);
+  const fallbackToAll = !Array.isArray(selectedValues);
+  const selectedSet = new Set(
+    normalizeRuleScopeSelection(selectedValues, fallbackToAll).filter((value) => validValues.has(value)),
+  );
+  const items = [];
+
+  const refreshButtonLabel = () => {
+    setFilterDropdownButtonContent(
+      button,
+      prefixText,
+      summarizeMultiSelectOptions(options, selectedSet),
+    );
+  };
+  const refreshItems = () => {
+    const allActive = selectedSet.has(FILTER_SCOPE_ALL_KEY);
+    items.forEach(({ value, checkbox, item }) => {
+      const checked = allActive ? (value === FILTER_SCOPE_ALL_KEY) : selectedSet.has(value);
+      checkbox.checked = checked;
+      item.classList.toggle('selected', checked);
+    });
+  };
+  const applySelection = () => {
+    refreshButtonLabel();
+    refreshItems();
+    onChange(Array.from(selectedSet));
+  };
+
+  const menuOptions = [{ value: FILTER_SCOPE_ALL_KEY, label: 'All' }, ...options];
+  menuOptions.forEach((option) => {
+    const optionValue = option.value;
+    const item = document.createElement('div');
+    item.className = 'custom-dropdown-item filter-multiselect-item';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.className = 'filter-multiselect-checkbox';
+
+    const value = document.createElement('span');
+    value.className = 'layer-id';
+    value.textContent = option.label;
+    item.appendChild(checkbox);
+    item.appendChild(value);
+
+    const applyToggle = (nextChecked) => {
+      if (optionValue === FILTER_SCOPE_ALL_KEY) {
+        if (nextChecked) {
+          selectedSet.clear();
+          selectedSet.add(FILTER_SCOPE_ALL_KEY);
+        } else {
+          selectedSet.delete(FILTER_SCOPE_ALL_KEY);
+        }
+      } else if (nextChecked) {
+        selectedSet.delete(FILTER_SCOPE_ALL_KEY);
+        selectedSet.add(optionValue);
+      } else {
+        selectedSet.delete(optionValue);
+      }
+      applySelection();
+    };
+
+    checkbox.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+    });
+    checkbox.addEventListener('change', (ev) => {
+      ev.stopPropagation();
+      applyToggle(checkbox.checked);
+    });
+    item.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      applyToggle(!checkbox.checked);
+    });
+    items.push({ value: optionValue, checkbox, item });
+    menu.appendChild(item);
+  });
+
+  refreshButtonLabel();
+  refreshItems();
+
+  button.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    toggleDropdownMenu(button, menu);
+  });
+
+  dropdown.appendChild(button);
+  dropdown.appendChild(menu);
+  wrap.appendChild(dropdown);
+  return wrap;
+}
+
 function closeDropdownMenu(menu) {
   if (dropdownPortal && menu.parentElement === dropdownPortal) {
     const host = menu.__hostElement || null;
@@ -936,27 +1207,13 @@ function getScalarMeta(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
   return resolved;
 }
 
-function applyStoredColors(entry, colors) {
-  if (!entry.colorGeometry) return;
-  setStoredColorAttribute(entry.colorGeometry, colors);
-}
-
-function applyColorsFromValues(entry, values, meta) {
+function buildColorsFromValues(values, meta) {
   const preset = getColormapPreset(meta && meta.cmap);
   const samples = preset && Array.isArray(preset.samples) ? preset.samples : null;
-  if (!samples || samples.length === 0 || !values || typeof values.length !== 'number') return false;
+  if (!samples || samples.length === 0 || !values || typeof values.length !== 'number') return null;
 
   const colorCount = values.length * 3;
-  if (!entry.colorGeometry) return false;
-  const existing = entry.colorGeometry.getAttribute('color');
-  const colors = (
-    existing
-    && existing.array instanceof Uint8Array
-    && existing.array.length === colorCount
-    && existing.normalized
-  )
-    ? existing.array
-    : new Uint8Array(colorCount);
+  const colors = new Uint8Array(colorCount);
   const minVal = Number.isFinite(meta.min) ? meta.min : 0.0;
   const maxVal = Number.isFinite(meta.max) ? meta.max : 1.0;
   const denom = Math.max(maxVal - minVal, 1e-8);
@@ -975,40 +1232,29 @@ function applyColorsFromValues(entry, values, meta) {
     colors[(idx * 3) + 1] = Math.round(left[1] + (right[1] - left[1]) * mix);
     colors[(idx * 3) + 2] = Math.round(left[2] + (right[2] - left[2]) * mix);
   }
+  return colors;
+}
 
-  if (
-    existing
-    && existing.array instanceof Uint8Array
-    && existing.array.length === colorCount
-    && existing.normalized
-  ) {
-    existing.needsUpdate = true;
-    return true;
-  }
-
-  entry.colorGeometry.setAttribute('color', createStoredColorAttribute(colors));
-  return true;
+function resolveEntryRawColors(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
+  const rawColors = getEntryRawColors(entry, fieldIdx);
+  const decoded = decodeArraySpec(rawColors, Uint8Array);
+  if (decoded && decoded.length > 0) return decoded;
+  return decodeArraySpec(entry.layer.colors, Uint8Array) || new Uint8Array(0);
 }
 
 function renderEntryColors(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
   const fieldValues = entry.layer.field_values || null;
   const values = fieldValues ? fieldValues[fieldIdx] : entry.layer.values || null;
-  const rawColors = getEntryRawColors(entry, fieldIdx);
+  const rawColors = resolveEntryRawColors(entry, fieldIdx);
   const cmapName = getEntryCmap(entry, fieldIdx);
   const meta = getScalarMeta(entry, fieldIdx);
-  const updatedFromValues = !isNoCmap(cmapName) && values && meta ? applyColorsFromValues(entry, values, meta) : false;
-
-  if (updatedFromValues) {
-    entry.colorGeometry?.attributes?.color && (entry.colorGeometry.attributes.color.needsUpdate = true);
-  } else if (rawColors) {
-    applyStoredColors(entry, rawColors);
-  } else {
-    applyStoredColors(entry, entry.layer.colors);
-  }
+  const colorFromValues = !isNoCmap(cmapName) && values && meta ? buildColorsFromValues(values, meta) : null;
 
   entry.activeFieldIdx = fieldIdx;
   entry.activeValues = values;
   entry.activeCmap = cmapName;
+  entry.currentColors = colorFromValues || rawColors;
+  applyFiltersToEntry(entry);
   requestRenderAndHover();
 }
 
@@ -1041,14 +1287,686 @@ function setColorClipBoundary(entry, fieldIdx, boundary, value) {
   hideHoverTooltip();
 }
 
+function getEntryScopeKey(entry) {
+  return `layer:${entry.layerId}`;
+}
+
+function getAllScopeKeys() {
+  return layers.map((entry) => getEntryScopeKey(entry));
+}
+
+function normalizeRuleScopeSelection(scopeKeys, fallbackToAll = true) {
+  const validKeys = new Set(getAllScopeKeys());
+  if (!Array.isArray(scopeKeys)) {
+    return fallbackToAll ? [FILTER_SCOPE_ALL_KEY] : [];
+  }
+  if (scopeKeys.includes(FILTER_SCOPE_ALL_KEY)) {
+    return [FILTER_SCOPE_ALL_KEY];
+  }
+  const resolved = [];
+  scopeKeys.forEach((key) => {
+    if (!validKeys.has(key)) return;
+    if (resolved.includes(key)) return;
+    resolved.push(key);
+  });
+  if (resolved.length === 0 && fallbackToAll) {
+    return [FILTER_SCOPE_ALL_KEY];
+  }
+  return resolved;
+}
+
+function resolveScopeKeys(scopeKeys, fallbackToAll = true) {
+  const normalized = normalizeRuleScopeSelection(scopeKeys, fallbackToAll);
+  const validKeys = new Set(getAllScopeKeys());
+  if (normalized.includes(FILTER_SCOPE_ALL_KEY)) {
+    return Array.from(validKeys);
+  }
+  return normalized.filter((key) => validKeys.has(key));
+}
+
+function getScopedEntries(scopeKeys, fallbackToAll = true) {
+  const resolved = resolveScopeKeys(scopeKeys, fallbackToAll);
+  if (resolved.length === 0) return [];
+  const keySet = new Set(resolved);
+  return layers.filter((entry) => keySet.has(getEntryScopeKey(entry)));
+}
+
+function isEntryWithinScope(entry, scopeKeys, fallbackToAll = true) {
+  const resolved = resolveScopeKeys(scopeKeys, fallbackToAll);
+  if (resolved.length === 0) return false;
+  return resolved.includes(getEntryScopeKey(entry));
+}
+
+function getEntryPositions(entry) {
+  return entry.layerKind === 'pointcloud' ? entry.layer.points : entry.layer.vertices;
+}
+
+function getEntryElementCount(entry) {
+  const positions = getEntryPositions(entry);
+  return Math.floor((positions && positions.length ? positions.length : 0) / 3);
+}
+
+function getEntryFieldValuesByName(entry, fieldName) {
+  if (!fieldName || !entry.fieldLookup) return null;
+  return entry.fieldLookup.get(fieldName) || null;
+}
+
+function computeFiniteAxisRange(positions, axisIdx) {
+  if (!positions || positions.length === 0) return null;
+  let minVal = Infinity;
+  let maxVal = -Infinity;
+  for (let idx = axisIdx; idx < positions.length; idx += 3) {
+    const value = Number(positions[idx]);
+    if (!Number.isFinite(value)) continue;
+    minVal = Math.min(minVal, value);
+    maxVal = Math.max(maxVal, value);
+  }
+  if (!Number.isFinite(minVal) || !Number.isFinite(maxVal)) return null;
+  return { min: minVal, max: maxVal };
+}
+
+function computeScopePositionRanges(scopeKeys) {
+  const ranges = {
+    x: { min: Infinity, max: -Infinity },
+    y: { min: Infinity, max: -Infinity },
+    z: { min: Infinity, max: -Infinity },
+  };
+  let hasValue = false;
+  for (const entry of getScopedEntries(scopeKeys, false)) {
+    const positions = getEntryPositions(entry);
+    const x = computeFiniteAxisRange(positions, 0);
+    const y = computeFiniteAxisRange(positions, 1);
+    const z = computeFiniteAxisRange(positions, 2);
+    if (!x || !y || !z) continue;
+    hasValue = true;
+    ranges.x.min = Math.min(ranges.x.min, x.min);
+    ranges.x.max = Math.max(ranges.x.max, x.max);
+    ranges.y.min = Math.min(ranges.y.min, y.min);
+    ranges.y.max = Math.max(ranges.y.max, y.max);
+    ranges.z.min = Math.min(ranges.z.min, z.min);
+    ranges.z.max = Math.max(ranges.z.max, z.max);
+  }
+  if (!hasValue) return null;
+  return ranges;
+}
+
+function computeScopeFieldRange(scopeKey, fieldName) {
+  let minVal = Infinity;
+  let maxVal = -Infinity;
+  let hasValue = false;
+  for (const entry of getScopedEntries(scopeKey, false)) {
+    const values = getEntryFieldValuesByName(entry, fieldName);
+    if (!values || values.length === 0) continue;
+    const range = computeFiniteValueRange(values);
+    if (!range) continue;
+    hasValue = true;
+    minVal = Math.min(minVal, range.min);
+    maxVal = Math.max(maxVal, range.max);
+  }
+  if (!hasValue) return null;
+  return { min: minVal, max: maxVal };
+}
+
+function getFilterFieldNames() {
+  const names = new Set();
+  for (const entry of layers) {
+    const fieldNames = entry.layer.field_names || [];
+    fieldNames.forEach((name) => names.add(String(name)));
+  }
+  return Array.from(names);
+}
+
+function getFilterPropertyOptions() {
+  const options = [{ value: FILTER_POSITION, label: 'Position (x/y/z)' }];
+  getFilterFieldNames().forEach((fieldName) => {
+    options.push({ value: `field:${fieldName}`, label: fieldName });
+  });
+  return options;
+}
+
+function getRuleDomain(rule, scopeKeys) {
+  if (!rule || !rule.property) return null;
+  if (rule.property === FILTER_POSITION) {
+    const ranges = computeScopePositionRanges(scopeKeys);
+    if (!ranges) return null;
+    return { kind: FILTER_POSITION, ranges };
+  }
+  if (rule.property.startsWith('field:')) {
+    const fieldName = rule.property.slice(6);
+    const range = computeScopeFieldRange(scopeKeys, fieldName);
+    if (!range) return null;
+    return { kind: 'field', fieldName, range };
+  }
+  return null;
+}
+
+function sliderToFilterFrac(value, fallback = 0.0) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return clampUnit(numeric / FILTER_SLIDER_MAX, fallback);
+}
+
+function filterFracToSlider(frac, fallback = 0.0) {
+  return Math.round(clampUnit(frac, fallback) * FILTER_SLIDER_MAX);
+}
+
+function rangeFromClip(range, clipState) {
+  if (!range) return null;
+  return applyClipToRange(range, clipState);
+}
+
+function createDefaultRule(property) {
+  return {
+    id: `rule-${filterRuleCounter += 1}`,
+    scopeKeys: [FILTER_SCOPE_ALL_KEY],
+    property: property || FILTER_POSITION,
+    expanded: true,
+    scalarClip: createClipState(),
+    positionClip: {
+      x: createClipState(),
+      y: createClipState(),
+      z: createClipState(),
+    },
+  };
+}
+
+function collectMaskIndices(mask, keepPassed) {
+  const list = [];
+  for (let idx = 0; idx < mask.length; idx += 1) {
+    if (Boolean(mask[idx]) === Boolean(keepPassed)) {
+      list.push(idx);
+    }
+  }
+  return list;
+}
+
+function buildPointSubsetData(entry, sourceIndices) {
+  const basePositions = entry.layer.points;
+  const baseColors = entry.currentColors || decodeArraySpec(entry.layer.colors, Uint8Array) || new Uint8Array(0);
+  const positions = new Float32Array(sourceIndices.length * 3);
+  const colors = new Uint8Array(sourceIndices.length * 3);
+  for (let outIdx = 0; outIdx < sourceIndices.length; outIdx += 1) {
+    const srcIdx = sourceIndices[outIdx];
+    const srcBase = srcIdx * 3;
+    const dstBase = outIdx * 3;
+    positions[dstBase] = basePositions[srcBase];
+    positions[dstBase + 1] = basePositions[srcBase + 1];
+    positions[dstBase + 2] = basePositions[srcBase + 2];
+    colors[dstBase] = baseColors[srcBase];
+    colors[dstBase + 1] = baseColors[srcBase + 1];
+    colors[dstBase + 2] = baseColors[srcBase + 2];
+  }
+  return { positions, colors };
+}
+
+function setPointObjectSubset(entry, object3d, sourceIndices, kind = 'unmasked') {
+  const geometry = object3d.geometry;
+  const subset = buildPointSubsetData(entry, sourceIndices);
+  setPositionAttribute(geometry, subset.positions);
+  setStoredColorAttribute(geometry, subset.colors);
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+  object3d.userData.sourceIndices = sourceIndices;
+  object3d.userData.maskKind = kind;
+}
+
+function splitMeshFacesByMask(faces, passMask) {
+  const unmasked = [];
+  const masked = [];
+  for (let idx = 0; idx + 2 < faces.length; idx += 3) {
+    const a = faces[idx];
+    const b = faces[idx + 1];
+    const c = faces[idx + 2];
+    if (passMask[a] && passMask[b] && passMask[c]) {
+      unmasked.push(a, b, c);
+    } else {
+      masked.push(a, b, c);
+    }
+  }
+  return {
+    unmaskedFaces: new Uint32Array(unmasked),
+    maskedFaces: new Uint32Array(masked),
+  };
+}
+
+function updateMeshEdgeLinesFromGeometry(entry) {
+  if (!entry.edgeLines || !entry.mesh) return;
+  const wireframeGeometry = new THREE.WireframeGeometry(entry.mesh.geometry);
+  const attr = wireframeGeometry.getAttribute('position');
+  const positions = attr ? Array.from(attr.array) : [];
+  wireframeGeometry.dispose();
+  entry.edgeLines.geometry.setPositions(positions);
+}
+
+function updatePointLinesFromMask(entry, passMask) {
+  if (!entry.pointLines) return;
+  const baseEdges = entry.layer.edges;
+  const basePositions = entry.layer.points;
+  if (!baseEdges || baseEdges.length < 2) {
+    entry.pointLines.geometry.setPositions([]);
+    return;
+  }
+  const positions = [];
+  for (let idx = 0; idx + 1 < baseEdges.length; idx += 2) {
+    const i = baseEdges[idx];
+    const j = baseEdges[idx + 1];
+    if (!passMask[i] || !passMask[j]) continue;
+    const iBase = i * 3;
+    const jBase = j * 3;
+    if (iBase + 2 >= basePositions.length || jBase + 2 >= basePositions.length) continue;
+    positions.push(
+      basePositions[iBase], basePositions[iBase + 1], basePositions[iBase + 2],
+      basePositions[jBase], basePositions[jBase + 1], basePositions[jBase + 2],
+    );
+  }
+  entry.pointLines.geometry.setPositions(positions);
+}
+
+function evaluateFieldRuleOnMask(entry, mask, rule, domain) {
+  const fieldName = domain.fieldName;
+  const values = getEntryFieldValuesByName(entry, fieldName);
+  if (!values) return;
+  const activeRange = rangeFromClip(domain.range, rule.scalarClip || createClipState());
+  if (!activeRange) return;
+  for (let idx = 0; idx < values.length; idx += 1) {
+    if (!mask[idx]) continue;
+    const value = Number(values[idx]);
+    if (!Number.isFinite(value) || value < activeRange.min || value > activeRange.max) {
+      mask[idx] = 0;
+    }
+  }
+}
+
+function evaluatePositionRuleOnMask(entry, mask, rule, domain) {
+  const positions = getEntryPositions(entry);
+  if (!positions || positions.length === 0) return;
+  const ranges = domain.ranges;
+  const xRange = rangeFromClip(ranges.x, rule.positionClip?.x || createClipState());
+  const yRange = rangeFromClip(ranges.y, rule.positionClip?.y || createClipState());
+  const zRange = rangeFromClip(ranges.z, rule.positionClip?.z || createClipState());
+  if (!xRange || !yRange || !zRange) return;
+  const count = getEntryElementCount(entry);
+  for (let idx = 0; idx < count; idx += 1) {
+    if (!mask[idx]) continue;
+    const base = idx * 3;
+    const x = Number(positions[base]);
+    const y = Number(positions[base + 1]);
+    const z = Number(positions[base + 2]);
+    const valid = Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)
+      && x >= xRange.min && x <= xRange.max
+      && y >= yRange.min && y <= yRange.max
+      && z >= zRange.min && z <= zRange.max;
+    if (!valid) {
+      mask[idx] = 0;
+    }
+  }
+}
+
+function computeEntryPassMask(entry) {
+  const count = getEntryElementCount(entry);
+  const mask = new Uint8Array(count);
+  mask.fill(1);
+  if (!filterState.rules || filterState.rules.length === 0) {
+    return mask;
+  }
+  for (const rule of filterState.rules) {
+    const ruleScopeKeys = resolveScopeKeys(rule.scopeKeys, false);
+    if (ruleScopeKeys.length === 0) continue;
+    if (!isEntryWithinScope(entry, ruleScopeKeys, false)) continue;
+    const domain = getRuleDomain(rule, ruleScopeKeys);
+    if (!domain) continue;
+    if (domain.kind === FILTER_POSITION) {
+      evaluatePositionRuleOnMask(entry, mask, rule, domain);
+    } else if (domain.kind === 'field') {
+      evaluateFieldRuleOnMask(entry, mask, rule, domain);
+    }
+  }
+  return mask;
+}
+
+function applyFiltersToEntry(entry) {
+  if (!entry) return;
+  const colors = entry.currentColors || decodeArraySpec(entry.layer.colors, Uint8Array) || new Uint8Array(0);
+  const passMask = computeEntryPassMask(entry);
+  entry.passMask = passMask;
+
+  if (entry.layerKind === 'pointcloud') {
+    const unmaskedIndices = collectMaskIndices(passMask, true);
+    const maskedIndices = collectMaskIndices(passMask, false);
+    setPointObjectSubset(entry, entry.points, unmaskedIndices, 'unmasked');
+    setPointObjectSubset(entry, entry.maskedPoints, maskedIndices, 'masked');
+    entry.unmaskedPointCount = unmaskedIndices.length;
+    entry.maskedPointCount = maskedIndices.length;
+    updatePointLinesFromMask(entry, passMask);
+  } else {
+    setStoredColorAttribute(entry.mesh.geometry, colors);
+    setStoredColorAttribute(entry.maskedMesh.geometry, colors);
+    const splitFaces = splitMeshFacesByMask(entry.layer.faces, passMask);
+    setIndexAttribute(entry.mesh.geometry, splitFaces.unmaskedFaces);
+    refreshMeshBounds(entry.mesh.geometry);
+    setIndexAttribute(entry.maskedMesh.geometry, splitFaces.maskedFaces);
+    refreshMeshBounds(entry.maskedMesh.geometry);
+    entry.unmaskedFaceCount = Math.floor(splitFaces.unmaskedFaces.length / 3);
+    entry.maskedFaceCount = Math.floor(splitFaces.maskedFaces.length / 3);
+    updateMeshEdgeLinesFromGeometry(entry);
+  }
+
+  updateEntryOpacity(entry, entry.opacity);
+  updateEntryEdgeOverlay(entry);
+}
+
+function applyFiltersToAllEntries() {
+  for (const entry of layers) {
+    applyFiltersToEntry(entry);
+  }
+  requestRenderAndHover();
+}
+
+function formatFilterValue(value) {
+  return Number.isFinite(value) ? Number(value).toFixed(4) : 'n/a';
+}
+
+function createDualSliderControl({
+  clipState,
+  range,
+  label,
+  onChanged,
+}) {
+  const wrap = document.createElement('div');
+  wrap.className = 'filter-control';
+  const title = document.createElement('label');
+  title.textContent = label;
+
+  const valuesLabel = document.createElement('div');
+  valuesLabel.className = 'filter-dual-label';
+  const left = document.createElement('span');
+  const right = document.createElement('span');
+  valuesLabel.appendChild(left);
+  valuesLabel.appendChild(right);
+
+  const slider = document.createElement('div');
+  slider.className = 'filter-dual-slider';
+  const track = document.createElement('div');
+  track.className = 'filter-dual-track';
+  const fill = document.createElement('div');
+  fill.className = 'filter-dual-fill';
+  const minInput = document.createElement('input');
+  minInput.type = 'range';
+  minInput.min = '0';
+  minInput.max = String(FILTER_SLIDER_MAX);
+  minInput.step = '1';
+  minInput.value = String(filterFracToSlider(clipState.minFrac, 0.0));
+  const maxInput = document.createElement('input');
+  maxInput.type = 'range';
+  maxInput.min = '0';
+  maxInput.max = String(FILTER_SLIDER_MAX);
+  maxInput.step = '1';
+  maxInput.value = String(filterFracToSlider(clipState.maxFrac, 1.0));
+
+  slider.appendChild(track);
+  slider.appendChild(fill);
+  slider.appendChild(minInput);
+  slider.appendChild(maxInput);
+
+  const sync = () => {
+    minInput.value = String(filterFracToSlider(clipState.minFrac, 0.0));
+    maxInput.value = String(filterFracToSlider(clipState.maxFrac, 1.0));
+    const startPct = clampUnit(clipState.minFrac, 0.0) * 100.0;
+    const endPct = clampUnit(clipState.maxFrac, 1.0) * 100.0;
+    fill.style.left = `${startPct}%`;
+    fill.style.width = `${Math.max(0.0, endPct - startPct)}%`;
+    const clippedRange = rangeFromClip(range, clipState);
+    left.textContent = formatFilterValue(clippedRange?.min);
+    right.textContent = formatFilterValue(clippedRange?.max);
+  };
+
+  minInput.addEventListener('input', () => {
+    setClipBoundary(clipState, 'min', sliderToFilterFrac(minInput.value, 0.0));
+    sync();
+    onChanged();
+  });
+  maxInput.addEventListener('input', () => {
+    setClipBoundary(clipState, 'max', sliderToFilterFrac(maxInput.value, 1.0));
+    sync();
+    onChanged();
+  });
+
+  sync();
+  wrap.appendChild(title);
+  wrap.appendChild(valuesLabel);
+  wrap.appendChild(slider);
+  return wrap;
+}
+
+function pickDefaultRuleProperty(scopeKeys = null) {
+  const resolvedScopeKeys = resolveScopeKeys(scopeKeys, true);
+  const options = getFilterPropertyOptions();
+  for (const option of options) {
+    const domain = getRuleDomain({ property: option.value }, resolvedScopeKeys);
+    if (domain) return option.value;
+  }
+  return FILTER_POSITION;
+}
+
+function onFilterRulesUpdated() {
+  applyFiltersToAllEntries();
+  updateFilterPanelUI();
+  hideHoverTooltip();
+}
+
+function updateFilterPanelUI() {
+  if (!filterRulesList) return;
+
+  const scopeOptions = [];
+  layers.forEach((entry, idx) => {
+    scopeOptions.push({ value: getEntryScopeKey(entry), label: `${idx + 1}. ${entry.layer.label}` });
+  });
+
+  filterRulesList.innerHTML = '';
+  if (!filterState.rules || filterState.rules.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'filter-empty-rules';
+    empty.textContent = 'No active rules. Add one to start filtering.';
+    filterRulesList.appendChild(empty);
+  } else {
+    const propertyOptions = getFilterPropertyOptions();
+    filterState.rules.forEach((rule) => {
+      if (Array.isArray(rule.scopeKeys)) {
+        rule.scopeKeys = normalizeRuleScopeSelection(rule.scopeKeys, false);
+      } else {
+        rule.scopeKeys = normalizeRuleScopeSelection(rule.scopeKeys, true);
+      }
+      if (typeof rule.expanded !== 'boolean') rule.expanded = true;
+      const row = document.createElement('div');
+      row.className = 'filter-rule-row';
+      const top = document.createElement('div');
+      top.className = 'filter-rule-top';
+
+      const body = document.createElement('div');
+      body.className = 'filter-rule-body';
+      body.classList.toggle('hidden', !rule.expanded);
+
+      const expandButton = document.createElement('button');
+      expandButton.type = 'button';
+      expandButton.className = 'layer-options-toggle filter-rule-toggle';
+      expandButton.setAttribute('aria-label', 'Toggle rule controls');
+      expandButton.setAttribute('aria-expanded', rule.expanded ? 'true' : 'false');
+      expandButton.textContent = rule.expanded ? '▾' : '▸';
+      expandButton.addEventListener('click', () => {
+        rule.expanded = !rule.expanded;
+        expandButton.setAttribute('aria-expanded', rule.expanded ? 'true' : 'false');
+        expandButton.textContent = rule.expanded ? '▾' : '▸';
+        body.classList.toggle('hidden', !rule.expanded);
+        if (!rule.expanded) closeAllDropdownMenus();
+      });
+
+      const propertyDropdown = createFilterDropdownControl({
+        prefixText: 'Property:',
+        options: propertyOptions,
+        selectedValue: rule.property,
+        onSelect: (nextProperty) => {
+          if (rule.property === nextProperty) return;
+          rule.property = nextProperty;
+          rule.scalarClip = createClipState();
+          rule.positionClip = {
+            x: createClipState(),
+            y: createClipState(),
+            z: createClipState(),
+          };
+          onFilterRulesUpdated();
+        },
+        hostClassName: 'filter-rule-select-host',
+      });
+
+      const removeButton = document.createElement('button');
+      removeButton.type = 'button';
+      removeButton.className = 'filter-remove-rule-btn';
+      removeButton.title = 'Remove rule';
+      removeButton.textContent = '×';
+      removeButton.addEventListener('click', () => {
+        filterState.rules = filterState.rules.filter((candidate) => candidate.id !== rule.id);
+        onFilterRulesUpdated();
+      });
+
+      top.appendChild(expandButton);
+      top.appendChild(propertyDropdown);
+      top.appendChild(removeButton);
+      row.appendChild(top);
+
+      body.appendChild(createFilterMultiSelectDropdownControl({
+        prefixText: 'Scope:',
+        options: scopeOptions,
+        selectedValues: rule.scopeKeys || [],
+        onChange: (nextValues) => {
+          rule.scopeKeys = nextValues;
+          onFilterRulesUpdated();
+        },
+        hostClassName: 'filter-rule-scope-host',
+      }));
+
+      const domain = getRuleDomain(rule, rule.scopeKeys || []);
+      if (!domain) {
+        row.classList.add('disabled');
+        const msg = document.createElement('div');
+        msg.className = 'filter-empty-rules';
+        msg.textContent = 'No matching values in current scope.';
+        body.appendChild(msg);
+      } else if (domain.kind === FILTER_POSITION) {
+        const axisWrap = document.createElement('div');
+        axisWrap.className = 'filter-position-grid';
+        ['x', 'y', 'z'].forEach((axis) => {
+          const sliderControl = createDualSliderControl({
+            clipState: rule.positionClip[axis],
+            range: domain.ranges[axis],
+            label: `Position ${axis.toUpperCase()}`,
+            onChanged: () => {
+              applyFiltersToAllEntries();
+              hideHoverTooltip();
+            },
+          });
+          const axisRow = document.createElement('div');
+          axisRow.className = 'filter-position-axis';
+          axisRow.appendChild(sliderControl);
+          axisWrap.appendChild(axisRow);
+        });
+        body.appendChild(axisWrap);
+      } else {
+        body.appendChild(createDualSliderControl({
+          clipState: rule.scalarClip,
+          range: domain.range,
+          label: domain.fieldName,
+          onChanged: () => {
+            applyFiltersToAllEntries();
+            hideHoverTooltip();
+          },
+        }));
+      }
+      row.appendChild(body);
+      filterRulesList.appendChild(row);
+    });
+  }
+
+  if (filterMaskedOpacityInput && filterMaskedOpacityValue) {
+    filterMaskedOpacityInput.value = String(filterState.maskedOpacity);
+    filterMaskedOpacityValue.textContent = Number(filterState.maskedOpacity).toFixed(2);
+  }
+}
+
+function setFilterPanelOpen(nextOpen) {
+  filterState.open = Boolean(nextOpen);
+  if (filterPanel) {
+    filterPanel.classList.toggle('collapsed', !filterState.open);
+    filterPanel.setAttribute('aria-hidden', filterState.open ? 'false' : 'true');
+  }
+  if (filterToggleButton) {
+    filterToggleButton.classList.toggle('active', filterState.open);
+    filterToggleButton.textContent = filterState.open ? 'Filters On' : 'Filters';
+    filterToggleButton.title = filterState.open ? 'Hide filters' : 'Show filters';
+    filterToggleButton.setAttribute('aria-label', filterToggleButton.title);
+  }
+}
+
+function initFilterPanelEvents() {
+  if (filterToggleButton) {
+    filterToggleButton.addEventListener('click', () => {
+      setFilterPanelOpen(!filterState.open);
+    });
+  }
+  if (filterCloseButton) {
+    filterCloseButton.addEventListener('click', () => {
+      setFilterPanelOpen(false);
+    });
+  }
+  if (filterPanel) {
+    filterPanel.addEventListener('scroll', () => {
+      closeAllDropdownMenus();
+    }, { passive: true });
+  }
+  if (filterAddRuleButton) {
+    filterAddRuleButton.addEventListener('click', () => {
+      const property = pickDefaultRuleProperty(getAllScopeKeys());
+      filterState.rules.push(createDefaultRule(property));
+      onFilterRulesUpdated();
+    });
+  }
+  if (filterMaskedOpacityInput) {
+    filterMaskedOpacityInput.addEventListener('input', () => {
+      filterState.maskedOpacity = clampUnit(filterMaskedOpacityInput.value, 0.0);
+      if (filterMaskedOpacityValue) {
+        filterMaskedOpacityValue.textContent = Number(filterState.maskedOpacity).toFixed(2);
+      }
+      for (const entry of layers) {
+        updateEntryOpacity(entry, entry.opacity);
+      }
+      requestRenderAndHover();
+      hideHoverTooltip();
+    });
+  }
+  updateFilterPanelUI();
+  setFilterPanelOpen(false);
+}
+
 function fitCamera() {
   const box = new THREE.Box3();
   let hasBox = false;
   for (const entry of layers) {
     if (!entry.visible) continue;
-    if (!entry.mainObject) continue;
-    box.expandByObject(entry.mainObject);
-    hasBox = true;
+    if (entry.mesh?.visible) {
+      box.expandByObject(entry.mesh);
+      hasBox = true;
+    }
+    if (entry.maskedMesh?.visible) {
+      box.expandByObject(entry.maskedMesh);
+      hasBox = true;
+    }
+    if (entry.points?.visible) {
+      box.expandByObject(entry.points);
+      hasBox = true;
+    }
+    if (entry.maskedPoints?.visible) {
+      box.expandByObject(entry.maskedPoints);
+      hasBox = true;
+    }
   }
   if (!hasBox || box.isEmpty()) return;
 
@@ -1323,15 +2241,14 @@ function toHexChannel(value) {
   return Math.round(Math.min(255, Math.max(0, value))).toString(16).padStart(2, '0');
 }
 
-function formatHoverColor(colorAttr, idx) {
-  if (!colorAttr || idx < 0 || idx >= colorAttr.count) return null;
-  let r = colorAttr.getX(idx);
-  let g = colorAttr.getY(idx);
-  let b = colorAttr.getZ(idx);
-  if (![r, g, b].every(Number.isFinite)) return null;
-  const red = Math.round(Math.min(1, Math.max(0, r)) * 255);
-  const green = Math.round(Math.min(1, Math.max(0, g)) * 255);
-  const blue = Math.round(Math.min(1, Math.max(0, b)) * 255);
+function formatHoverColorFromBytes(colors, idx) {
+  if (!colors || idx < 0) return null;
+  const base = idx * 3;
+  if (base + 2 >= colors.length) return null;
+  const red = Number(colors[base]);
+  const green = Number(colors[base + 1]);
+  const blue = Number(colors[base + 2]);
+  if (![red, green, blue].every(Number.isFinite)) return null;
   return {
     rgb: `rgb(${red}, ${green}, ${blue})`,
     hex: `#${toHexChannel(red)}${toHexChannel(green)}${toHexChannel(blue)}`,
@@ -1445,6 +2362,20 @@ function pickBestPointHit(hits) {
   return bestHit;
 }
 
+function getPointSourceIndexFromHit(hit) {
+  if (!hit) return -1;
+  const localIdx = Number(hit.index ?? -1);
+  if (!Number.isFinite(localIdx) || localIdx < 0) return -1;
+  const sourceIndices = hit.object?.userData?.sourceIndices || null;
+  if (Array.isArray(sourceIndices)) {
+    return Number(sourceIndices[localIdx] ?? -1);
+  }
+  if (sourceIndices && typeof sourceIndices.length === 'number') {
+    return Number(sourceIndices[localIdx] ?? -1);
+  }
+  return localIdx;
+}
+
 function updateHoverFromPointer() {
   if (!pointerState.inside) {
     hideHoverTooltip();
@@ -1460,18 +2391,24 @@ function updateHoverFromPointer() {
   let best = null;
   for (const entry of layers) {
     if (!entry.visible) continue;
-    let hit = null;
-    if (entry.points) {
+    const pointObjects = [entry.points, entry.maskedPoints].filter((obj) => obj && obj.visible);
+    for (const obj of pointObjects) {
       raycaster.params.Points.threshold = computePointHoverThreshold(rect.height, entry);
-      const hits = raycaster.intersectObject(entry.points, false);
-      hit = pickBestPointHit(hits);
-    } else if (entry.mesh) {
-      const hits = raycaster.intersectObject(entry.mesh, false);
-      hit = (hits && hits.length > 0) ? hits[0] : null;
+      const hits = raycaster.intersectObject(obj, false);
+      const hit = pickBestPointHit(hits);
+      if (!hit) continue;
+      if (!best || hit.distance < best.hit.distance) {
+        best = { entry, hit };
+      }
     }
-    if (!hit) continue;
-    if (!best || hit.distance < best.hit.distance) {
-      best = { entry, hit };
+    const meshObjects = [entry.mesh, entry.maskedMesh].filter((obj) => obj && obj.visible);
+    for (const obj of meshObjects) {
+      const hits = raycaster.intersectObject(obj, false);
+      const hit = (hits && hits.length > 0) ? hits[0] : null;
+      if (!hit) continue;
+      if (!best || hit.distance < best.hit.distance) {
+        best = { entry, hit };
+      }
     }
   }
 
@@ -1480,23 +2417,28 @@ function updateHoverFromPointer() {
     return;
   }
 
-  const posAttr = best.entry.colorGeometry?.getAttribute('position');
-  const colorAttr = best.entry.colorGeometry?.getAttribute('color');
   let idx = -1;
-  if (best.entry.points) {
-    idx = Number(best.hit.index ?? -1);
-  } else if (best.entry.mesh) {
-    idx = pickClosestFaceVertexIndex(best.hit, best.entry.mesh, posAttr);
+  if (best.entry.layerKind === 'pointcloud') {
+    idx = getPointSourceIndexFromHit(best.hit);
+  } else {
+    const posAttr = best.hit.object?.geometry?.getAttribute('position') || null;
+    idx = pickClosestFaceVertexIndex(best.hit, best.hit.object, posAttr);
   }
   if (idx < 0) {
     hideHoverTooltip();
     return;
   }
 
-  const px = posAttr.getX(idx);
-  const py = posAttr.getY(idx);
-  const pz = posAttr.getZ(idx);
-  const hoverColor = formatHoverColor(colorAttr, idx);
+  const positions = getEntryPositions(best.entry);
+  const base = idx * 3;
+  if (!positions || base + 2 >= positions.length) {
+    hideHoverTooltip();
+    return;
+  }
+  const px = Number(positions[base]);
+  const py = Number(positions[base + 1]);
+  const pz = Number(positions[base + 2]);
+  const hoverColor = formatHoverColorFromBytes(best.entry.currentColors, idx);
   if (!hoverColor) {
     hideHoverTooltip();
     return;
@@ -1557,6 +2499,9 @@ function appendPointLayerOptions(entry, optionGrid) {
       entry.pointSize = value;
       if (entry.points) {
         entry.points.material.uniforms.size.value = value;
+      }
+      if (entry.maskedPoints) {
+        entry.maskedPoints.material.uniforms.size.value = value;
       }
       requestRenderAndHover();
     },
@@ -1754,7 +2699,7 @@ function rebuildLayerList() {
       entry.visible = checkbox.checked;
       if (entry.mesh) entry.mesh.visible = entry.visible;
       if (entry.points) entry.points.visible = entry.visible;
-      if (entry.pointLines) entry.pointLines.visible = entry.visible;
+      updateMaskedObjectVisibility(entry);
       updateEntryEdgeOverlay(entry);
       rebuildLayerList();
       hideHoverTooltip();
@@ -1824,6 +2769,7 @@ function rebuildLayerList() {
   updateColorbars();
   updateInfoPanel();
   updateToggleAllLayers();
+  updateFilterPanelUI();
 }
 
 function updateToggleAllLayers() {
@@ -1847,7 +2793,7 @@ function setAllLayersVisibility(visible) {
     entry.visible = visible;
     if (entry.mesh) entry.mesh.visible = visible;
     if (entry.points) entry.points.visible = visible;
-    if (entry.pointLines) entry.pointLines.visible = visible;
+    updateMaskedObjectVisibility(entry);
     updateEntryEdgeOverlay(entry);
   }
   rebuildLayerList();
@@ -1860,7 +2806,7 @@ document.addEventListener('click', (ev) => {
   }
 });
 
-payload.layers.forEach((rawLayer) => {
+payload.layers.forEach((rawLayer, layerIdx) => {
   const layer = normalizeLayerData(rawLayer);
   const layerKind = getLayerKind(layer);
   const built = layerKind === 'pointcloud' ? buildPoints(layer) : buildMesh(layer);
@@ -1875,17 +2821,23 @@ payload.layers.forEach((rawLayer) => {
   );
   const entry = {
     layer,
+    layerId: layerIdx,
     layerKind,
     mesh: layerKind === 'mesh' ? built.mesh : null,
+    maskedMesh: layerKind === 'mesh' ? built.maskedMesh : null,
     edgeLines: layerKind === 'mesh' ? built.edgeLines : null,
     points: layerKind === 'pointcloud' ? built.points : null,
+    maskedPoints: layerKind === 'pointcloud' ? built.maskedPoints : null,
     pointLines: layerKind === 'pointcloud' ? built.lines : null,
-    mainObject: layerKind === 'mesh' ? built.mesh : built.points,
-    colorGeometry: layerKind === 'mesh' ? built.mesh.geometry : built.points.geometry,
     visible: layer.visible !== false,
     activeFieldIdx: Number.isInteger(layer.active_field_idx) ? layer.active_field_idx : 0,
     activeValues: layer.values || null,
     activeCmap: layer.scalar_meta && layer.scalar_meta.cmap ? layer.scalar_meta.cmap : NO_CMAP,
+    currentColors: decodeArraySpec(layer.colors, Uint8Array) || new Uint8Array(0),
+    unmaskedPointCount: layerKind === 'pointcloud' ? Math.floor(layer.points.length / 3) : 0,
+    maskedPointCount: 0,
+    unmaskedFaceCount: layerKind === 'mesh' ? Math.floor(layer.faces.length / 3) : 0,
+    maskedFaceCount: 0,
     fieldClipStates: Array.from({ length: Math.max(fieldCount, 1) }, () => createClipState()),
     sharedFieldClip: createClipState(),
     shareFieldScale: Boolean(layer.share_field_scale ?? payload.initial_share_field_scale),
@@ -1895,23 +2847,41 @@ payload.layers.forEach((rawLayer) => {
     pointSize: Math.min(12.0, Math.max(1.0, Number(layer.point_size ?? payload.point_size) || 5.0)),
     optionsExpanded: layer.visible !== false,
     fieldOptionsContainer: null,
+    fieldLookup: new Map(),
   };
+  const fieldNamesForLookup = Array.isArray(layer.field_names) ? layer.field_names : [];
+  if (Array.isArray(fieldValues)) {
+    fieldNamesForLookup.forEach((name, idx) => {
+      const values = fieldValues[idx];
+      if (values) entry.fieldLookup.set(String(name), values);
+    });
+  }
   if (entry.mesh) entry.mesh.visible = entry.visible;
+  if (entry.maskedMesh) entry.maskedMesh.visible = false;
   if (entry.points) entry.points.visible = entry.visible;
-  if (entry.pointLines) entry.pointLines.visible = entry.visible;
+  if (entry.maskedPoints) entry.maskedPoints.visible = false;
   updateEntryOpacity(entry, entry.opacity);
   updateEntryEdgeThickness(entry, entry.edgeThickness);
   if (entry.points) {
     entry.points.material.uniforms.size.value = entry.pointSize;
   }
+  if (entry.maskedPoints) {
+    entry.maskedPoints.material.uniforms.size.value = entry.pointSize;
+  }
   updateEntryEdgeOverlay(entry);
   layers.push(entry);
 
   const fieldNames = layer.field_names || null;
+  let didRenderColors = false;
   if (fieldNames && fieldNames.length > 0) {
     setLayerField(entry, Math.max(0, Math.min(entry.activeFieldIdx, fieldNames.length - 1)));
+    didRenderColors = true;
   } else if (fieldValues || layer.values) {
     renderEntryColors(entry, entry.activeFieldIdx);
+    didRenderColors = true;
+  }
+  if (!didRenderColors) {
+    applyFiltersToEntry(entry);
   }
 });
 
@@ -1922,6 +2892,8 @@ if (toggleAllLayersInput) {
   });
 }
 
+initFilterPanelEvents();
+applyFiltersToAllEntries();
 rebuildLayerList();
 refreshEdgeOverlay();
 
@@ -1931,15 +2903,23 @@ document.getElementById('btn-theme-mode').addEventListener('click', () => {
 const commandsToggleBtn = document.getElementById('btn-toggle-commands');
 const controlsPanel = document.getElementById('controls');
 if (commandsToggleBtn && controlsPanel) {
-  const updateCommandsToggleButton = () => {
+  const setCommandsVisible = (nextVisible) => {
+    commandsVisible = Boolean(nextVisible);
+    controlsPanel.classList.toggle('collapsed', !commandsVisible);
     commandsToggleBtn.textContent = commandsVisible ? 'Hide Commands' : 'Show Commands';
     commandsToggleBtn.classList.toggle('active', !commandsVisible);
   };
+  const updateCommandsToggleButton = () => {
+    setCommandsVisible(commandsVisible);
+  };
   commandsToggleBtn.addEventListener('click', () => {
-    commandsVisible = !commandsVisible;
-    controlsPanel.classList.toggle('collapsed', !commandsVisible);
-    updateCommandsToggleButton();
+    setCommandsVisible(!commandsVisible);
   });
+  if (controlsCloseButton) {
+    controlsCloseButton.addEventListener('click', () => {
+      setCommandsVisible(false);
+    });
+  }
   updateCommandsToggleButton();
   controlsPanel.addEventListener('scroll', () => {
     closeAllDropdownMenus();
