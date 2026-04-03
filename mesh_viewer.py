@@ -3,8 +3,6 @@ from __future__ import annotations
 import base64
 from typing import Any, Mapping
 
-import matplotlib.colors as mcolors
-import matplotlib.pyplot as plt
 import numpy as np
 try:
     import torch
@@ -14,16 +12,18 @@ except Exception:  # pragma: no cover - optional dependency in some environments
 try:
     from .viewer_common import (
         ViewerFigureBase,
-        _raw_scalar_gradient,
-        _sample_cmap,
+        _prepare_color_data,
+        _remap_filtered_indices,
         _to_numpy,
+        _to_uint8_rgb,
     )
 except ImportError:  # pragma: no cover - allow direct module imports from the repo root
     from viewer_common import (
         ViewerFigureBase,
-        _raw_scalar_gradient,
-        _sample_cmap,
+        _prepare_color_data,
+        _remap_filtered_indices,
         _to_numpy,
+        _to_uint8_rgb,
     )
 
 
@@ -62,58 +62,13 @@ def _prepare_vertex_colors(
     vertex_count: int,
     cmap: str | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, dict[str, Any] | None]:
-    scalar_meta = None
-    scalar_values: np.ndarray | None = None
-
-    if isinstance(vertex_color, str):
-        rgb = np.asarray(mcolors.to_rgb(vertex_color), dtype=np.float32)
-        colors = np.repeat(rgb[None, :], vertex_count, axis=0)
-        raw_colors = colors
-    else:
-        color_arr = _to_numpy(vertex_color)
-        if color_arr is None:
-            raise ValueError("vertex_color cannot be None")
-        color_arr = np.asarray(color_arr)
-        base_shape = raw_vertex_shape[:-1]
-
-        if list(color_arr.shape) != list(raw_vertex_shape):
-            if color_arr.shape == tuple(base_shape):
-                scalar_values = np.asarray(color_arr, dtype=np.float32).reshape(-1)
-                color_arr = np.repeat(color_arr[..., None], 3, axis=-1)
-            elif color_arr.shape == tuple(base_shape) + (1,):
-                scalar_values = np.asarray(color_arr, dtype=np.float32).reshape(-1)
-                color_arr = np.repeat(color_arr, 3, axis=-1)
-            else:
-                raise ValueError(f"Unrecognized vertex_color shape {color_arr.shape}")
-
-        color_arr = np.asarray(color_arr, dtype=np.float32).reshape(-1, 3)
-        if scalar_values is None:
-            scalar_values = color_arr[:, 0].astype(np.float32, copy=False)
-        raw_colors = color_arr
-
-        scalar_vals = scalar_values.astype(np.float32, copy=False)
-        finite_scalar = np.isfinite(scalar_vals)
-        if np.any(finite_scalar):
-            finite_vals = scalar_vals[finite_scalar]
-            min_val = float(np.min(finite_vals))
-            max_val = float(np.max(finite_vals))
-        else:
-            min_val, max_val = 0.0, 1.0
-        scalar_meta = {
-            "min": min_val,
-            "max": max_val,
-            "cmap": cmap,
-            "gradient": _sample_cmap(cmap) if cmap is not None else _raw_scalar_gradient(min_val, max_val),
-        }
-
-        if cmap is not None:
-            norm = (scalar_vals - min_val) / max(max_val - min_val, 1e-8)
-            norm = np.nan_to_num(norm, nan=0.0, posinf=1.0, neginf=0.0)
-            colors = plt.get_cmap(cmap)(norm)[:, :3].astype(np.float32)
-        else:
-            colors = color_arr
-
-    return colors, raw_colors, scalar_values, scalar_meta
+    return _prepare_color_data(
+        vertex_color,
+        raw_geometry_shape=raw_vertex_shape,
+        item_count=vertex_count,
+        cmap=cmap,
+        color_label="vertex_color",
+    )
 
 
 def _filter_mesh_geometry(
@@ -126,26 +81,7 @@ def _filter_mesh_geometry(
     else:
         verts = np.zeros((0, 3), dtype=np.float32)
 
-    n_raw = int(valid_mask.shape[0])
-    in_range = (
-        (tri[:, 0] >= 0)
-        & (tri[:, 1] >= 0)
-        & (tri[:, 2] >= 0)
-        & (tri[:, 0] < n_raw)
-        & (tri[:, 1] < n_raw)
-        & (tri[:, 2] < n_raw)
-    )
-    tri = tri[in_range]
-
-    if np.any(valid_mask) and tri.shape[0] > 0:
-        remap = np.full((n_raw,), -1, dtype=np.int32)
-        remap[np.where(valid_mask)[0]] = np.arange(int(np.sum(valid_mask)), dtype=np.int32)
-        keep = valid_mask[tri[:, 0]] & valid_mask[tri[:, 1]] & valid_mask[tri[:, 2]]
-        tri = tri[keep]
-        if tri.shape[0] > 0:
-            tri = np.stack([remap[tri[:, 0]], remap[tri[:, 1]], remap[tri[:, 2]]], axis=1)
-    else:
-        tri = np.zeros((0, 3), dtype=np.int32)
+    tri = _remap_filtered_indices(tri, valid_mask)
     return verts, tri
 
 
@@ -164,14 +100,6 @@ def _encode_mesh_layer(
 ) -> dict[str, Any]:
     if scalar_values is not None and scalar_values.shape[0] != verts.shape[0]:
         raise ValueError("scalar_values must match filtered vertex count")
-
-    def _to_uint8_rgb(arr: np.ndarray) -> np.ndarray:
-        if arr.size == 0:
-            return np.zeros((0, 3), dtype=np.uint8)
-        max_color = float(np.nanmax(arr))
-        if max_color <= 1.0 + 1e-6:
-            return np.clip(arr * 255.0, 0, 255).astype(np.uint8)
-        return np.clip(arr, 0, 255).astype(np.uint8)
 
     colors_uint8 = _to_uint8_rgb(colors)
     raw_colors_uint8 = _to_uint8_rgb(raw_colors)

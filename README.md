@@ -7,7 +7,7 @@ Browser-based, notebook compatible, interactive 3D/mesh plotting utils.
 ```python
 import numpy as np
 
-from pointcloud_viewer import plot_pointcloud
+from dev.geoviz import plot_pointcloud
 
 # Build a noisy sphere point cloud.
 n = 5000
@@ -48,8 +48,7 @@ fig.show(inline=True)
 You can combine both kinds of geometry in the same viewer by reusing `init_fig`:
 
 ```python
-from mesh_viewer import plot_mesh
-from pointcloud_viewer import plot_pointcloud
+from dev.geoviz import plot_mesh, plot_pointcloud
 
 fig = plot_mesh(vertices, faces, label="Surface")
 fig = plot_pointcloud(points, init_fig=fig, label="Samples")
@@ -61,7 +60,7 @@ fig.show(in_browser=True)
 ```python
 import numpy as np
 
-from mesh_viewer import plot_mesh
+from dev.geoviz import plot_mesh
 
 # Cube vertices.
 vertices = np.array(

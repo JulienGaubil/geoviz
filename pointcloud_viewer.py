@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-import matplotlib.colors as mcolors
-import matplotlib.pyplot as plt
 import numpy as np
 try:
     import torch
@@ -13,16 +11,18 @@ except Exception:  # pragma: no cover - optional dependency in some environments
 try:
     from .viewer_common import (
         ViewerFigureBase,
-        _raw_scalar_gradient,
-        _sample_cmap,
+        _prepare_color_data,
+        _remap_filtered_indices,
         _to_numpy,
+        _to_uint8_rgb,
     )
 except ImportError:  # pragma: no cover - allow direct module imports from the repo root
     from viewer_common import (
         ViewerFigureBase,
-        _raw_scalar_gradient,
-        _sample_cmap,
+        _prepare_color_data,
+        _remap_filtered_indices,
         _to_numpy,
+        _to_uint8_rgb,
     )
 
 
@@ -52,63 +52,14 @@ def _prepare_layer(
     if downsampling_factor > 1:
         pts = pts[::downsampling_factor]
 
-    scalar_meta = None
-    scalar_values: np.ndarray | None = None
-    raw_colors: np.ndarray | None = None
-    if isinstance(point_color, str):
-        rgb = np.asarray(mcolors.to_rgb(point_color), dtype=np.float32)
-        colors = np.repeat(rgb[None, :], pts.shape[0], axis=0)
-        raw_colors = colors
-    else:
-        color_arr = _to_numpy(point_color)
-        if color_arr is None:
-            raise ValueError("point_color cannot be None")
-        color_arr = np.asarray(color_arr)
-        base_shape = raw_point_shape[:-1]
-        if list(color_arr.shape) != list(raw_point_shape):
-            if color_arr.shape == tuple(base_shape):
-                scalar_values = np.asarray(color_arr, dtype=np.float32).reshape(-1)
-                color_arr = np.repeat(color_arr[..., None], 3, axis=-1)
-            elif color_arr.shape == tuple(base_shape) + (1,):
-                scalar_values = np.asarray(color_arr, dtype=np.float32).reshape(-1)
-                color_arr = np.repeat(color_arr, 3, axis=-1)
-            else:
-                raise ValueError(f"Unrecognized point_color shape {color_arr.shape}")
-        color_arr = np.asarray(color_arr, dtype=np.float32).reshape(-1, 3)
-        if downsampling_factor > 1:
-            color_arr = color_arr[::downsampling_factor]
-            if scalar_values is not None:
-                scalar_values = scalar_values[::downsampling_factor]
-        if scalar_values is None:
-            scalar_values = color_arr[:, 0].astype(np.float32, copy=False)
-        raw_colors = color_arr
-
-        scalar_vals = scalar_values.astype(np.float32, copy=False)
-        finite_scalar = np.isfinite(scalar_vals)
-        if np.any(finite_scalar):
-            finite_vals = scalar_vals[finite_scalar]
-            min_val = float(np.min(finite_vals))
-            max_val = float(np.max(finite_vals))
-        else:
-            min_val, max_val = 0.0, 1.0
-        scalar_meta = {
-            "min": min_val,
-            "max": max_val,
-            "cmap": cmap,
-            "gradient": _sample_cmap(cmap) if cmap is not None else _raw_scalar_gradient(min_val, max_val),
-        }
-
-        if cmap is not None:
-            finite_scalar = np.isfinite(scalar_vals)
-            if np.any(finite_scalar):
-                finite_vals = scalar_vals[finite_scalar]
-                min_val = float(np.min(finite_vals))
-                max_val = float(np.max(finite_vals))
-            norm = (scalar_vals - min_val) / max(max_val - min_val, 1e-8)
-            norm = np.nan_to_num(norm, nan=0.0, posinf=1.0, neginf=0.0)
-            colors = plt.get_cmap(cmap)(norm)[:, :3].astype(np.float32)
-        else:
-            colors = color_arr
+    colors, raw_colors, scalar_values, scalar_meta = _prepare_color_data(
+        point_color,
+        raw_geometry_shape=raw_point_shape,
+        item_count=pts.shape[0],
+        cmap=cmap,
+        color_label="point_color",
+        downsampling_factor=downsampling_factor,
+    )
 
     # Keep only finite points/colors; invalid values can make Three.js compute NaN bounds
     # and cull the whole point cloud.
@@ -130,35 +81,10 @@ def _prepare_layer(
         scalar_values = np.zeros((0,), dtype=np.float32) if scalar_values is not None else None
 
     if edg is not None:
-        # Drop malformed edges and remap indices after filtering.
-        n = int(valid_mask.shape[0])
-        in_range = (
-            (edg[:, 0] >= 0)
-            & (edg[:, 1] >= 0)
-            & (edg[:, 0] < n)
-            & (edg[:, 1] < n)
-        )
-        edg = edg[in_range]
-        if np.any(valid_mask) and edg.shape[0] > 0:
-            remap = np.full((n,), -1, dtype=np.int32)
-            remap[np.where(valid_mask)[0]] = np.arange(int(np.sum(valid_mask)), dtype=np.int32)
-            keep = valid_mask[edg[:, 0]] & valid_mask[edg[:, 1]]
-            edg = edg[keep]
-            if edg.shape[0] > 0:
-                edg = np.stack([remap[edg[:, 0]], remap[edg[:, 1]]], axis=1)
-        else:
-            edg = np.zeros((0, 2), dtype=np.int32)
-
-    def _to_uint8_rgb(arr: np.ndarray) -> np.ndarray:
-        if arr.size == 0:
-            return np.zeros((0, 3), dtype=np.uint8)
-        max_color = float(np.nanmax(arr))
-        if max_color <= 1.0 + 1e-6:
-            return np.clip(arr * 255.0, 0, 255).astype(np.uint8)
-        return np.clip(arr, 0, 255).astype(np.uint8)
+        edg = _remap_filtered_indices(edg, valid_mask)
 
     colors_uint8 = _to_uint8_rgb(colors)
-    raw_colors_uint8 = _to_uint8_rgb(raw_colors if raw_colors is not None else colors)
+    raw_colors_uint8 = _to_uint8_rgb(raw_colors)
 
     layer = {
         "layer_kind": "pointcloud",

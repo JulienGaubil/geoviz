@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import webbrowser
@@ -79,6 +80,113 @@ def _raw_scalar_gradient(min_val: float, max_val: float, n: int = 7) -> list[str
         clipped = int(np.clip(np.round(intensity), 0, 255))
         gradient.append(f"rgb({clipped}, {clipped}, {clipped})")
     return gradient
+
+
+def _to_uint8_rgb(arr: np.ndarray) -> np.ndarray:
+    if arr.size == 0:
+        return np.zeros((0, 3), dtype=np.uint8)
+    max_color = float(np.nanmax(arr))
+    if max_color <= 1.0 + 1e-6:
+        return np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+    return np.clip(arr, 0, 255).astype(np.uint8)
+
+
+def _prepare_color_data(
+    color_value: np.ndarray | torch.Tensor | str,
+    *,
+    raw_geometry_shape: tuple[int, ...],
+    item_count: int,
+    cmap: str | None,
+    color_label: str,
+    downsampling_factor: int = 1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, dict[str, Any] | None]:
+    scalar_meta = None
+    scalar_values: np.ndarray | None = None
+
+    if isinstance(color_value, str):
+        rgb = np.asarray(mcolors.to_rgb(color_value), dtype=np.float32)
+        colors = np.repeat(rgb[None, :], item_count, axis=0)
+        raw_colors = colors
+        return colors, raw_colors, scalar_values, scalar_meta
+
+    color_arr = _to_numpy(color_value)
+    if color_arr is None:
+        raise ValueError(f"{color_label} cannot be None")
+    color_arr = np.asarray(color_arr)
+    base_shape = raw_geometry_shape[:-1]
+    if list(color_arr.shape) != list(raw_geometry_shape):
+        if color_arr.shape == tuple(base_shape):
+            scalar_values = np.asarray(color_arr, dtype=np.float32).reshape(-1)
+            color_arr = np.repeat(color_arr[..., None], 3, axis=-1)
+        elif color_arr.shape == tuple(base_shape) + (1,):
+            scalar_values = np.asarray(color_arr, dtype=np.float32).reshape(-1)
+            color_arr = np.repeat(color_arr, 3, axis=-1)
+        else:
+            raise ValueError(f"Unrecognized {color_label} shape {color_arr.shape}")
+
+    color_arr = np.asarray(color_arr, dtype=np.float32).reshape(-1, 3)
+    if downsampling_factor > 1:
+        color_arr = color_arr[::downsampling_factor]
+        if scalar_values is not None:
+            scalar_values = scalar_values[::downsampling_factor]
+
+    if scalar_values is None:
+        scalar_values = color_arr[:, 0].astype(np.float32, copy=False)
+    raw_colors = color_arr
+
+    scalar_vals = scalar_values.astype(np.float32, copy=False)
+    finite_scalar = np.isfinite(scalar_vals)
+    if np.any(finite_scalar):
+        finite_vals = scalar_vals[finite_scalar]
+        min_val = float(np.min(finite_vals))
+        max_val = float(np.max(finite_vals))
+    else:
+        min_val, max_val = 0.0, 1.0
+
+    scalar_meta = {
+        "min": min_val,
+        "max": max_val,
+        "cmap": cmap,
+        "gradient": _sample_cmap(cmap) if cmap is not None else _raw_scalar_gradient(min_val, max_val),
+    }
+
+    if cmap is not None:
+        norm = (scalar_vals - min_val) / max(max_val - min_val, 1e-8)
+        norm = np.nan_to_num(norm, nan=0.0, posinf=1.0, neginf=0.0)
+        colors = plt.get_cmap(cmap)(norm)[:, :3].astype(np.float32)
+    else:
+        colors = color_arr
+
+    return colors, raw_colors, scalar_values, scalar_meta
+
+
+def _remap_filtered_indices(indices: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    idx = np.asarray(indices, dtype=np.int32)
+    if idx.ndim != 2:
+        raise ValueError("indices must be a 2D array")
+    width = int(idx.shape[1])
+    if idx.shape[0] == 0:
+        return np.zeros((0, width), dtype=np.int32)
+
+    n_raw = int(valid_mask.shape[0])
+    in_range = np.ones((idx.shape[0],), dtype=bool)
+    for col in range(width):
+        in_range &= (idx[:, col] >= 0) & (idx[:, col] < n_raw)
+    idx = idx[in_range]
+
+    if not np.any(valid_mask) or idx.shape[0] == 0:
+        return np.zeros((0, width), dtype=np.int32)
+
+    keep = np.ones((idx.shape[0],), dtype=bool)
+    for col in range(width):
+        keep &= valid_mask[idx[:, col]]
+    idx = idx[keep]
+    if idx.shape[0] == 0:
+        return np.zeros((0, width), dtype=np.int32)
+
+    remap = np.full((n_raw,), -1, dtype=np.int32)
+    remap[np.where(valid_mask)[0]] = np.arange(int(np.sum(valid_mask)), dtype=np.int32)
+    return remap[idx]
 
 
 def _available_cmaps(preferred: str | None = None) -> list[str]:
@@ -161,6 +269,7 @@ class ViewerFigureBase:
     _server: ThreadingHTTPServer | None = field(default=None, init=False, repr=False)
     _server_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _served_html_path: Path | None = field(default=None, init=False, repr=False)
+    _served_html_is_temp: bool = field(default=False, init=False, repr=False)
     _served_url: str | None = field(default=None, init=False, repr=False)
 
     default_title: ClassVar[str] = "Viewer"
@@ -192,9 +301,10 @@ class ViewerFigureBase:
     def _write_html(self, path: str | Path | None = None) -> Path:
         if path is None:
             fd, tmp_path = tempfile.mkstemp(prefix="pointcloud_viewer_", suffix=".html")
-            Path(tmp_path).write_text(self.to_html(), encoding="utf-8")
-            Path(tmp_path).chmod(0o644)
-            return Path(tmp_path)
+            os.close(fd)
+            out = Path(tmp_path)
+            out.write_text(self.to_html(), encoding="utf-8")
+            return out
         out = Path(path)
         out.write_text(self.to_html(), encoding="utf-8")
         return out
@@ -229,6 +339,7 @@ class ViewerFigureBase:
         if self._server is not None:
             self.close_server()
 
+        is_temp_html = path is None
         html_path = self._write_html(path=path)
         viewer = self
         server_ref: dict[str, ThreadingHTTPServer | None] = {"server": None}
@@ -271,10 +382,14 @@ class ViewerFigureBase:
         self._server = server
         self._server_thread = thread
         self._served_html_path = html_path
+        self._served_html_is_temp = is_temp_html
         self._served_url = f"http://{host}:{server.server_port}/{html_path.name}"
         return self._served_url
 
     def close_server(self) -> None:
+        served_html_path = self._served_html_path
+        served_html_is_temp = self._served_html_is_temp
+
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()
@@ -282,6 +397,15 @@ class ViewerFigureBase:
         if self._server_thread is not None:
             self._server_thread.join(timeout=1.0)
             self._server_thread = None
+
+        if served_html_is_temp and served_html_path is not None:
+            try:
+                served_html_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        self._served_html_path = None
+        self._served_html_is_temp = False
         self._served_url = None
 
     def show(
