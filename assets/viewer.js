@@ -133,6 +133,7 @@ const filterRulesList = document.getElementById('filter-rules-list');
 const filterMaskedOpacityInput = document.getElementById('filter-masked-opacity');
 const filterMaskedOpacityValue = document.getElementById('filter-masked-opacity-value');
 const filterAddRuleButton = document.getElementById('btn-filter-add-rule');
+const filterResetRulesButton = document.getElementById('btn-filter-reset-rules');
 const filterToggleButton = document.getElementById('btn-filter-panel');
 const filterCloseButton = document.getElementById('btn-filter-close');
 const controlsCloseButton = document.getElementById('btn-controls-close');
@@ -1470,6 +1471,17 @@ function createDefaultRule(property) {
   };
 }
 
+function resetRuleConfig(rule) {
+  if (!rule) return;
+  rule.scopeKeys = [FILTER_SCOPE_ALL_KEY];
+  rule.scalarClip = createClipState();
+  rule.positionClip = {
+    x: createClipState(),
+    y: createClipState(),
+    z: createClipState(),
+  };
+}
+
 function collectMaskIndices(mask, keepPassed) {
   const list = [];
   for (let idx = 0; idx < mask.length; idx += 1) {
@@ -1828,8 +1840,19 @@ function updateFilterPanelUI() {
         onFilterRulesUpdated();
       });
 
+      const resetButton = document.createElement('button');
+      resetButton.type = 'button';
+      resetButton.className = 'filter-reset-rule-btn';
+      resetButton.title = 'Reset rule';
+      resetButton.textContent = '↺';
+      resetButton.addEventListener('click', () => {
+        resetRuleConfig(rule);
+        onFilterRulesUpdated();
+      });
+
       top.appendChild(expandButton);
       top.appendChild(propertyDropdown);
+      top.appendChild(resetButton);
       top.appendChild(removeButton);
       row.appendChild(top);
 
@@ -1926,6 +1949,14 @@ function initFilterPanelEvents() {
     filterAddRuleButton.addEventListener('click', () => {
       const property = pickDefaultRuleProperty(getAllScopeKeys());
       filterState.rules.push(createDefaultRule(property));
+      onFilterRulesUpdated();
+    });
+  }
+  if (filterResetRulesButton) {
+    filterResetRulesButton.addEventListener('click', () => {
+      filterState.rules.forEach((rule) => {
+        resetRuleConfig(rule);
+      });
       onFilterRulesUpdated();
     });
   }
