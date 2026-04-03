@@ -6,7 +6,6 @@ from html import escape
 from typing import Any, Mapping
 
 import matplotlib.colors as mcolors
-import matplotlib.pyplot as plt
 import numpy as np
 try:
     import torch
@@ -14,112 +13,19 @@ except Exception:  # pragma: no cover - optional dependency in some environments
     torch = None
 
 try:
-    from .pointcloud_viewer import PointCloudViewerFigure
-except ImportError:  # pragma: no cover - allow direct module imports from the repo root
-    from pointcloud_viewer import PointCloudViewerFigure
-
-
-def _to_numpy(x: np.ndarray | torch.Tensor | None) -> np.ndarray | None:
-    if x is None:
-        return None
-    if torch is not None and isinstance(x, torch.Tensor):
-        return x.detach().cpu().numpy()
-    return np.asarray(x)
-
-
-def _sample_cmap(cmap: str, n: int = 7) -> list[str]:
-    colormap = plt.get_cmap(cmap)
-    values = np.linspace(0.0, 1.0, n)
-    return [mcolors.to_hex(colormap(v), keep_alpha=False) for v in values]
-
-
-def _sample_cmap_rgb(cmap: str, n: int = 64) -> list[list[int]]:
-    colormap = plt.get_cmap(cmap)
-    values = np.linspace(0.0, 1.0, n)
-    rgb = np.asarray(colormap(values)[:, :3], dtype=np.float32)
-    return np.clip(np.round(rgb * 255.0), 0, 255).astype(np.uint8).tolist()
-
-
-def _raw_scalar_gradient(min_val: float, max_val: float, n: int = 7) -> list[str]:
-    use_unit_scale = max_val <= 1.0 + 1e-6
-    gradient: list[str] = []
-    for idx in range(n):
-        t = 0.0 if n <= 1 else idx / (n - 1)
-        raw = min_val + (max_val - min_val) * t
-        intensity = raw * 255.0 if use_unit_scale else raw
-        clipped = int(np.clip(np.round(intensity), 0, 255))
-        gradient.append(f"rgb({clipped}, {clipped}, {clipped})")
-    return gradient
-
-
-def _available_cmaps(preferred: str | None = None) -> list[str]:
-    options: list[str] = []
-    if preferred is not None:
-        options.append(preferred)
-    options.extend(
-        [
-            "viridis",
-            "plasma",
-            "inferno",
-            "magma",
-            "cividis",
-            "turbo",
-            "jet",
-            "coolwarm",
-            "Spectral",
-            "RdYlBu",
-        ]
+    from .viewer_common import (
+        ViewerFigureBase,
+        _raw_scalar_gradient,
+        _sample_cmap,
+        _to_numpy,
     )
-
-    valid: list[str] = []
-    seen: set[str] = set()
-    for cmap_name in options:
-        if cmap_name in seen:
-            continue
-        try:
-            plt.get_cmap(cmap_name)
-        except ValueError:
-            continue
-        valid.append(cmap_name)
-        seen.add(cmap_name)
-    return valid
-
-
-def _collect_layer_cmaps(layers: list[dict[str, Any]]) -> list[str]:
-    preferred: list[str] = []
-    for layer in layers:
-        scalar_meta = layer.get("scalar_meta")
-        if isinstance(scalar_meta, Mapping):
-            cmap_name = scalar_meta.get("cmap")
-            if isinstance(cmap_name, str):
-                preferred.append(cmap_name)
-        field_metas = layer.get("field_scalar_meta")
-        if isinstance(field_metas, list):
-            for meta in field_metas:
-                if not isinstance(meta, Mapping):
-                    continue
-                cmap_name = meta.get("cmap")
-                if isinstance(cmap_name, str):
-                    preferred.append(cmap_name)
-
-    ordered: list[str] = []
-    seen: set[str] = set()
-    for cmap_name in preferred:
-        if cmap_name in seen:
-            continue
-        ordered.append(cmap_name)
-        seen.add(cmap_name)
-    return ordered
-
-
-def _colormap_catalog(cmap_names: list[str]) -> dict[str, dict[str, Any]]:
-    return {
-        cmap_name: {
-            "gradient": _sample_cmap(cmap_name),
-            "samples": _sample_cmap_rgb(cmap_name),
-        }
-        for cmap_name in cmap_names
-    }
+except ImportError:  # pragma: no cover - allow direct module imports from the repo root
+    from viewer_common import (
+        ViewerFigureBase,
+        _raw_scalar_gradient,
+        _sample_cmap,
+        _to_numpy,
+    )
 
 
 def _encode_array_payload(arr: np.ndarray, *, dtype: np.dtype | str | None = None) -> dict[str, Any]:
@@ -272,6 +178,7 @@ def _encode_mesh_layer(
     raw_colors_uint8 = _to_uint8_rgb(raw_colors)
 
     return {
+        "layer_kind": "mesh",
         "label": label,
         "vertices": _encode_array_payload(verts, dtype=np.float32),
         "faces": _encode_array_payload(tri, dtype=np.uint32),
@@ -285,6 +192,7 @@ def _encode_mesh_layer(
         else _encode_array_payload(scalar_values, dtype=np.float32),
         "visible": bool(visible),
         "opacity": float(np.clip(opacity, 0.05, 1.0)),
+        "edge_thickness": 1.0,
         "show_edges": bool(show_edges),
     }
 
@@ -334,7 +242,9 @@ def _prepare_mesh_layer(
     )
 
 
-class MeshViewerFigure(PointCloudViewerFigure):
+class MeshViewerFigure(ViewerFigureBase):
+    default_title = "Mesh Viewer"
+
     def __init__(
         self,
         *,
@@ -342,7 +252,39 @@ class MeshViewerFigure(PointCloudViewerFigure):
         opacity: float = 1.0,
         share_colormap_scale: bool = False,
     ) -> None:
-        super().__init__(title=title, point_size=1.0, opacity=float(np.clip(opacity, 0.05, 1.0)), share_colormap_scale=share_colormap_scale)
+        super().__init__(title=title, point_size=5.0, opacity=float(np.clip(opacity, 0.05, 1.0)), share_colormap_scale=share_colormap_scale)
+
+    def add_pointcloud(
+        self,
+        points: np.ndarray | torch.Tensor,
+        edges: np.ndarray | torch.Tensor | None = None,
+        point_color: np.ndarray | torch.Tensor | str = "blue",
+        downsampling_factor: int = 1,
+        cmap: str | None = None,
+        title: str | None = None,
+        label: str = "Points",
+        opacity: float | None = None,
+    ) -> "MeshViewerFigure":
+        try:
+            from .pointcloud_viewer import _prepare_layer as _prepare_pointcloud_layer
+        except ImportError:  # pragma: no cover - allow direct module imports from the repo root
+            from pointcloud_viewer import _prepare_layer as _prepare_pointcloud_layer
+
+        layer = _prepare_pointcloud_layer(
+            points=points,
+            edges=edges,
+            point_color=point_color,
+            downsampling_factor=downsampling_factor,
+            cmap=cmap,
+            label=label,
+            opacity=float(np.clip(self.opacity if opacity is None else opacity, 0.05, 1.0)),
+        )
+        layer["layer_kind"] = "pointcloud"
+        layer["point_size"] = float(np.clip(self.point_size, 1.0, 12.0))
+        self.layers.append(layer)
+        if title is not None:
+            self.title = title
+        return self
 
     def add_mesh(
         self,
@@ -372,24 +314,9 @@ class MeshViewerFigure(PointCloudViewerFigure):
             self.title = title
         return self
 
-    def _payload(self) -> dict[str, Any]:
-        preferred_cmaps = _collect_layer_cmaps(self.layers)
-        cmap_names = _available_cmaps(preferred_cmaps[0] if preferred_cmaps else None)
-        for cmap_name in preferred_cmaps[1:]:
-            if cmap_name not in cmap_names:
-                cmap_names.insert(0, cmap_name)
-        return {
-            "title": self.title or "Mesh Viewer",
-            "opacity": float(np.clip(self.opacity, 0.05, 1.0)),
-            "initial_share_field_scale": self.share_colormap_scale,
-            "layers": self.layers,
-            "available_cmaps": cmap_names,
-            "colormap_presets": _colormap_catalog(cmap_names),
-        }
-
     def to_html(self) -> str:
         payload = json.dumps(self._payload())
-        page_title = escape(self.title or "Mesh Viewer")
+        page_title = escape(self.title or self.default_title)
 
         html = """<!DOCTYPE html>
 <html lang=\"en\">
@@ -1146,6 +1073,9 @@ class MeshViewerFigure(PointCloudViewerFigure):
   <script type=\"module\">
     import * as THREE from 'three';
     import { TrackballControls } from 'three/addons/controls/TrackballControls.js';
+    import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+    import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
+    import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
     import {
       acceleratedRaycast,
       computeBoundsTree,
@@ -1187,8 +1117,12 @@ class MeshViewerFigure(PointCloudViewerFigure):
     }
 
     function normalizeLayerData(layer) {
+      const kind = String(layer.layer_kind || (layer.points ? 'pointcloud' : 'mesh')).toLowerCase();
+      layer.layer_kind = (kind === 'pointcloud') ? 'pointcloud' : 'mesh';
       layer.vertices = decodeArraySpec(layer.vertices, Float32Array) || new Float32Array(0);
       layer.faces = decodeArraySpec(layer.faces, Uint32Array) || new Uint32Array(0);
+      layer.points = decodeArraySpec(layer.points, Float32Array) || new Float32Array(0);
+      layer.edges = decodeArraySpec(layer.edges, Uint32Array);
       layer.colors = decodeArraySpec(layer.colors, Uint8Array) || new Uint8Array(0);
       layer.raw_colors = decodeArraySpec(layer.raw_colors, Uint8Array) || layer.colors;
       layer.values = decodeArraySpec(layer.values, Float32Array);
@@ -1198,12 +1132,21 @@ class MeshViewerFigure(PointCloudViewerFigure):
       layer.field_values = Array.isArray(layer.field_values)
         ? layer.field_values.map((values) => decodeArraySpec(values, Float32Array))
         : null;
+      const fallbackVertexCount = layer.layer_kind === 'pointcloud'
+        ? Math.floor(layer.points.length / 3)
+        : Math.floor(layer.vertices.length / 3);
       layer.vertex_count = Number.isFinite(layer.vertex_count)
         ? Number(layer.vertex_count)
-        : Math.floor(layer.vertices.length / 3);
+        : fallbackVertexCount;
       layer.face_count = Number.isFinite(layer.face_count)
         ? Number(layer.face_count)
         : Math.floor(layer.faces.length / 3);
+      layer.point_size = Number.isFinite(Number(layer.point_size))
+        ? Number(layer.point_size)
+        : Number(payload.point_size);
+      layer.edge_thickness = Number.isFinite(Number(layer.edge_thickness))
+        ? Number(layer.edge_thickness)
+        : 1.0;
       return layer;
     }
 
@@ -1271,6 +1214,26 @@ class MeshViewerFigure(PointCloudViewerFigure):
       clientY: 0,
     };
     let hoverRefreshQueued = false;
+    const pointVertexShader = `
+      attribute vec3 color;
+      varying vec3 vColor;
+      uniform float size;
+      void main() {
+        vColor = color;
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        gl_PointSize = size;
+        gl_Position = projectionMatrix * mvPosition;
+      }
+    `;
+    const pointFragmentShader = `
+      varying vec3 vColor;
+      uniform float opacity;
+      void main() {
+        vec2 center = gl_PointCoord - vec2(0.5);
+        if (length(center) > 0.5) discard;
+        gl_FragColor = vec4(vColor, opacity);
+      }
+    `;
 
     function requestRender() {
       // Rendering is driven by the animation loop to match the point cloud viewer.
@@ -1432,6 +1395,29 @@ class MeshViewerFigure(PointCloudViewerFigure):
       requestRender();
     }
 
+    function getLayerKind(layer) {
+      return String(layer?.layer_kind || (layer?.points ? 'pointcloud' : 'mesh')).toLowerCase() === 'pointcloud'
+        ? 'pointcloud'
+        : 'mesh';
+    }
+
+    function getLayerEdgeThickness(layer) {
+      const value = Number(layer?.edge_thickness ?? 1.0);
+      return Number.isFinite(value) ? Math.min(12.0, Math.max(1.0, value)) : 1.0;
+    }
+
+    function setLineMaterialResolution(material) {
+      if (!material || !material.resolution) return;
+      material.resolution.set(Math.max(1, window.innerWidth), Math.max(1, window.innerHeight));
+    }
+
+    function refreshLineMaterialResolutions() {
+      for (const entry of layers) {
+        if (entry.edgeLines?.material) setLineMaterialResolution(entry.edgeLines.material);
+        if (entry.pointLines?.material) setLineMaterialResolution(entry.pointLines.material);
+      }
+    }
+
     function buildMesh(layer) {
       const geometry = new THREE.BufferGeometry();
       const positionAttr = new THREE.BufferAttribute(layer.vertices, 3);
@@ -1463,37 +1449,129 @@ class MeshViewerFigure(PointCloudViewerFigure):
       mesh.frustumCulled = true;
       scene.add(mesh);
 
-      const edgeGeometry = new THREE.WireframeGeometry(geometry);
-      const edgeMaterial = new THREE.LineBasicMaterial({
+      const wireframeGeometry = new THREE.WireframeGeometry(geometry);
+      const wirePositionsAttr = wireframeGeometry.getAttribute('position');
+      const wirePositions = wirePositionsAttr ? Array.from(wirePositionsAttr.array) : [];
+      wireframeGeometry.dispose();
+      const edgeThickness = getLayerEdgeThickness(layer);
+      const edgeMaterial = new LineMaterial({
         color: edgeColorHex(),
         transparent: true,
         opacity: isDayMode ? 0.92 : 1.0,
         depthTest: true,
         depthWrite: false,
+        linewidth: edgeThickness,
       });
-      const edgeLines = new THREE.LineSegments(edgeGeometry, edgeMaterial);
-      edgeLines.visible = false;
-      edgeLines.frustumCulled = true;
-      edgeLines.renderOrder = 3;
-      scene.add(edgeLines);
+      setLineMaterialResolution(edgeMaterial);
+      let edgeLines = null;
+      if (wirePositions.length > 0) {
+        const edgeGeometry = new LineSegmentsGeometry();
+        edgeGeometry.setPositions(wirePositions);
+        edgeLines = new LineSegments2(edgeGeometry, edgeMaterial);
+        edgeLines.visible = false;
+        edgeLines.frustumCulled = false;
+        edgeLines.renderOrder = 3;
+        scene.add(edgeLines);
+      } else {
+        edgeMaterial.dispose();
+      }
       return { mesh, edgeLines };
+    }
+
+    function buildPoints(layer) {
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(layer.points, 3));
+      geometry.setAttribute('color', createStoredColorAttribute(layer.colors));
+
+      const pointSize = Math.min(12.0, Math.max(1.0, Number(layer.point_size ?? payload.point_size) || 5.0));
+      const initialOpacity = Number(layer.opacity ?? payload.opacity) || 1.0;
+      const material = new THREE.ShaderMaterial({
+        uniforms: {
+          size: { value: pointSize },
+          opacity: { value: initialOpacity },
+        },
+        vertexShader: pointVertexShader,
+        fragmentShader: pointFragmentShader,
+        transparent: true,
+      });
+      const points = new THREE.Points(geometry, material);
+      points.frustumCulled = false;
+      scene.add(points);
+
+      let lines = null;
+      if (layer.edges && layer.edges.length >= 2) {
+        const edgeThickness = getLayerEdgeThickness(layer);
+        const positions = [];
+        for (let idx = 0; idx + 1 < layer.edges.length; idx += 2) {
+          const i = layer.edges[idx];
+          const j = layer.edges[idx + 1];
+          if (i < 0 || j < 0) continue;
+          const iBase = i * 3;
+          const jBase = j * 3;
+          if (jBase + 2 >= layer.points.length || iBase + 2 >= layer.points.length) continue;
+          positions.push(
+            layer.points[iBase], layer.points[iBase + 1], layer.points[iBase + 2],
+            layer.points[jBase], layer.points[jBase + 1], layer.points[jBase + 2],
+          );
+        }
+        if (positions.length > 0) {
+          const lineGeometry = new LineSegmentsGeometry();
+          lineGeometry.setPositions(positions);
+          const lineMaterial = new LineMaterial({
+            color: isDayMode ? 0x0f172a : 0xe4e4e7,
+            opacity: (isDayMode ? 0.28 : 0.35) * initialOpacity,
+            transparent: true,
+            linewidth: edgeThickness,
+          });
+          setLineMaterialResolution(lineMaterial);
+          lines = new LineSegments2(lineGeometry, lineMaterial);
+          lines.frustumCulled = false;
+          scene.add(lines);
+        }
+      }
+      return { points, lines };
     }
 
     function updateEntryOpacity(entry, opacity) {
       const nextOpacity = Math.min(1.0, Math.max(0.05, Number(opacity) || 1.0));
       entry.opacity = nextOpacity;
-      entry.mesh.material.opacity = nextOpacity;
-      entry.mesh.material.transparent = nextOpacity < 0.999;
-      entry.mesh.material.depthWrite = nextOpacity >= 0.999;
-      entry.mesh.material.needsUpdate = true;
+      if (entry.mesh) {
+        entry.mesh.material.opacity = nextOpacity;
+        entry.mesh.material.transparent = nextOpacity < 0.999;
+        entry.mesh.material.depthWrite = nextOpacity >= 0.999;
+        entry.mesh.material.needsUpdate = true;
+      }
+      if (entry.points) {
+        entry.points.material.uniforms.opacity.value = nextOpacity;
+      }
+      if (entry.pointLines) {
+        entry.pointLines.material.opacity = (isDayMode ? 0.28 : 0.35) * nextOpacity;
+      }
+    }
+
+    function updateEntryEdgeThickness(entry, thickness) {
+      const nextThickness = Math.min(12.0, Math.max(1.0, Number(thickness) || 1.0));
+      entry.edgeThickness = nextThickness;
+      if (entry.edgeLines) {
+        entry.edgeLines.material.linewidth = nextThickness;
+      }
+      if (entry.pointLines) {
+        entry.pointLines.material.linewidth = nextThickness;
+      }
     }
 
     function updateEntryEdgeOverlay(entry) {
-      if (!entry.edgeLines) return;
-      const color = edgeColorHex();
-      entry.edgeLines.visible = entry.visible && entry.showEdges;
-      entry.edgeLines.material.color.setHex(color);
-      entry.edgeLines.material.opacity = isDayMode ? 0.82 : 0.92;
+      if (entry.edgeLines) {
+        const color = edgeColorHex();
+        entry.edgeLines.visible = entry.visible && entry.showEdges;
+        entry.edgeLines.material.color.setHex(color);
+        entry.edgeLines.material.opacity = isDayMode ? 0.82 : 0.92;
+      }
+      if (entry.pointLines) {
+        entry.pointLines.visible = entry.visible;
+        entry.pointLines.material.color.setHex(isDayMode ? 0x0f172a : 0xe4e4e7);
+        entry.pointLines.material.opacity = (isDayMode ? 0.28 : 0.35) * entry.opacity;
+      }
     }
 
     function refreshEdgeOverlay() {
@@ -1950,7 +2028,8 @@ class MeshViewerFigure(PointCloudViewerFigure):
     }
 
     function applyStoredColors(entry, colors) {
-      setStoredColorAttribute(entry.mesh.geometry, colors);
+      if (!entry.colorGeometry) return;
+      setStoredColorAttribute(entry.colorGeometry, colors);
     }
 
     function applyColorsFromValues(entry, values, meta) {
@@ -1959,7 +2038,8 @@ class MeshViewerFigure(PointCloudViewerFigure):
       if (!samples || samples.length === 0 || !values || typeof values.length !== 'number') return false;
 
       const colorCount = values.length * 3;
-      const existing = entry.mesh.geometry.getAttribute('color');
+      if (!entry.colorGeometry) return false;
+      const existing = entry.colorGeometry.getAttribute('color');
       const colors = (
         existing
         && existing.array instanceof Uint8Array
@@ -1997,7 +2077,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
         return true;
       }
 
-      entry.mesh.geometry.setAttribute('color', createStoredColorAttribute(colors));
+      entry.colorGeometry.setAttribute('color', createStoredColorAttribute(colors));
       return true;
     }
 
@@ -2010,7 +2090,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
       const updatedFromValues = !isNoCmap(cmapName) && values && meta ? applyColorsFromValues(entry, values, meta) : false;
 
       if (updatedFromValues) {
-        entry.mesh.geometry.attributes.color.needsUpdate = true;
+        entry.colorGeometry?.attributes?.color && (entry.colorGeometry.attributes.color.needsUpdate = true);
       } else if (rawColors) {
         applyStoredColors(entry, rawColors);
       } else {
@@ -2057,7 +2137,8 @@ class MeshViewerFigure(PointCloudViewerFigure):
       let hasBox = false;
       for (const entry of layers) {
         if (!entry.visible) continue;
-        box.expandByObject(entry.mesh);
+        if (!entry.mainObject) continue;
+        box.expandByObject(entry.mainObject);
         hasBox = true;
       }
       if (!hasBox || box.isEmpty()) return;
@@ -2407,6 +2488,42 @@ class MeshViewerFigure(PointCloudViewerFigure):
       return bestIdx;
     }
 
+    function getEntryPointSize(entry) {
+      if (!entry) return 1.0;
+      const numeric = Number(entry.pointSize ?? entry.layer?.point_size ?? payload.point_size);
+      return Number.isFinite(numeric) ? Math.min(12.0, Math.max(1.0, numeric)) : 1.0;
+    }
+
+    function computePointHoverThreshold(viewportHeightPx, entry) {
+      const distance = camera.position.distanceTo(controls.target);
+      const fov = THREE.MathUtils.degToRad(camera.fov);
+      const worldPerPixel = (2 * Math.max(distance, 1e-6) * Math.tan(fov / 2)) / Math.max(viewportHeightPx, 1);
+      const pointRadiusPx = Math.max(getEntryPointSize(entry) * 0.5, 1.5);
+      return Math.max(worldPerPixel * pointRadiusPx * 1.15, 1e-5);
+    }
+
+    function pickBestPointHit(hits) {
+      if (!hits || hits.length === 0) return null;
+      let bestHit = null;
+      for (const hit of hits) {
+        if (hit.index === undefined || hit.index === null) continue;
+        if (!bestHit) {
+          bestHit = hit;
+          continue;
+        }
+        const bestDistanceToRay = Number.isFinite(bestHit.distanceToRay) ? bestHit.distanceToRay : Infinity;
+        const hitDistanceToRay = Number.isFinite(hit.distanceToRay) ? hit.distanceToRay : Infinity;
+        if (hitDistanceToRay < bestDistanceToRay - 1e-9) {
+          bestHit = hit;
+          continue;
+        }
+        if (Math.abs(hitDistanceToRay - bestDistanceToRay) <= 1e-9 && hit.distance < bestHit.distance) {
+          bestHit = hit;
+        }
+      }
+      return bestHit;
+    }
+
     function updateHoverFromPointer() {
       if (!pointerState.inside) {
         hideHoverTooltip();
@@ -2422,9 +2539,16 @@ class MeshViewerFigure(PointCloudViewerFigure):
       let best = null;
       for (const entry of layers) {
         if (!entry.visible) continue;
-        const hits = raycaster.intersectObject(entry.mesh, false);
-        if (!hits || hits.length === 0) continue;
-        const hit = hits[0];
+        let hit = null;
+        if (entry.points) {
+          raycaster.params.Points.threshold = computePointHoverThreshold(rect.height, entry);
+          const hits = raycaster.intersectObject(entry.points, false);
+          hit = pickBestPointHit(hits);
+        } else if (entry.mesh) {
+          const hits = raycaster.intersectObject(entry.mesh, false);
+          hit = (hits && hits.length > 0) ? hits[0] : null;
+        }
+        if (!hit) continue;
         if (!best || hit.distance < best.hit.distance) {
           best = { entry, hit };
         }
@@ -2435,9 +2559,14 @@ class MeshViewerFigure(PointCloudViewerFigure):
         return;
       }
 
-      const posAttr = best.entry.mesh.geometry.getAttribute('position');
-      const colorAttr = best.entry.mesh.geometry.getAttribute('color');
-      const idx = pickClosestFaceVertexIndex(best.hit, best.entry.mesh, posAttr);
+      const posAttr = best.entry.colorGeometry?.getAttribute('position');
+      const colorAttr = best.entry.colorGeometry?.getAttribute('color');
+      let idx = -1;
+      if (best.entry.points) {
+        idx = Number(best.hit.index ?? -1);
+      } else if (best.entry.mesh) {
+        idx = pickClosestFaceVertexIndex(best.hit, best.entry.mesh, posAttr);
+      }
       if (idx < 0) {
         hideHoverTooltip();
         return;
@@ -2474,6 +2603,8 @@ class MeshViewerFigure(PointCloudViewerFigure):
       layers.forEach((entry, idx) => {
         const row = document.createElement('div');
         row.className = 'layer-row';
+        const isPointLayer = entry.layerKind === 'pointcloud';
+        const hasMultipleFields = getEntryFieldCount(entry) > 1;
         const hasFieldOptions = true;
         const hasScalarOptions = getEntryFieldCount(entry) > 0 || Boolean(entry.layer.scalar_meta) || Boolean(entry.layer.values);
         let refreshFieldControls = null;
@@ -2485,7 +2616,9 @@ class MeshViewerFigure(PointCloudViewerFigure):
         checkbox.checked = entry.visible;
         checkbox.addEventListener('change', () => {
           entry.visible = checkbox.checked;
-          entry.mesh.visible = entry.visible;
+          if (entry.mesh) entry.mesh.visible = entry.visible;
+          if (entry.points) entry.points.visible = entry.visible;
+          if (entry.pointLines) entry.pointLines.visible = entry.visible;
           updateEntryEdgeOverlay(entry);
           rebuildLayerList();
           hideHoverTooltip();
@@ -2524,51 +2657,140 @@ class MeshViewerFigure(PointCloudViewerFigure):
         const optionGrid = document.createElement('div');
         optionGrid.className = 'layer-option-grid';
 
-        const opacityWrap = document.createElement('div');
-        opacityWrap.className = 'layer-option-control';
-        const opacityLabel = document.createElement('label');
-        opacityLabel.textContent = 'Mesh opacity';
-        const opacityInput = document.createElement('input');
-        opacityInput.type = 'range';
-        opacityInput.min = '0.05';
-        opacityInput.max = '1';
-        opacityInput.step = '0.05';
-        opacityInput.value = String(entry.opacity);
-        opacityInput.disabled = !entry.visible;
-        opacityInput.addEventListener('input', () => {
-          updateEntryOpacity(entry, opacityInput.value);
-          requestRender();
-        });
-        opacityWrap.appendChild(opacityLabel);
-        opacityWrap.appendChild(opacityInput);
-        optionGrid.appendChild(opacityWrap);
+        if (isPointLayer) {
+          const pointSizeWrap = document.createElement('div');
+          pointSizeWrap.className = 'layer-option-control';
+          const pointSizeLabel = document.createElement('label');
+          pointSizeLabel.textContent = 'Point size';
+          const pointSizeInput = document.createElement('input');
+          pointSizeInput.type = 'range';
+          pointSizeInput.min = '1';
+          pointSizeInput.max = '12';
+          pointSizeInput.step = '0.5';
+          pointSizeInput.value = String(entry.pointSize);
+          pointSizeInput.disabled = !entry.visible;
+          pointSizeInput.addEventListener('input', () => {
+            const value = Math.min(12.0, Math.max(1.0, Number(pointSizeInput.value) || entry.pointSize));
+            entry.pointSize = value;
+            if (entry.points) {
+              entry.points.material.uniforms.size.value = value;
+            }
+            requestRenderAndHover();
+          });
+          pointSizeWrap.appendChild(pointSizeLabel);
+          pointSizeWrap.appendChild(pointSizeInput);
+          optionGrid.appendChild(pointSizeWrap);
 
-        const edgeToggleLabel = document.createElement('label');
-        edgeToggleLabel.className = 'layer-option-toggle';
-        const edgeToggleInput = document.createElement('input');
-        edgeToggleInput.type = 'checkbox';
-        edgeToggleInput.checked = Boolean(entry.showEdges);
-        edgeToggleInput.disabled = !entry.visible;
-        edgeToggleInput.addEventListener('change', () => {
-          entry.showEdges = edgeToggleInput.checked;
-          updateEntryEdgeOverlay(entry);
-        });
-        edgeToggleLabel.appendChild(edgeToggleInput);
-        edgeToggleLabel.appendChild(document.createTextNode('Show mesh edges'));
-        optionGrid.appendChild(edgeToggleLabel);
+          const opacityWrap = document.createElement('div');
+          opacityWrap.className = 'layer-option-control';
+          const opacityLabel = document.createElement('label');
+          opacityLabel.textContent = 'Point opacity';
+          const opacityInput = document.createElement('input');
+          opacityInput.type = 'range';
+          opacityInput.min = '0.05';
+          opacityInput.max = '1';
+          opacityInput.step = '0.05';
+          opacityInput.value = String(entry.opacity);
+          opacityInput.disabled = !entry.visible;
+          opacityInput.addEventListener('input', () => {
+            updateEntryOpacity(entry, opacityInput.value);
+            requestRenderAndHover();
+          });
+          opacityWrap.appendChild(opacityLabel);
+          opacityWrap.appendChild(opacityInput);
+          optionGrid.appendChild(opacityWrap);
 
-        const shareScaleLabel = document.createElement('label');
-        shareScaleLabel.className = 'layer-option-toggle';
-        const shareScaleInput = document.createElement('input');
-        shareScaleInput.type = 'checkbox';
-        shareScaleInput.checked = Boolean(entry.shareFieldScale);
-        shareScaleInput.disabled = !entry.visible || !getSharedFieldScaleRange(entry);
-        shareScaleInput.addEventListener('change', () => {
-          setLayerShareFieldScale(entry, shareScaleInput.checked);
-        });
-        shareScaleLabel.appendChild(shareScaleInput);
-        shareScaleLabel.appendChild(document.createTextNode('Share field colormap scale'));
-        optionGrid.appendChild(shareScaleLabel);
+          if (entry.pointLines && entry.visible) {
+            const edgeThicknessWrap = document.createElement('div');
+            edgeThicknessWrap.className = 'layer-option-control';
+            const edgeThicknessLabel = document.createElement('label');
+            edgeThicknessLabel.textContent = 'Edge thickness';
+            const edgeThicknessInput = document.createElement('input');
+            edgeThicknessInput.type = 'range';
+            edgeThicknessInput.min = '1';
+            edgeThicknessInput.max = '12';
+            edgeThicknessInput.step = '0.5';
+            edgeThicknessInput.value = String(entry.edgeThickness);
+            edgeThicknessInput.disabled = !entry.visible;
+            edgeThicknessInput.addEventListener('input', () => {
+              updateEntryEdgeThickness(entry, edgeThicknessInput.value);
+              requestRenderAndHover();
+            });
+            edgeThicknessWrap.appendChild(edgeThicknessLabel);
+            edgeThicknessWrap.appendChild(edgeThicknessInput);
+            optionGrid.appendChild(edgeThicknessWrap);
+          }
+        } else {
+          const opacityWrap = document.createElement('div');
+          opacityWrap.className = 'layer-option-control';
+          const opacityLabel = document.createElement('label');
+          opacityLabel.textContent = 'Mesh opacity';
+          const opacityInput = document.createElement('input');
+          opacityInput.type = 'range';
+          opacityInput.min = '0.05';
+          opacityInput.max = '1';
+          opacityInput.step = '0.05';
+          opacityInput.value = String(entry.opacity);
+          opacityInput.disabled = !entry.visible;
+          opacityInput.addEventListener('input', () => {
+            updateEntryOpacity(entry, opacityInput.value);
+            requestRenderAndHover();
+          });
+          opacityWrap.appendChild(opacityLabel);
+          opacityWrap.appendChild(opacityInput);
+          optionGrid.appendChild(opacityWrap);
+
+          const edgeToggleLabel = document.createElement('label');
+          edgeToggleLabel.className = 'layer-option-toggle';
+          const edgeToggleInput = document.createElement('input');
+          edgeToggleInput.type = 'checkbox';
+          edgeToggleInput.checked = Boolean(entry.showEdges);
+          edgeToggleInput.disabled = !entry.visible;
+          edgeToggleInput.addEventListener('change', () => {
+            entry.showEdges = edgeToggleInput.checked;
+            updateEntryEdgeOverlay(entry);
+            rebuildLayerList();
+          });
+          edgeToggleLabel.appendChild(edgeToggleInput);
+          edgeToggleLabel.appendChild(document.createTextNode('Show mesh edges'));
+          optionGrid.appendChild(edgeToggleLabel);
+
+          if (entry.edgeLines && entry.showEdges && entry.visible) {
+            const edgeThicknessWrap = document.createElement('div');
+            edgeThicknessWrap.className = 'layer-option-control';
+            const edgeThicknessLabel = document.createElement('label');
+            edgeThicknessLabel.textContent = 'Edge thickness';
+            const edgeThicknessInput = document.createElement('input');
+            edgeThicknessInput.type = 'range';
+            edgeThicknessInput.min = '1';
+            edgeThicknessInput.max = '12';
+            edgeThicknessInput.step = '0.5';
+            edgeThicknessInput.value = String(entry.edgeThickness);
+            edgeThicknessInput.disabled = !entry.visible;
+            edgeThicknessInput.addEventListener('input', () => {
+              updateEntryEdgeThickness(entry, edgeThicknessInput.value);
+              requestRenderAndHover();
+            });
+            edgeThicknessWrap.appendChild(edgeThicknessLabel);
+            edgeThicknessWrap.appendChild(edgeThicknessInput);
+            optionGrid.appendChild(edgeThicknessWrap);
+          }
+        }
+
+        if (hasMultipleFields) {
+          const shareScaleLabel = document.createElement('label');
+          shareScaleLabel.className = 'layer-option-toggle';
+          const shareScaleInput = document.createElement('input');
+          shareScaleInput.type = 'checkbox';
+          shareScaleInput.checked = Boolean(entry.shareFieldScale);
+          shareScaleInput.disabled = !entry.visible || !getSharedFieldScaleRange(entry);
+          shareScaleInput.addEventListener('change', () => {
+            setLayerShareFieldScale(entry, shareScaleInput.checked);
+          });
+          shareScaleLabel.appendChild(shareScaleInput);
+          shareScaleLabel.appendChild(document.createTextNode('Share colormap scale across fields'));
+          optionGrid.appendChild(shareScaleLabel);
+        }
 
         controlsBody.appendChild(optionGrid);
 
@@ -2694,7 +2916,9 @@ class MeshViewerFigure(PointCloudViewerFigure):
     function setAllLayersVisibility(visible) {
       for (const entry of layers) {
         entry.visible = visible;
-        entry.mesh.visible = visible;
+        if (entry.mesh) entry.mesh.visible = visible;
+        if (entry.points) entry.points.visible = visible;
+        if (entry.pointLines) entry.pointLines.visible = visible;
         updateEntryEdgeOverlay(entry);
       }
       rebuildLayerList();
@@ -2710,7 +2934,8 @@ class MeshViewerFigure(PointCloudViewerFigure):
 
     payload.layers.forEach((rawLayer) => {
       const layer = normalizeLayerData(rawLayer);
-      const built = buildMesh(layer);
+      const layerKind = getLayerKind(layer);
+      const built = layerKind === 'pointcloud' ? buildPoints(layer) : buildMesh(layer);
       const fieldMetas = layer.field_scalar_meta || null;
       const fieldValues = layer.field_values || null;
       const fieldColorCount = Array.isArray(layer.field_colors) ? layer.field_colors.length : 0;
@@ -2725,8 +2950,13 @@ class MeshViewerFigure(PointCloudViewerFigure):
         : null;
       const entry = {
         layer,
-        mesh: built.mesh,
-        edgeLines: built.edgeLines,
+        layerKind,
+        mesh: layerKind === 'mesh' ? built.mesh : null,
+        edgeLines: layerKind === 'mesh' ? built.edgeLines : null,
+        points: layerKind === 'pointcloud' ? built.points : null,
+        pointLines: layerKind === 'pointcloud' ? built.lines : null,
+        mainObject: layerKind === 'mesh' ? built.mesh : built.points,
+        colorGeometry: layerKind === 'mesh' ? built.mesh.geometry : built.points.geometry,
         visible: layer.visible !== false,
         activeFieldIdx: Number.isInteger(layer.active_field_idx) ? layer.active_field_idx : 0,
         activeValues: layer.values || null,
@@ -2734,14 +2964,22 @@ class MeshViewerFigure(PointCloudViewerFigure):
         fieldCmaps,
         fieldClipStates: Array.from({ length: Math.max(fieldCount, 1) }, () => createClipState()),
         sharedFieldClip: createClipState(),
-        shareFieldScale: Boolean(payload.initial_share_field_scale),
+        shareFieldScale: Boolean(layer.share_field_scale ?? payload.initial_share_field_scale),
         opacity: Math.min(1.0, Math.max(0.05, Number(layer.opacity ?? payload.opacity) || 1.0)),
-        showEdges: layer.show_edges === true,
+        showEdges: layerKind === 'mesh' && layer.show_edges === true,
+        edgeThickness: getLayerEdgeThickness(layer),
+        pointSize: Math.min(12.0, Math.max(1.0, Number(layer.point_size ?? payload.point_size) || 5.0)),
         optionsExpanded: layer.visible !== false,
         fieldOptionsContainer: null,
       };
-      entry.mesh.visible = entry.visible;
+      if (entry.mesh) entry.mesh.visible = entry.visible;
+      if (entry.points) entry.points.visible = entry.visible;
+      if (entry.pointLines) entry.pointLines.visible = entry.visible;
       updateEntryOpacity(entry, entry.opacity);
+      updateEntryEdgeThickness(entry, entry.edgeThickness);
+      if (entry.points) {
+        entry.points.material.uniforms.size.value = entry.pointSize;
+      }
       updateEntryEdgeOverlay(entry);
       layers.push(entry);
 
@@ -2815,6 +3053,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
+      refreshLineMaterialResolutions();
       controls.handleResize?.();
       requestRenderAndHover();
     });
@@ -2846,7 +3085,7 @@ class MeshViewerFigure(PointCloudViewerFigure):
 def plot_mesh(
     vertices: np.ndarray | torch.Tensor,
     faces: np.ndarray | torch.Tensor,
-    init_fig: MeshViewerFigure | None = None,
+    init_fig: ViewerFigureBase | None = None,
     vertex_color: np.ndarray | torch.Tensor | str = "#94a3b8",
     scalar_fields: Mapping[str, np.ndarray | torch.Tensor] | None = None,
     opacity: float | None = None,
@@ -2857,7 +3096,18 @@ def plot_mesh(
     visible: bool = True,
     show_edges: bool = False,
 ) -> MeshViewerFigure:
-    fig = init_fig if init_fig is not None else MeshViewerFigure()
+    if init_fig is None:
+        fig = MeshViewerFigure()
+    elif isinstance(init_fig, MeshViewerFigure):
+        fig = init_fig
+    else:
+        fig = MeshViewerFigure(
+            title=init_fig.title,
+            opacity=float(np.clip(init_fig.opacity, 0.05, 1.0)),
+            share_colormap_scale=bool(init_fig.share_colormap_scale),
+        )
+        fig.point_size = float(np.clip(getattr(init_fig, "point_size", fig.point_size), 1.0, 12.0))
+        fig.layers.extend(init_fig.layers)
     if share_colormap_scale is not None:
         fig.share_colormap_scale = bool(share_colormap_scale)
     resolved_opacity = float(np.clip(fig.opacity if opacity is None else opacity, 0.05, 1.0))
@@ -2929,6 +3179,7 @@ def plot_mesh(
         _, base_layer = encoded_fields[0]
 
         combined_layer = {
+            "layer_kind": "mesh",
             "label": label,
             "vertices": base_layer["vertices"],
             "faces": base_layer["faces"],
@@ -2945,6 +3196,7 @@ def plot_mesh(
             "scalar_meta": base_layer["scalar_meta"],
             "visible": bool(visible),
             "opacity": resolved_opacity,
+            "edge_thickness": 1.0,
             "show_edges": bool(show_edges),
         }
         fig.layers.append(combined_layer)

@@ -43,6 +43,19 @@ fig.show(in_browser=True)
 fig.show(inline=True)
 ```
 
+## Mixed Mesh + Point Cloud
+
+You can combine both kinds of geometry in the same viewer by reusing `init_fig`:
+
+```python
+from mesh_viewer import plot_mesh
+from pointcloud_viewer import plot_pointcloud
+
+fig = plot_mesh(vertices, faces, label="Surface")
+fig = plot_pointcloud(points, init_fig=fig, label="Samples")
+fig.show(in_browser=True)
+```
+
 ## Quick mesh example
 
 ```python

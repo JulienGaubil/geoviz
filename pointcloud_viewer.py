@@ -1,13 +1,7 @@
 from __future__ import annotations
 
 import json
-import tempfile
-import threading
-import webbrowser
-from dataclasses import dataclass, field
 from html import escape
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any, Mapping
 
 import matplotlib.colors as mcolors
@@ -18,108 +12,20 @@ try:
 except Exception:  # pragma: no cover - optional dependency in some environments
     torch = None
 
-
-def _to_numpy(x: np.ndarray | torch.Tensor | None) -> np.ndarray | None:
-    if x is None:
-        return None
-    if torch is not None and isinstance(x, torch.Tensor):
-        return x.detach().cpu().numpy()
-    return np.asarray(x)
-
-
-def _sample_cmap(cmap: str, n: int = 7) -> list[str]:
-    colormap = plt.get_cmap(cmap)
-    values = np.linspace(0.0, 1.0, n)
-    return [mcolors.to_hex(colormap(v), keep_alpha=False) for v in values]
-
-
-def _sample_cmap_rgb(cmap: str, n: int = 64) -> list[list[int]]:
-    colormap = plt.get_cmap(cmap)
-    values = np.linspace(0.0, 1.0, n)
-    rgb = np.asarray(colormap(values)[:, :3], dtype=np.float32)
-    return np.clip(np.round(rgb * 255.0), 0, 255).astype(np.uint8).tolist()
-
-
-def _raw_scalar_gradient(min_val: float, max_val: float, n: int = 7) -> list[str]:
-    use_unit_scale = max_val <= 1.0 + 1e-6
-    gradient: list[str] = []
-    for idx in range(n):
-        t = 0.0 if n <= 1 else idx / (n - 1)
-        raw = min_val + (max_val - min_val) * t
-        intensity = raw * 255.0 if use_unit_scale else raw
-        clipped = int(np.clip(np.round(intensity), 0, 255))
-        gradient.append(f"rgb({clipped}, {clipped}, {clipped})")
-    return gradient
-
-
-def _available_cmaps(preferred: str | None = None) -> list[str]:
-    options: list[str] = []
-    if preferred is not None:
-        options.append(preferred)
-    options.extend(
-        [
-            "viridis",
-            "plasma",
-            "inferno",
-            "magma",
-            "cividis",
-            "turbo",
-            "jet",
-            "coolwarm",
-            "Spectral",
-            "RdYlBu",
-        ]
+try:
+    from .viewer_common import (
+        ViewerFigureBase,
+        _raw_scalar_gradient,
+        _sample_cmap,
+        _to_numpy,
     )
-
-    valid: list[str] = []
-    seen: set[str] = set()
-    for cmap_name in options:
-        if cmap_name in seen:
-            continue
-        try:
-            plt.get_cmap(cmap_name)
-        except ValueError:
-            continue
-        valid.append(cmap_name)
-        seen.add(cmap_name)
-    return valid
-
-
-def _collect_layer_cmaps(layers: list[dict[str, Any]]) -> list[str]:
-    preferred: list[str] = []
-    for layer in layers:
-        scalar_meta = layer.get("scalar_meta")
-        if isinstance(scalar_meta, Mapping):
-            cmap_name = scalar_meta.get("cmap")
-            if isinstance(cmap_name, str):
-                preferred.append(cmap_name)
-        field_metas = layer.get("field_scalar_meta")
-        if isinstance(field_metas, list):
-            for meta in field_metas:
-                if not isinstance(meta, Mapping):
-                    continue
-                cmap_name = meta.get("cmap")
-                if isinstance(cmap_name, str):
-                    preferred.append(cmap_name)
-
-    ordered: list[str] = []
-    seen: set[str] = set()
-    for cmap_name in preferred:
-        if cmap_name in seen:
-            continue
-        ordered.append(cmap_name)
-        seen.add(cmap_name)
-    return ordered
-
-
-def _colormap_catalog(cmap_names: list[str]) -> dict[str, dict[str, Any]]:
-    return {
-        cmap_name: {
-            "gradient": _sample_cmap(cmap_name),
-            "samples": _sample_cmap_rgb(cmap_name),
-        }
-        for cmap_name in cmap_names
-    }
+except ImportError:  # pragma: no cover - allow direct module imports from the repo root
+    from viewer_common import (
+        ViewerFigureBase,
+        _raw_scalar_gradient,
+        _sample_cmap,
+        _to_numpy,
+    )
 
 
 def _prepare_layer(
@@ -257,11 +163,13 @@ def _prepare_layer(
     raw_colors_uint8 = _to_uint8_rgb(raw_colors if raw_colors is not None else colors)
 
     layer = {
+        "layer_kind": "pointcloud",
         "label": label,
         "points": np.ascontiguousarray(pts, dtype=np.float32).tolist(),
         "colors": colors_uint8.tolist(),
         "raw_colors": raw_colors_uint8.tolist(),
         "edges": None if edg is None else edg.tolist(),
+        "edge_thickness": 1.0,
         "scalar_meta": scalar_meta,
         "values": None if scalar_values is None else np.ascontiguousarray(scalar_values, dtype=np.float32).tolist(),
         "visible": True,
@@ -270,17 +178,8 @@ def _prepare_layer(
     return layer
 
 
-@dataclass
-class PointCloudViewerFigure:
-    layers: list[dict[str, Any]] = field(default_factory=list)
-    title: str | None = None
-    point_size: float = 5.0
-    opacity: float = 1.0
-    share_colormap_scale: bool = False
-    _server: ThreadingHTTPServer | None = field(default=None, init=False, repr=False)
-    _server_thread: threading.Thread | None = field(default=None, init=False, repr=False)
-    _served_html_path: Path | None = field(default=None, init=False, repr=False)
-    _served_url: str | None = field(default=None, init=False, repr=False)
+class PointCloudViewerFigure(ViewerFigureBase):
+    default_title = "Point Cloud Viewer"
 
     def add_pointcloud(
         self,
@@ -293,36 +192,21 @@ class PointCloudViewerFigure:
         label: str = "Points",
         opacity: float | None = None,
     ) -> "PointCloudViewerFigure":
-        self.layers.append(
-            _prepare_layer(
-                points=points,
-                edges=edges,
-                point_color=point_color,
-                downsampling_factor=downsampling_factor,
-                cmap=cmap,
-                label=label,
-                opacity=float(np.clip(self.opacity if opacity is None else opacity, 0.05, 1.0)),
-            )
+        layer = _prepare_layer(
+            points=points,
+            edges=edges,
+            point_color=point_color,
+            downsampling_factor=downsampling_factor,
+            cmap=cmap,
+            label=label,
+            opacity=float(np.clip(self.opacity if opacity is None else opacity, 0.05, 1.0)),
         )
+        layer["layer_kind"] = "pointcloud"
+        layer["point_size"] = float(np.clip(self.point_size, 1.0, 12.0))
+        self.layers.append(layer)
         if title is not None:
             self.title = title
         return self
-
-    def _payload(self) -> dict[str, Any]:
-        preferred_cmaps = _collect_layer_cmaps(self.layers)
-        cmap_names = _available_cmaps(preferred_cmaps[0] if preferred_cmaps else None)
-        for cmap_name in preferred_cmaps[1:]:
-            if cmap_name not in cmap_names:
-                cmap_names.insert(0, cmap_name)
-        return {
-            "title": self.title or "Point Cloud Viewer",
-            "point_size": self.point_size,
-            "opacity": float(np.clip(self.opacity, 0.05, 1.0)),
-            "initial_share_field_scale": self.share_colormap_scale,
-            "layers": self.layers,
-            "available_cmaps": cmap_names,
-            "colormap_presets": _colormap_catalog(cmap_names),
-        }
 
     def to_html(self) -> str:
         payload = json.dumps(self._payload())
@@ -508,6 +392,41 @@ class PointCloudViewerFigure:
     }}
     .layer-controls-body.hidden {{
       display: none;
+    }}
+    .layer-controls-body.disabled {{
+      opacity: 0.45;
+    }}
+    .layer-controls-body.disabled .layer-option-toggle,
+    .layer-controls-body.disabled .layer-option-control label,
+    .layer-controls-body.disabled .layer-select-wrapper,
+    .layer-controls-body.disabled .colorbar,
+    .layer-controls-body.disabled input:disabled,
+    .layer-controls-body.disabled button:disabled {{
+      cursor: not-allowed;
+    }}
+    .layer-option-grid {{
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }}
+    .layer-option-control {{
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }}
+    .layer-option-control label {{
+      font-size: 12px;
+      color: var(--text-secondary);
+    }}
+    .layer-option-toggle {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }}
+    .layer-option-toggle input[type="checkbox"] {{
+      margin: 0;
     }}
     .layer-select-wrapper {{
       position: relative;
@@ -1000,18 +919,11 @@ class PointCloudViewerFigure:
     <div class="section">
       <div class="section-title">Display</div>
       <div class="control">
-        <label for="point-size">Point size</label>
-        <input id="point-size" type="range" min="1" max="12" step="0.5" value="{self.point_size}">
-      </div>
-      <div class="control">
         <button id="btn-reset-camera" type="button">Reset camera</button>
       </div>
     </div>
     <div class="section">
       <div class="section-title">Layers</div>
-      <div id="share-field-scale-control" class="control">
-        <label><input id="share-field-scale" type="checkbox"> Share field colormap scale</label>
-      </div>
       <div id="layer-list"></div>
     </div>
   </div>
@@ -1045,6 +957,9 @@ class PointCloudViewerFigure:
   <script type="module">
     import * as THREE from 'three';
     import {{ TrackballControls }} from 'three/addons/controls/TrackballControls.js';
+    import {{ LineMaterial }} from 'three/addons/lines/LineMaterial.js';
+    import {{ LineSegments2 }} from 'three/addons/lines/LineSegments2.js';
+    import {{ LineSegmentsGeometry }} from 'three/addons/lines/LineSegmentsGeometry.js';
 
     const payload = {payload};
     const colormapPresets = payload.colormap_presets || {{}};
@@ -1073,9 +988,7 @@ class PointCloudViewerFigure:
     const dropdownPortal = document.getElementById('dropdown-portal');
     let isDayMode = false;
     let commandsVisible = true;
-    let shareFieldScale = Boolean(payload.initial_share_field_scale);
     const CLIP_SLIDER_MAX = 1000;
-    let sharedFieldClip = {{ minFrac: 0.0, maxFrac: 1.0 }};
     const vertexShader = `
       attribute vec3 color;
       varying vec3 vColor;
@@ -1180,7 +1093,12 @@ class PointCloudViewerFigure:
     }}
 
     function getClipState(entry, fieldIdx = entry.activeFieldIdx ?? 0) {{
-      if (shareFieldScale) return sharedFieldClip;
+      if (entry.shareFieldScale) {{
+        if (!entry.sharedFieldClip) {{
+          entry.sharedFieldClip = createClipState();
+        }}
+        return entry.sharedFieldClip;
+      }}
       const states = ensureFieldClipStates(entry);
       const clampedIdx = Math.max(0, Math.min(states.length - 1, fieldIdx));
       if (!states[clampedIdx]) {{
@@ -1438,6 +1356,40 @@ class PointCloudViewerFigure:
       return Number.isFinite(value) ? Math.min(1.0, Math.max(0.05, value)) : 1.0;
     }}
 
+    function getLayerPointSize(layer) {{
+      const value = Number(layer?.point_size ?? payload.point_size);
+      return Number.isFinite(value) ? Math.min(12.0, Math.max(1.0, value)) : payload.point_size;
+    }}
+
+    function getLayerEdgeThickness(layer) {{
+      const value = Number(layer?.edge_thickness ?? 1.0);
+      return Number.isFinite(value) ? Math.min(12.0, Math.max(1.0, value)) : 1.0;
+    }}
+
+    function updateEntryPointSize(entry, size) {{
+      const numeric = Number(size);
+      const clamped = Number.isFinite(numeric) ? Math.min(12.0, Math.max(1.0, numeric)) : getLayerPointSize(entry.layer);
+      entry.pointSize = clamped;
+      entry.objects.points.material.uniforms.size.value = clamped;
+    }}
+
+    function updateEntryOpacity(entry, opacity) {{
+      const nextOpacity = Math.min(1.0, Math.max(0.05, Number(opacity) || 1.0));
+      entry.opacity = nextOpacity;
+      entry.objects.points.material.uniforms.opacity.value = nextOpacity;
+      if (entry.objects.lines) {{
+        entry.objects.lines.material.opacity = (isDayMode ? 0.28 : 0.35) * nextOpacity;
+      }}
+    }}
+
+    function updateEntryEdgeThickness(entry, thickness) {{
+      const nextThickness = Math.min(12.0, Math.max(1.0, Number(thickness) || 1.0));
+      entry.edgeThickness = nextThickness;
+      if (entry.objects.lines) {{
+        entry.objects.lines.material.linewidth = nextThickness;
+      }}
+    }}
+
     function applyThemeMode(dayMode) {{
       isDayMode = Boolean(dayMode);
       document.body.classList.toggle('day-mode', isDayMode);
@@ -1458,8 +1410,21 @@ class PointCloudViewerFigure:
       }}
     }}
 
+    function setLineMaterialResolution(material) {{
+      if (!material || !material.resolution) return;
+      material.resolution.set(Math.max(1, window.innerWidth), Math.max(1, window.innerHeight));
+    }}
+
+    function refreshLineMaterialResolutions() {{
+      for (const entry of layers) {{
+        const material = entry.objects?.lines?.material;
+        setLineMaterialResolution(material);
+      }}
+    }}
+
     function buildPoints(layer) {{
       const baseOpacity = getLayerOpacity(layer);
+      const baseEdgeThickness = getLayerEdgeThickness(layer);
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.Float32BufferAttribute(layer.points.flat(), 3));
       geometry.setAttribute('color', createStoredColorAttribute(flattenColorArray(layer.colors)));
@@ -1484,14 +1449,17 @@ class PointCloudViewerFigure:
           const pj = layer.points[j];
           positions.push(...pi, ...pj);
         }}
-        const lineGeometry = new THREE.BufferGeometry();
-        lineGeometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-        const lineMaterial = new THREE.LineBasicMaterial({{
+        const lineGeometry = new LineSegmentsGeometry();
+        lineGeometry.setPositions(positions);
+        const lineMaterial = new LineMaterial({{
           color: isDayMode ? 0x0f172a : 0xe4e4e7,
           opacity: (isDayMode ? 0.28 : 0.35) * baseOpacity,
           transparent: true,
+          linewidth: baseEdgeThickness,
         }});
-        lines = new THREE.LineSegments(lineGeometry, lineMaterial);
+        setLineMaterialResolution(lineMaterial);
+        lines = new LineSegments2(lineGeometry, lineMaterial);
+        lines.frustumCulled = false;
         scene.add(lines);
       }}
       return {{ points, lines }};
@@ -1565,32 +1533,16 @@ class PointCloudViewerFigure:
       return range ? [range] : [];
     }}
 
-    function getSharedFieldScaleRange() {{
+    function getSharedFieldScaleRange(entry) {{
+      if (!entry || isNoCmap(getEntryCmap(entry))) return null;
       let minVal = Infinity;
       let maxVal = -Infinity;
-      for (const entry of layers) {{
-        if (!entry.visible || isNoCmap(getEntryCmap(entry))) continue;
-        for (const range of getEntryAllScaleRanges(entry)) {{
-          minVal = Math.min(minVal, range.min);
-          maxVal = Math.max(maxVal, range.max);
-        }}
+      for (const range of getEntryAllScaleRanges(entry)) {{
+        minVal = Math.min(minVal, range.min);
+        maxVal = Math.max(maxVal, range.max);
       }}
       if (!Number.isFinite(minVal) || !Number.isFinite(maxVal)) return null;
       return {{ min: minVal, max: maxVal }};
-    }}
-
-    function hasVisibleColormapSelection() {{
-      return layers.some((entry) => entry.visible && !isNoCmap(getEntryCmap(entry)));
-    }}
-
-    function updateShareFieldScaleControl() {{
-      const control = document.getElementById('share-field-scale-control');
-      const input = document.getElementById('share-field-scale');
-      if (!control || !input) return;
-      const sharedFieldScaleRange = getSharedFieldScaleRange();
-      control.style.display = hasVisibleColormapSelection() ? '' : 'none';
-      input.checked = shareFieldScale;
-      input.disabled = !sharedFieldScaleRange;
     }}
 
     function getScalarMeta(entry, fieldIdx = entry.activeFieldIdx ?? 0) {{
@@ -1609,8 +1561,8 @@ class PointCloudViewerFigure:
             ? getEntryRawGradient(entry, fieldIdx)
             : (getColormapPreset(cmapName)?.gradient || null),
         }};
-        const sharedFieldScaleRange = getSharedFieldScaleRange();
-        if (!isNoCmap(cmapName) && shareFieldScale && sharedFieldScaleRange) {{
+        const sharedFieldScaleRange = getSharedFieldScaleRange(entry);
+        if (!isNoCmap(cmapName) && entry.shareFieldScale && sharedFieldScaleRange) {{
           resolved.min = sharedFieldScaleRange.min;
           resolved.max = sharedFieldScaleRange.max;
         }}
@@ -1640,8 +1592,8 @@ class PointCloudViewerFigure:
           ? (baseMeta.gradient || getEntryRawGradient(entry, fieldIdx))
           : (getColormapPreset(cmapName)?.gradient || baseMeta.gradient),
       }};
-      const sharedFieldScaleRange = getSharedFieldScaleRange();
-      if (!isNoCmap(cmapName) && shareFieldScale && sharedFieldScaleRange) {{
+      const sharedFieldScaleRange = getSharedFieldScaleRange(entry);
+      if (!isNoCmap(cmapName) && entry.shareFieldScale && sharedFieldScaleRange) {{
         resolved.min = sharedFieldScaleRange.min;
         resolved.max = sharedFieldScaleRange.max;
       }}
@@ -2046,7 +1998,6 @@ class PointCloudViewerFigure:
     }}
 
     function updateColorbars() {{
-      updateShareFieldScaleControl();
       for (const entry of layers) {{
         if (!entry.fieldOptionsContainer) continue;
         entry.fieldOptionsContainer.innerHTML = '';
@@ -2079,7 +2030,9 @@ class PointCloudViewerFigure:
       layers.forEach((entry, idx) => {{
         const row = document.createElement('div');
         row.className = 'layer-row';
-        const hasFieldOptions = getEntryFieldCount(entry) > 0 || Boolean(entry.layer.scalar_meta) || Boolean(entry.layer.values);
+        const hasMultipleFields = getEntryFieldCount(entry) > 1;
+        const hasScalarOptions = getEntryFieldCount(entry) > 0 || Boolean(entry.layer.scalar_meta) || Boolean(entry.layer.values);
+        const hasLayerOptions = true;
         let refreshFieldControls = null;
         let controlsBody = null;
         let toggleButton = null;
@@ -2090,9 +2043,8 @@ class PointCloudViewerFigure:
           entry.visible = checkbox.checked;
           entry.objects.points.visible = entry.visible;
           if (entry.objects.lines) entry.objects.lines.visible = entry.visible;
-          refreshFieldControls?.();
-          updateColorbars();
-          updateInfoPanel();
+          rebuildLayerList();
+          hideHoverTooltip();
           requestRenderAndHover();
         }});
         const info = document.createElement('div');
@@ -2102,7 +2054,7 @@ class PointCloudViewerFigure:
         label.textContent = `${{idx + 1}}. ${{entry.layer.label}}`;
         info.appendChild(label);
 
-        if (hasFieldOptions) {{
+        if (hasLayerOptions) {{
           const toggle = document.createElement('button');
           toggle.type = 'button';
           toggle.className = 'layer-options-toggle';
@@ -2122,6 +2074,86 @@ class PointCloudViewerFigure:
         controlsBody = document.createElement('div');
         controlsBody.className = 'layer-controls-body';
         controlsBody.classList.toggle('hidden', !entry.optionsExpanded);
+        controlsBody.classList.toggle('disabled', !entry.visible);
+
+        const optionGrid = document.createElement('div');
+        optionGrid.className = 'layer-option-grid';
+
+        const pointSizeWrap = document.createElement('div');
+        pointSizeWrap.className = 'layer-option-control';
+        const pointSizeLabel = document.createElement('label');
+        pointSizeLabel.textContent = 'Point size';
+        const pointSizeInput = document.createElement('input');
+        pointSizeInput.type = 'range';
+        pointSizeInput.min = '1';
+        pointSizeInput.max = '12';
+        pointSizeInput.step = '0.5';
+        pointSizeInput.value = String(entry.pointSize);
+        pointSizeInput.disabled = !entry.visible;
+        pointSizeInput.addEventListener('input', () => {{
+          updateEntryPointSize(entry, pointSizeInput.value);
+          requestRenderAndHover();
+        }});
+        pointSizeWrap.appendChild(pointSizeLabel);
+        pointSizeWrap.appendChild(pointSizeInput);
+        optionGrid.appendChild(pointSizeWrap);
+
+        const opacityWrap = document.createElement('div');
+        opacityWrap.className = 'layer-option-control';
+        const opacityLabel = document.createElement('label');
+        opacityLabel.textContent = 'Point opacity';
+        const opacityInput = document.createElement('input');
+        opacityInput.type = 'range';
+        opacityInput.min = '0.05';
+        opacityInput.max = '1';
+        opacityInput.step = '0.05';
+        opacityInput.value = String(entry.opacity);
+        opacityInput.disabled = !entry.visible;
+        opacityInput.addEventListener('input', () => {{
+          updateEntryOpacity(entry, opacityInput.value);
+          requestRenderAndHover();
+        }});
+        opacityWrap.appendChild(opacityLabel);
+        opacityWrap.appendChild(opacityInput);
+        optionGrid.appendChild(opacityWrap);
+
+        if (entry.objects.lines && entry.visible) {{
+          const edgeThicknessWrap = document.createElement('div');
+          edgeThicknessWrap.className = 'layer-option-control';
+          const edgeThicknessLabel = document.createElement('label');
+          edgeThicknessLabel.textContent = 'Edge thickness';
+          const edgeThicknessInput = document.createElement('input');
+          edgeThicknessInput.type = 'range';
+          edgeThicknessInput.min = '1';
+          edgeThicknessInput.max = '12';
+          edgeThicknessInput.step = '0.5';
+          edgeThicknessInput.value = String(entry.edgeThickness);
+          edgeThicknessInput.disabled = !entry.visible;
+          edgeThicknessInput.addEventListener('input', () => {{
+            updateEntryEdgeThickness(entry, edgeThicknessInput.value);
+            requestRenderAndHover();
+          }});
+          edgeThicknessWrap.appendChild(edgeThicknessLabel);
+          edgeThicknessWrap.appendChild(edgeThicknessInput);
+          optionGrid.appendChild(edgeThicknessWrap);
+        }}
+
+        if (hasMultipleFields) {{
+          const shareScaleLabel = document.createElement('label');
+          shareScaleLabel.className = 'layer-option-toggle';
+          const shareScaleInput = document.createElement('input');
+          shareScaleInput.type = 'checkbox';
+          shareScaleInput.checked = Boolean(entry.shareFieldScale);
+          shareScaleInput.disabled = !entry.visible || !getSharedFieldScaleRange(entry);
+          shareScaleInput.addEventListener('change', () => {{
+            setLayerShareFieldScale(entry, shareScaleInput.checked);
+          }});
+          shareScaleLabel.appendChild(shareScaleInput);
+          shareScaleLabel.appendChild(document.createTextNode('Share colormap scale across fields'));
+          optionGrid.appendChild(shareScaleLabel);
+        }}
+
+        controlsBody.appendChild(optionGrid);
 
         const fieldNames = entry.layer.field_names || [];
         if (fieldNames.length > 1) {{
@@ -2205,7 +2237,7 @@ class PointCloudViewerFigure:
           controlsBody.appendChild(wrap);
         }}
 
-        if (hasFieldOptions) {{
+        if (hasScalarOptions) {{
           const colorbarHost = document.createElement('div');
           colorbarHost.className = 'layer-colorbar-host';
           controlsBody.appendChild(colorbarHost);
@@ -2217,7 +2249,7 @@ class PointCloudViewerFigure:
         row.appendChild(checkbox);
         row.appendChild(info);
         if (toggleButton) row.appendChild(toggleButton);
-        if (hasFieldOptions) row.appendChild(controlsBody);
+        if (hasLayerOptions) row.appendChild(controlsBody);
         container.appendChild(row);
       }});
       updateColorbars();
@@ -2265,18 +2297,16 @@ class PointCloudViewerFigure:
       updateColorbars();
     }}
 
-    function setShareFieldScale(enabled) {{
-      shareFieldScale = Boolean(enabled);
-      for (const entry of layers) {{
-        const fieldIdx = Math.max(
-          0,
-          Math.min(
-            entry.activeFieldIdx ?? 0,
-            entry.fieldCmaps && entry.fieldCmaps.length > 0 ? entry.fieldCmaps.length - 1 : 0,
-          ),
-        );
-        renderEntryColors(entry, fieldIdx);
-      }}
+    function setLayerShareFieldScale(entry, enabled) {{
+      entry.shareFieldScale = Boolean(enabled);
+      const fieldIdx = Math.max(
+        0,
+        Math.min(
+          entry.activeFieldIdx ?? 0,
+          entry.fieldCmaps && entry.fieldCmaps.length > 0 ? entry.fieldCmaps.length - 1 : 0,
+        ),
+      );
+      renderEntryColors(entry, fieldIdx);
       updateColorbars();
       hideHoverTooltip();
     }}
@@ -2284,14 +2314,7 @@ class PointCloudViewerFigure:
     function setColorClipBoundary(entry, fieldIdx, boundary, value) {{
       const state = getClipState(entry, fieldIdx);
       setClipBoundary(state, boundary, sliderValueToClip(value, boundary === 'max' ? 1.0 : 0.0));
-      if (shareFieldScale) {{
-        for (const layerEntry of layers) {{
-          const targetFieldIdx = Math.max(0, Math.min(getEntryFieldCount(layerEntry) - 1, layerEntry.activeFieldIdx ?? 0));
-          renderEntryColors(layerEntry, targetFieldIdx);
-        }}
-      }} else {{
-        renderEntryColors(entry, fieldIdx);
-      }}
+      renderEntryColors(entry, fieldIdx);
       syncAllColorbarClipControls();
       hideHoverTooltip();
     }}
@@ -2370,17 +2393,21 @@ class PointCloudViewerFigure:
       hoverTooltip.style.top = `${{Math.min(clientY + 14, Math.max(margin, maxY))}}px`;
     }}
 
-    function getCurrentPointSize() {{
-      const input = document.getElementById('point-size');
-      const value = Number(input?.value ?? payload.point_size);
-      return Number.isFinite(value) && value > 0 ? value : payload.point_size;
+    function getHoverPointSize() {{
+      let maxPointSize = 0.0;
+      for (const entry of layers) {{
+        if (!entry.visible) continue;
+        maxPointSize = Math.max(maxPointSize, Number(entry.pointSize) || 0.0);
+      }}
+      if (maxPointSize > 0.0) return maxPointSize;
+      return Math.max(1.0, Number(payload.point_size) || 1.0);
     }}
 
     function computeHoverThreshold(viewportHeightPx) {{
       const distance = camera.position.distanceTo(controls.target);
       const fov = THREE.MathUtils.degToRad(camera.fov);
       const worldPerPixel = (2 * Math.max(distance, 1e-6) * Math.tan(fov / 2)) / Math.max(viewportHeightPx, 1);
-      const pointRadiusPx = Math.max(getCurrentPointSize() * 0.5, 1.5);
+      const pointRadiusPx = Math.max(getHoverPointSize() * 0.5, 1.5);
       return Math.max(worldPerPixel * pointRadiusPx * 1.15, 1e-5);
     }}
 
@@ -2490,17 +2517,24 @@ class PointCloudViewerFigure:
         objects,
         visible: layer.visible !== false,
         opacity: getLayerOpacity(layer),
+        edgeThickness: getLayerEdgeThickness(layer),
+        pointSize: getLayerPointSize(layer),
         activeFieldIdx: Number(layer.active_field_idx || 0),
         activeValues: layer.values || null,
         activeCmap: layer.scalar_meta && layer.scalar_meta.cmap ? layer.scalar_meta.cmap : NO_CMAP,
         fieldCmaps,
         fieldClipStates: Array.from({{ length: Math.max(fieldCount, 1) }}, () => createClipState()),
-        optionsExpanded: fieldCount > 0 || Boolean(layer.values) || Boolean(layer.scalar_meta),
+        sharedFieldClip: createClipState(),
+        shareFieldScale: Boolean(layer.share_field_scale ?? payload.initial_share_field_scale),
+        optionsExpanded: layer.visible !== false,
         fieldOptionsContainer: null,
       }};
       layers.push(entry);
       entry.objects.points.visible = entry.visible;
       if (entry.objects.lines) entry.objects.lines.visible = entry.visible;
+      updateEntryOpacity(entry, entry.opacity);
+      updateEntryEdgeThickness(entry, entry.edgeThickness);
+      updateEntryPointSize(entry, entry.pointSize);
       if (layer.field_names && layer.field_names.length > 0) {{
         setLayerField(entry, entry.activeFieldIdx);
       }} else if (fieldValues || layer.values) {{
@@ -2509,13 +2543,6 @@ class PointCloudViewerFigure:
     }}
 
     rebuildLayerList();
-
-    document.getElementById('point-size').addEventListener('input', (event) => {{
-      const size = Number(event.target.value);
-      for (const entry of layers) {{
-        entry.objects.points.material.uniforms.size.value = size;
-      }}
-    }});
     document.getElementById('btn-quit-top').addEventListener('click', async () => {{
       try {{
         await fetch('/__quit__', {{ method: 'POST' }});
@@ -2528,14 +2555,6 @@ class PointCloudViewerFigure:
     document.getElementById('btn-theme-mode').addEventListener('click', () => applyThemeMode(!isDayMode));
     const commandsToggleBtn = document.getElementById('btn-toggle-commands');
     const controlsPanel = document.getElementById('controls');
-    const shareFieldScaleInput = document.getElementById('share-field-scale');
-    if (shareFieldScaleInput) {{
-      shareFieldScaleInput.checked = shareFieldScale;
-      shareFieldScaleInput.disabled = !getSharedFieldScaleRange();
-      shareFieldScaleInput.addEventListener('change', () => {{
-        setShareFieldScale(shareFieldScaleInput.checked);
-      }});
-    }}
     if (commandsToggleBtn && controlsPanel) {{
       const updateCommandsToggleButton = () => {{
         commandsToggleBtn.textContent = commandsVisible ? 'Hide Commands' : 'Show Commands';
@@ -2561,6 +2580,7 @@ class PointCloudViewerFigure:
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
+      refreshLineMaterialResolutions();
       controls.handleResize?.();
     }});
 
@@ -2580,183 +2600,10 @@ class PointCloudViewerFigure:
 </body>
 </html>"""
 
-    def _write_html(self, path: str | Path | None = None) -> Path:
-        if path is None:
-            fd, tmp_path = tempfile.mkstemp(prefix="pointcloud_viewer_", suffix=".html")
-            Path(tmp_path).write_text(self.to_html(), encoding="utf-8")
-            Path(tmp_path).chmod(0o644)
-            return Path(tmp_path)
-        out = Path(path)
-        out.write_text(self.to_html(), encoding="utf-8")
-        return out
-
-    def _notebook_iframe_html(
-      self,
-      *,
-      width: int | str = "100%",
-      height: int = 760,
-    ) -> str:
-      width_css = f"{width}px" if isinstance(width, int) else str(width)
-      html_content = self.to_html()
-      # Escape characters that would break the srcdoc attribute value
-      srcdoc = (
-          html_content
-          .replace("&", "&amp;")
-          .replace('"', "&quot;")
-      )
-      return (
-          f'<div style="width:{width_css};max-width:100%;">'
-          f'<iframe srcdoc="{srcdoc}"'
-          f' style="display:block;width:100%;height:{int(height)}px;border:0;border-radius:8px;"'
-          f' referrerpolicy="no-referrer"'
-          f' sandbox="allow-scripts allow-same-origin">'
-          f'</iframe>'
-          f'</div>'
-      )
-
-    def _repr_html_(self) -> str:
-        return self._notebook_iframe_html()
-
-    def _serve(self, host: str = "127.0.0.1", port: int = 0, path: str | Path | None = None) -> str:
-        if self._server is not None:
-            self.close_server()
-
-        html_path = self._write_html(path=path)
-        viewer = self
-        server_ref: dict[str, ThreadingHTTPServer | None] = {"server": None}
-
-        class _QuietHandler(SimpleHTTPRequestHandler):
-            def log_message(self, format: str, *args: Any) -> None:
-                return
-
-            def do_POST(self) -> None:
-                if self.path == "/__quit__":
-                    body = b'{"status":"ok"}'
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-
-                    def _shutdown() -> None:
-                        try:
-                            viewer.close_server()
-                        except Exception:
-                            srv = server_ref.get("server")
-                            if srv is not None:
-                                try:
-                                    srv.shutdown()
-                                except Exception:
-                                    pass
-
-                    threading.Thread(target=_shutdown, daemon=True, name="pointcloud-viewer-shutdown").start()
-                    return
-                self.send_error(404, "Not Found")
-
-        handler = lambda *args, **kwargs: _QuietHandler(*args, directory=str(html_path.parent), **kwargs)
-        server = ThreadingHTTPServer((host, port), handler)
-        server_ref["server"] = server
-        server.daemon_threads = True
-        thread = threading.Thread(target=server.serve_forever, daemon=True, name="pointcloud-viewer-server")
-        thread.start()
-
-        self._server = server
-        self._server_thread = thread
-        self._served_html_path = html_path
-        self._served_url = f"http://{host}:{server.server_port}/{html_path.name}"
-        return self._served_url
-
-    def close_server(self) -> None:
-        if self._server is not None:
-            self._server.shutdown()
-            self._server.server_close()
-            self._server = None
-        if self._server_thread is not None:
-            self._server_thread.join(timeout=1.0)
-            self._server_thread = None
-        self._served_url = None
-
-    def show(
-        self,
-        *,
-        inline: bool | None = None,
-        in_browser: bool | None = None,
-        open_browser: bool | None = None,
-        notebook_proxy: bool | str | None = None,
-        width: int | str = "100%",
-        height: int = 760,
-        path: str | Path | None = None,
-        host: str = "127.0.0.1",
-        port: int = 0,
-        block: bool = False,
-    ) -> Any:
-        shell = None
-        try:
-            from IPython import get_ipython
-
-            shell = get_ipython()
-        except Exception:
-            shell = None
-
-        if open_browser is not None:
-            if in_browser is not None and bool(in_browser) != bool(open_browser):
-                raise ValueError("in_browser and open_browser must match when both are provided")
-            in_browser = open_browser
-
-        if inline is None and in_browser is None:
-            inline = False
-            in_browser = True
-        elif inline is None:
-            inline = not bool(in_browser)
-        elif in_browser is None:
-            in_browser = not bool(inline)
-
-        inline = bool(inline)
-        in_browser = bool(in_browser)
-
-        if inline and shell is None:
-            raise RuntimeError("inline=True requires an IPython notebook environment")
-        if inline and in_browser:
-            raise ValueError("inline=True and in_browser=True are mutually exclusive")
-
-        if inline:
-            from IPython.display import HTML, display
-
-            # Preserve the argument for backward compatibility; notebook rendering
-            # is now self-contained and does not rely on a local HTTP server.
-            _ = notebook_proxy
-            display(HTML(self._notebook_iframe_html(width=width, height=height)))
-            return None
-
-        url = self._serve(host=host, port=port, path=path)
-
-        if in_browser:
-            webbrowser.open(url, new=2)
-
-        if block and self._server_thread is not None:
-            self._server_thread.join()
-
-        return None
-
-    def open_in_browser(
-        self,
-        *,
-        host: str = "127.0.0.1",
-        port: int = 0,
-        path: str | Path | None = None,
-        block: bool = False,
-    ) -> str:
-        url = self._serve(host=host, port=port, path=path)
-        webbrowser.open(url, new=2)
-        if block and self._server_thread is not None:
-            self._server_thread.join()
-        return url
-
-
 def plot_pointcloud(
     points: np.ndarray | torch.Tensor,
     edges: np.ndarray | torch.Tensor | None = None,
-    init_fig: PointCloudViewerFigure | None = None,
+    init_fig: ViewerFigureBase | None = None,
     point_color: np.ndarray | torch.Tensor | str = "blue",
     scalar_fields: Mapping[str, np.ndarray | torch.Tensor] | None = None,
     downsampling_factor: int = 1,
@@ -2766,8 +2613,10 @@ def plot_pointcloud(
     cmap: str | None = None,
     title: str | None = None,
     label: str = "Points",
-) -> PointCloudViewerFigure:
+) -> ViewerFigureBase:
     fig = init_fig if init_fig is not None else PointCloudViewerFigure()
+    if not hasattr(fig, "add_pointcloud"):
+        raise TypeError("init_fig must provide an add_pointcloud(...) method")
     if point_size is not None:
         fig.point_size = float(point_size)
     if share_colormap_scale is not None:
@@ -2810,9 +2659,11 @@ def plot_pointcloud(
                 )
 
         combined_layer = {
+            "layer_kind": "pointcloud",
             "label": label,
             "points": base_layer["points"],
             "edges": base_layer["edges"],
+            "edge_thickness": 1.0,
             "colors": base_layer["colors"],
             "raw_colors": base_layer["raw_colors"],
             "values": base_layer["values"],
@@ -2822,6 +2673,7 @@ def plot_pointcloud(
             "field_scalar_meta": [layer_data["scalar_meta"] for _, layer_data in prepared_fields],
             "active_field_idx": 0,
             "scalar_meta": base_layer["scalar_meta"],
+            "point_size": float(np.clip(fig.point_size, 1.0, 12.0)),
             "visible": True,
             "opacity": resolved_opacity,
         }
