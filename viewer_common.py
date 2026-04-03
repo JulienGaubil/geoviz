@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import webbrowser
 from dataclasses import dataclass, field
+from functools import lru_cache
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from html import escape
 from pathlib import Path
 from typing import Any, ClassVar, Mapping
 
@@ -16,6 +19,33 @@ try:
     import torch
 except Exception:  # pragma: no cover - optional dependency in some environments
     torch = None
+
+
+@lru_cache(maxsize=None)
+def _read_asset_text(name: str) -> str:
+    return (Path(__file__).with_name("assets") / name).read_text(encoding="utf-8")
+
+
+def _render_viewer_html(
+    payload: Mapping[str, Any],
+    *,
+    title: str,
+    meta_names: tuple[str, ...] = (),
+) -> str:
+    meta_tags = "\n".join(f'  <meta name="{escape(name)}" content="1">' for name in meta_names)
+    template = _read_asset_text("viewer_template.html")
+    inline_css = _read_asset_text("viewer.css")
+    inline_js = _read_asset_text("viewer.js")
+    payload_json = json.dumps(payload).replace("</", "<\\/")
+    escaped_title = escape(title)
+    return (
+        template
+        .replace("__META_TAGS__", meta_tags)
+        .replace("__TITLE__", escaped_title)
+        .replace("__INLINE_CSS__", inline_css)
+        .replace("__INLINE_JS__", inline_js)
+        .replace("__PAYLOAD_JSON__", payload_json)
+    )
 
 
 def _to_numpy(x: np.ndarray | torch.Tensor | None) -> np.ndarray | None:
@@ -134,6 +164,7 @@ class ViewerFigureBase:
     _served_url: str | None = field(default=None, init=False, repr=False)
 
     default_title: ClassVar[str] = "Viewer"
+    html_meta_names: ClassVar[tuple[str, ...]] = ()
 
     def _payload(self) -> dict[str, Any]:
         preferred_cmaps = _collect_layer_cmaps(self.layers)
@@ -152,7 +183,11 @@ class ViewerFigureBase:
         }
 
     def to_html(self) -> str:
-        raise NotImplementedError("to_html() must be implemented by subclasses")
+        return _render_viewer_html(
+            self._payload(),
+            title=self.title or self.default_title,
+            meta_names=self.html_meta_names,
+        )
 
     def _write_html(self, path: str | Path | None = None) -> Path:
         if path is None:
@@ -203,7 +238,7 @@ class ViewerFigureBase:
                 return
 
             def do_POST(self) -> None:
-                if self.path == "/__quit__":
+                if self.path in {"/__quit__", "/_shutdown"}:
                     body = b'{"status":"ok"}'
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")

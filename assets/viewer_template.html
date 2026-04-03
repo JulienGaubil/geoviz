@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="geoviz-shared-runtime" content="1">
+__META_TAGS__
+  <title>__TITLE__</title>
+  <style>
+__INLINE_CSS__
+  </style>
+</head>
+<body>
+  <div id="canvas-container"></div>
+  <div id="top-actions">
+    <button id="btn-quit-top" class="top-action-btn danger" title="Quit viewer" aria-label="Quit viewer">Quit Viewer</button>
+    <button id="btn-toggle-commands" class="top-action-btn text-btn" title="Hide commands" aria-label="Hide commands">Hide Commands</button>
+    <button id="btn-theme-mode" class="top-action-btn" title="Switch to day mode" aria-label="Switch to day mode">☾</button>
+  </div>
+  <div id="controls">
+    <h1>__TITLE__</h1>
+    <div class="section">
+      <div class="section-title">Display</div>
+      <div class="control">
+        <button id="btn-reset-camera" type="button">Reset camera</button>
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-title">Layers</div>
+      <div class="layer-row master-toggle">
+        <input id="toggle-all-layers" type="checkbox" checked>
+        <div class="layer-label">Toggle all</div>
+      </div>
+      <div id="layer-list"></div>
+    </div>
+  </div>
+  <div id="info-panel">
+    <div class="info-row">
+      <div class="info-item">
+        <span class="info-label">Points:</span>
+        <span class="info-value" id="info-points">--</span>
+      </div>
+      <div class="info-item">
+        <span class="info-label">Vertices:</span>
+        <span class="info-value" id="info-vertices">--</span>
+      </div>
+      <div class="info-item">
+        <span class="info-label">Faces:</span>
+        <span class="info-value" id="info-faces">--</span>
+      </div>
+    </div>
+  </div>
+  <div id="hover-tooltip"></div>
+  <div id="dropdown-portal"></div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+        "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.9.9/build/index.module.js"
+      }
+    }
+  </script>
+  <script id="viewer-payload" type="application/json">__PAYLOAD_JSON__</script>
+  <script type="module">
+__INLINE_JS__
+  </script>
+</body>
+</html>
