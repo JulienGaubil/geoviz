@@ -376,3 +376,14 @@ def plot_mesh(
         opacity=resolved_opacity,
         show_edges=show_edges,
     )
+
+
+def plot_trimesh(
+    trimesh,
+    **kwargs,
+) -> MeshViewerFigure:
+    return plot_mesh(
+        vertices=np.asarray(trimesh.vertices),
+        faces=np.asarray(trimesh.faces),
+        **kwargs
+    )

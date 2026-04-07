@@ -60,7 +60,7 @@ fig.show(in_browser=True)
 ```python
 import numpy as np
 
-from dev.geoviz import plot_mesh
+from dev.geoviz import plot_mesh, plot_trimesh
 
 # Cube vertices.
 vertices = np.array(
@@ -106,6 +106,9 @@ fig = plot_mesh(
     label="Cube",
 )
 fig.show(in_browser=True)
+
+# Equivalent convenience alias when your mesh is explicitly triangular.
+fig = plot_trimesh(vertices, faces, label="Cube")
 
 # In a notebook, render inline without spawning a local server.
 # You can also just evaluate `fig` in the last cell output.
