@@ -2671,6 +2671,38 @@ function createLayerFieldSelector(entry) {
     updateFieldControls(nextFieldIdx);
   };
 
+  const moveField = (delta) => {
+    if (!entry.visible) return false;
+    const currentIdx = entry.activeFieldIdx ?? 0;
+    const nextIdx = Math.max(0, Math.min(fieldNames.length - 1, currentIdx + delta));
+    if (nextIdx === currentIdx) return false;
+    closeDropdownMenu(menu);
+    selectField(nextIdx);
+    return true;
+  };
+
+  let repeatDelay = 0;
+  let repeatInterval = 0;
+  let suppressNextClick = false;
+  const stopFieldRepeat = () => {
+    clearTimeout(repeatDelay);
+    clearInterval(repeatInterval);
+    repeatDelay = 0;
+    repeatInterval = 0;
+  };
+  const startFieldRepeat = (buttonEl, delta, ev) => {
+    if (buttonEl.disabled || ev.button !== 0) return;
+    stopFieldRepeat();
+    buttonEl.setPointerCapture?.(ev.pointerId);
+    repeatDelay = window.setTimeout(() => {
+      suppressNextClick = true;
+      if (!moveField(delta)) return;
+      repeatInterval = window.setInterval(() => {
+        if (!moveField(delta)) stopFieldRepeat();
+      }, 120);
+    }, 320);
+  };
+
   fieldNames.forEach((name, fieldIdx) => {
     const item = document.createElement('div');
     item.className = 'custom-dropdown-item';
@@ -2688,17 +2720,30 @@ function createLayerFieldSelector(entry) {
 
   prevButton.addEventListener('click', (ev) => {
     ev.stopPropagation();
-    closeDropdownMenu(menu);
-    selectField((entry.activeFieldIdx ?? 0) - 1);
+    if (suppressNextClick) {
+      suppressNextClick = false;
+      return;
+    }
+    moveField(-1);
   });
+  prevButton.addEventListener('pointerdown', (ev) => startFieldRepeat(prevButton, -1, ev));
   button.addEventListener('click', (ev) => {
     ev.stopPropagation();
     toggleDropdownMenu(button, menu);
   });
   nextButton.addEventListener('click', (ev) => {
     ev.stopPropagation();
-    closeDropdownMenu(menu);
-    selectField((entry.activeFieldIdx ?? 0) + 1);
+    if (suppressNextClick) {
+      suppressNextClick = false;
+      return;
+    }
+    moveField(1);
+  });
+  nextButton.addEventListener('pointerdown', (ev) => startFieldRepeat(nextButton, 1, ev));
+  [prevButton, nextButton].forEach((navButton) => {
+    navButton.addEventListener('pointerup', stopFieldRepeat);
+    navButton.addEventListener('pointercancel', stopFieldRepeat);
+    navButton.addEventListener('lostpointercapture', stopFieldRepeat);
   });
 
   updateFieldControls(Math.max(0, Math.min(fieldNames.length - 1, entry.activeFieldIdx ?? 0)));
