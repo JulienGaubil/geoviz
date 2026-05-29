@@ -766,6 +766,12 @@ input[type="range"]::-moz-range-thumb {
   letter-spacing: 0.2px;
   flex: 0 0 72px;
 }
+.cmap-dropdown-button .dropdown-label {
+  flex: 0 0 auto;
+}
+.cmap-dropdown-button .layer-id {
+  text-align: left;
+}
 .field-dropdown-label {
   flex: 0 0 auto;
 }

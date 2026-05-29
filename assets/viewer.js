@@ -59,6 +59,11 @@ function normalizeLayerData(layer) {
   layer.field_values = Array.isArray(layer.field_values)
     ? layer.field_values.map((values) => decodeArraySpec(values, Float32Array))
     : null;
+  if (layer.texture && typeof layer.texture === 'object') {
+    layer.texture.uv = decodeArraySpec(layer.texture.uv, Float32Array) || new Float32Array(0);
+  } else {
+    layer.texture = null;
+  }
   const fallbackVertexCount = layer.layer_kind === 'pointcloud'
     ? Math.floor(layer.points.length / 3)
     : Math.floor(layer.vertices.length / 3);
@@ -377,23 +382,71 @@ function refreshMeshBounds(geometry) {
   }
 }
 
+function createMeshMaterial({
+  textureMap = null,
+  textureMode = false,
+  opacity = 1.0,
+  masked = false,
+} = {}) {
+  if (textureMode && textureMap) {
+    return new THREE.MeshBasicMaterial({
+      vertexColors: false,
+      map: textureMap,
+      color: 0xffffff,
+      side: THREE.FrontSide,
+      alphaTest: 0.5,
+      transparent: masked || opacity < 0.999,
+      opacity,
+      depthWrite: masked ? false : opacity >= 0.999,
+      polygonOffset: true,
+      polygonOffsetFactor: 1,
+      polygonOffsetUnits: 1,
+    });
+  }
+  return new THREE.MeshLambertMaterial({
+    vertexColors: true,
+    side: THREE.DoubleSide,
+    transparent: masked || opacity < 0.999,
+    opacity,
+    depthWrite: masked ? false : opacity >= 0.999,
+    polygonOffset: true,
+    polygonOffsetFactor: 1,
+    polygonOffsetUnits: 1,
+  });
+}
+
 function buildMesh(layer) {
   const geometry = new THREE.BufferGeometry();
   setPositionAttribute(geometry, layer.vertices);
   geometry.setAttribute('color', createStoredColorAttribute(layer.colors));
+  const hasTexture = Boolean(
+    layer.texture
+    && typeof layer.texture.image_data_uri === 'string'
+    && layer.texture.uv
+    && layer.texture.uv.length === Math.floor(layer.vertices.length / 3) * 2
+  );
+  let textureMap = null;
+  if (hasTexture) {
+    geometry.setAttribute('uv', new THREE.BufferAttribute(layer.texture.uv, 2));
+    textureMap = new THREE.TextureLoader().load(layer.texture.image_data_uri);
+    textureMap.colorSpace = THREE.SRGBColorSpace;
+    textureMap.flipY = true;
+    textureMap.wrapS = THREE.ClampToEdgeWrapping;
+    textureMap.wrapT = THREE.ClampToEdgeWrapping;
+    textureMap.minFilter = THREE.LinearMipmapLinearFilter;
+    textureMap.magFilter = THREE.LinearFilter;
+    textureMap.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    textureMap.needsUpdate = true;
+  }
+  const textureModeActive = Boolean(textureMap && layer.active_cmap === TEXTURE_CMAP);
   setIndexAttribute(geometry, layer.faces);
   refreshMeshBounds(geometry);
 
   const initialOpacity = Number(layer.opacity ?? payload.opacity) || 1.0;
-  const material = new THREE.MeshLambertMaterial({
-    vertexColors: true,
-    side: THREE.DoubleSide,
-    transparent: initialOpacity < 0.999,
+  const material = createMeshMaterial({
+    textureMap,
+    textureMode: textureModeActive,
     opacity: initialOpacity,
-    depthWrite: initialOpacity >= 0.999,
-    polygonOffset: true,
-    polygonOffsetFactor: 1,
-    polygonOffsetUnits: 1,
   });
   const mesh = new THREE.Mesh(geometry, material);
   mesh.frustumCulled = true;
@@ -402,17 +455,16 @@ function buildMesh(layer) {
   const maskedGeometry = new THREE.BufferGeometry();
   setPositionAttribute(maskedGeometry, layer.vertices.slice());
   maskedGeometry.setAttribute('color', createStoredColorAttribute(layer.colors.slice()));
+  if (hasTexture) {
+    maskedGeometry.setAttribute('uv', new THREE.BufferAttribute(layer.texture.uv.slice(), 2));
+  }
   setIndexAttribute(maskedGeometry, new Uint32Array(0));
   refreshMeshBounds(maskedGeometry);
-  const maskedMaterial = new THREE.MeshLambertMaterial({
-    vertexColors: true,
-    side: THREE.DoubleSide,
-    transparent: true,
+  const maskedMaterial = createMeshMaterial({
+    textureMap,
+    textureMode: textureModeActive,
     opacity: 0.0,
-    depthWrite: false,
-    polygonOffset: true,
-    polygonOffsetFactor: 1,
-    polygonOffsetUnits: 1,
+    masked: true,
   });
   const maskedMesh = new THREE.Mesh(maskedGeometry, maskedMaterial);
   maskedMesh.frustumCulled = true;
@@ -445,7 +497,7 @@ function buildMesh(layer) {
   } else {
     edgeMaterial.dispose();
   }
-  return { mesh, maskedMesh, edgeLines };
+  return { mesh, maskedMesh, edgeLines, textureMap };
 }
 
 function buildPoints(layer) {
@@ -585,6 +637,7 @@ function refreshEdgeOverlay() {
 }
 
 const NO_CMAP = 'none';
+const TEXTURE_CMAP = 'texture';
 
 function getFallbackCmap() {
   return availableCmaps[0] || 'viridis';
@@ -592,6 +645,14 @@ function getFallbackCmap() {
 
 function isNoCmap(cmapName) {
   return !cmapName || cmapName === NO_CMAP;
+}
+
+function isTextureCmap(cmapName) {
+  return cmapName === TEXTURE_CMAP;
+}
+
+function usesScalarCmap(cmapName) {
+  return !isNoCmap(cmapName) && !isTextureCmap(cmapName);
 }
 
 function getColormapPreset(cmapName) {
@@ -664,6 +725,9 @@ function getEntryRawColors(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
 
 function getEntryColorModeOptions(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
   const options = [NO_CMAP];
+  if (entry.layer?.texture) {
+    options.push(TEXTURE_CMAP);
+  }
   const values = getEntryDisplayedValues(entry, fieldIdx);
   if (values && typeof values.length === 'number') {
     availableCmaps.forEach((cmapName) => options.push(cmapName));
@@ -809,6 +873,10 @@ function buildDistributionSvg(values, meta) {
 function createCmapSwatch(entry, fieldIdx, cmapName) {
   const swatch = document.createElement('span');
   swatch.className = 'cmap-swatch';
+  if (isTextureCmap(cmapName)) {
+    swatch.style.background = 'linear-gradient(135deg, #f8fafc 0%, #f8fafc 34%, #0f172a 35%, #0f172a 43%, #dc2626 44%, #dc2626 56%, #2563eb 57%, #2563eb 66%, #f8fafc 67%, #f8fafc 100%)';
+    return swatch;
+  }
   const gradient = isNoCmap(cmapName)
     ? getEntryRawGradient(entry, fieldIdx)
     : (getColormapPreset(cmapName)?.gradient || null);
@@ -1125,7 +1193,7 @@ function getEntryAllScaleRanges(entry) {
 }
 
 function getSharedFieldScaleRange(entry) {
-  if (!entry || isNoCmap(getEntryCmap(entry))) return null;
+  if (!entry || !usesScalarCmap(getEntryCmap(entry))) return null;
   let minVal = Infinity;
   let maxVal = -Infinity;
   for (const range of getEntryAllScaleRanges(entry)) {
@@ -1148,18 +1216,18 @@ function getScalarMeta(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
       min: range.min,
       max: range.max,
       cmap: cmapName,
-      gradient: isNoCmap(cmapName)
-        ? getEntryRawGradient(entry, fieldIdx)
-        : (getColormapPreset(cmapName)?.gradient || null),
+      gradient: usesScalarCmap(cmapName)
+        ? (getColormapPreset(cmapName)?.gradient || null)
+        : getEntryRawGradient(entry, fieldIdx),
     };
     const sharedFieldScaleRange = getSharedFieldScaleRange(entry);
-    if (!isNoCmap(cmapName) && entry.shareFieldScale && sharedFieldScaleRange) {
+    if (usesScalarCmap(cmapName) && entry.shareFieldScale && sharedFieldScaleRange) {
       resolved.min = sharedFieldScaleRange.min;
       resolved.max = sharedFieldScaleRange.max;
     }
     resolved.fullMin = resolved.min;
     resolved.fullMax = resolved.max;
-    if (!isNoCmap(cmapName)) {
+    if (usesScalarCmap(cmapName)) {
       const clippedRange = applyClipToRange(
         { min: resolved.fullMin, max: resolved.fullMax },
         getClipState(entry, fieldIdx),
@@ -1173,24 +1241,24 @@ function getScalarMeta(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
       getClipState(entry, fieldIdx).minFrac,
       getClipState(entry, fieldIdx).maxFrac,
     );
-    resolved.clipEnabled = !isNoCmap(cmapName) && Math.abs(resolved.fullMax - resolved.fullMin) > 1e-12;
+    resolved.clipEnabled = usesScalarCmap(cmapName) && Math.abs(resolved.fullMax - resolved.fullMin) > 1e-12;
     return resolved;
   }
   const resolved = {
     ...baseMeta,
     cmap: cmapName,
-    gradient: isNoCmap(cmapName)
-      ? (baseMeta.gradient || getEntryRawGradient(entry, fieldIdx))
-      : (getColormapPreset(cmapName)?.gradient || baseMeta.gradient),
+    gradient: usesScalarCmap(cmapName)
+      ? (getColormapPreset(cmapName)?.gradient || baseMeta.gradient)
+      : (baseMeta.gradient || getEntryRawGradient(entry, fieldIdx)),
   };
   const sharedFieldScaleRange = getSharedFieldScaleRange(entry);
-  if (!isNoCmap(cmapName) && entry.shareFieldScale && sharedFieldScaleRange) {
+  if (usesScalarCmap(cmapName) && entry.shareFieldScale && sharedFieldScaleRange) {
     resolved.min = sharedFieldScaleRange.min;
     resolved.max = sharedFieldScaleRange.max;
   }
   resolved.fullMin = resolved.min;
   resolved.fullMax = resolved.max;
-  if (!isNoCmap(cmapName)) {
+  if (usesScalarCmap(cmapName)) {
     const clippedRange = applyClipToRange(
       { min: resolved.fullMin, max: resolved.fullMax },
       getClipState(entry, fieldIdx),
@@ -1204,7 +1272,7 @@ function getScalarMeta(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
     getClipState(entry, fieldIdx).minFrac,
     getClipState(entry, fieldIdx).maxFrac,
   );
-  resolved.clipEnabled = !isNoCmap(cmapName) && Math.abs(resolved.fullMax - resolved.fullMin) > 1e-12;
+  resolved.clipEnabled = usesScalarCmap(cmapName) && Math.abs(resolved.fullMax - resolved.fullMin) > 1e-12;
   return resolved;
 }
 
@@ -1243,18 +1311,37 @@ function resolveEntryRawColors(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
   return decodeArraySpec(entry.layer.colors, Uint8Array) || new Uint8Array(0);
 }
 
+function setMeshTextureMode(entry, enabled) {
+  if (!entry || !entry.textureMap) return;
+  const replaceMaterial = (object3d, masked = false) => {
+    if (!object3d?.material) return;
+    const oldMaterial = object3d.material;
+    const nextMaterial = createMeshMaterial({
+      textureMap: entry.textureMap,
+      textureMode: enabled,
+      opacity: oldMaterial.opacity,
+      masked,
+    });
+    object3d.material = nextMaterial;
+    oldMaterial.dispose?.();
+  };
+  replaceMaterial(entry.mesh, false);
+  replaceMaterial(entry.maskedMesh, true);
+}
+
 function renderEntryColors(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
   const fieldValues = entry.layer.field_values || null;
   const values = fieldValues ? fieldValues[fieldIdx] : entry.layer.values || null;
   const rawColors = resolveEntryRawColors(entry, fieldIdx);
   const cmapName = getEntryCmap(entry, fieldIdx);
   const meta = getScalarMeta(entry, fieldIdx);
-  const colorFromValues = !isNoCmap(cmapName) && values && meta ? buildColorsFromValues(values, meta) : null;
+  const colorFromValues = usesScalarCmap(cmapName) && values && meta ? buildColorsFromValues(values, meta) : null;
 
   entry.activeFieldIdx = fieldIdx;
   entry.activeValues = values;
   entry.activeCmap = cmapName;
   entry.currentColors = colorFromValues || rawColors;
+  setMeshTextureMode(entry, isTextureCmap(cmapName));
   applyFiltersToEntry(entry);
   requestRenderAndHover();
 }
@@ -2021,18 +2108,60 @@ function fitCamera() {
 
 function createCmapDropdown(entry, fieldIdx, controlsEnabled) {
   const dropdownWrap = document.createElement('div');
-  dropdownWrap.className = 'layer-select-wrapper';
+  dropdownWrap.className = 'layer-select-wrapper layer-field-controls';
+  const controls = document.createElement('div');
+  controls.className = 'field-select-inline';
+  const prevButton = document.createElement('button');
+  prevButton.type = 'button';
+  prevButton.className = 'field-nav-button';
+  prevButton.textContent = '←';
+  prevButton.setAttribute('aria-label', 'Previous colormap');
   const dropdown = document.createElement('div');
   dropdown.className = 'custom-dropdown';
   const button = document.createElement('button');
   button.type = 'button';
   button.className = 'layer-select-button cmap-dropdown-button';
   button.disabled = !controlsEnabled;
-  const currentCmap = getEntryCmap(entry, fieldIdx);
+  const options = getEntryColorModeOptions(entry, fieldIdx);
+  const currentCmap = options.includes(getEntryCmap(entry, fieldIdx)) ? getEntryCmap(entry, fieldIdx) : NO_CMAP;
   setCmapButtonContent(button, currentCmap);
   const menu = document.createElement('div');
   menu.className = 'custom-dropdown-menu';
-  getEntryColorModeOptions(entry, fieldIdx).forEach((cmapName) => {
+  const nextButton = document.createElement('button');
+  nextButton.type = 'button';
+  nextButton.className = 'field-nav-button';
+  nextButton.textContent = '→';
+  nextButton.setAttribute('aria-label', 'Next colormap');
+
+  const updateCmapControls = (cmapName) => {
+    const cmapIdx = Math.max(0, options.indexOf(cmapName));
+    setCmapButtonContent(button, options[cmapIdx]);
+    menu.querySelectorAll('.custom-dropdown-item').forEach((el, idx) => {
+      el.classList.toggle('selected', idx === cmapIdx);
+    });
+    button.disabled = !controlsEnabled;
+    if (!controlsEnabled) closeDropdownMenu(menu);
+    prevButton.disabled = !controlsEnabled || cmapIdx <= 0;
+    nextButton.disabled = !controlsEnabled || cmapIdx >= options.length - 1;
+  };
+
+  const selectCmap = (cmapName) => {
+    if (!controlsEnabled) return;
+    const nextCmap = options.includes(cmapName) ? cmapName : NO_CMAP;
+    setLayerCmap(entry, nextCmap);
+    updateCmapControls(nextCmap);
+  };
+
+  const moveCmap = (delta) => {
+    if (!controlsEnabled) return;
+    const currentIdx = Math.max(0, options.indexOf(getEntryCmap(entry, fieldIdx)));
+    const nextIdx = Math.max(0, Math.min(options.length - 1, currentIdx + delta));
+    if (nextIdx === currentIdx) return;
+    closeDropdownMenu(menu);
+    selectCmap(options[nextIdx]);
+  };
+
+  options.forEach((cmapName) => {
     const item = document.createElement('div');
     item.className = 'custom-dropdown-item cmap-dropdown-item';
     if (!controlsEnabled) item.classList.add('disabled');
@@ -2047,23 +2176,31 @@ function createCmapDropdown(entry, fieldIdx, controlsEnabled) {
     item.appendChild(value);
     item.addEventListener('click', () => {
       if (!controlsEnabled) return;
-      setLayerCmap(entry, cmapName);
-      setCmapButtonContent(button, cmapName);
-      menu.querySelectorAll('.custom-dropdown-item').forEach((el) => {
-        el.classList.toggle('selected', el === item);
-      });
+      selectCmap(cmapName);
       closeDropdownMenu(menu);
     });
     menu.appendChild(item);
+  });
+  prevButton.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    moveCmap(-1);
   });
   button.addEventListener('click', (ev) => {
     if (!controlsEnabled) return;
     ev.stopPropagation();
     toggleDropdownMenu(button, menu);
   });
+  nextButton.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    moveCmap(1);
+  });
+  updateCmapControls(currentCmap);
+  controls.appendChild(prevButton);
   dropdown.appendChild(button);
   dropdown.appendChild(menu);
-  dropdownWrap.appendChild(dropdown);
+  controls.appendChild(dropdown);
+  controls.appendChild(nextButton);
+  dropdownWrap.appendChild(controls);
   return { dropdownWrap, currentCmap };
 }
 
@@ -2071,10 +2208,10 @@ function createEntryFieldPanel(entry) {
   const fieldIdx = entry.activeFieldIdx ?? 0;
   const fieldNames = entry.layer.field_names || null;
   const meta = getScalarMeta(entry, fieldIdx);
-  if (!meta) return null;
+  if (!meta && !entry.layer?.texture) return null;
 
   const fieldLabel = fieldNames ? fieldNames[fieldIdx] : null;
-  const colorbarLabel = fieldLabel ? `Field: ${fieldLabel}` : 'Field colors';
+  const colorbarLabel = meta ? (fieldLabel ? `Field: ${fieldLabel}` : 'Field colors') : 'Color mode';
   const controlsEnabled = entry.visible;
 
   const wrapper = document.createElement('div');
@@ -2083,6 +2220,11 @@ function createEntryFieldPanel(entry) {
   title.className = 'colorbar-title';
   title.textContent = colorbarLabel;
   const { dropdownWrap, currentCmap } = createCmapDropdown(entry, fieldIdx, controlsEnabled);
+  wrapper.appendChild(title);
+  wrapper.appendChild(dropdownWrap);
+  if (!meta) {
+    return wrapper;
+  }
   const visual = document.createElement('div');
   visual.className = 'colorbar-visual';
   const distributionWrap = document.createElement('div');
@@ -2097,8 +2239,6 @@ function createEntryFieldPanel(entry) {
   const gradient = document.createElement('div');
   gradient.className = 'colorbar-gradient';
   gradient.style.background = gradientCss(meta.gradient);
-  wrapper.appendChild(title);
-  wrapper.appendChild(dropdownWrap);
   if (distribution) {
     distributionWrap.appendChild(distribution);
   }
@@ -2114,8 +2254,7 @@ function createEntryFieldPanel(entry) {
     range.appendChild(maxLabel);
     wrapper.appendChild(range);
 
-    const currentCmapIsClipped = !isNoCmap(currentCmap);
-    if (currentCmapIsClipped) {
+    if (usesScalarCmap(currentCmap)) {
       const clipWrap = document.createElement('div');
       clipWrap.className = 'colorbar-clip';
       const clipSlider = document.createElement('div');
@@ -2764,7 +2903,10 @@ function rebuildLayerList() {
     row.className = 'layer-row';
     const isPointLayer = entry.layerKind === 'pointcloud';
     const hasFieldOptions = true;
-    const hasScalarOptions = getEntryFieldCount(entry) > 0 || Boolean(entry.layer.scalar_meta) || Boolean(entry.layer.values);
+    const hasScalarOptions = getEntryFieldCount(entry) > 0
+      || Boolean(entry.layer.scalar_meta)
+      || Boolean(entry.layer.values)
+      || Boolean(entry.layer.texture);
     let controlsBody = null;
     let toggleButton = null;
 
@@ -2902,13 +3044,14 @@ payload.layers.forEach((rawLayer, layerIdx) => {
     mesh: layerKind === 'mesh' ? built.mesh : null,
     maskedMesh: layerKind === 'mesh' ? built.maskedMesh : null,
     edgeLines: layerKind === 'mesh' ? built.edgeLines : null,
+    textureMap: layerKind === 'mesh' ? built.textureMap : null,
     points: layerKind === 'pointcloud' ? built.points : null,
     maskedPoints: layerKind === 'pointcloud' ? built.maskedPoints : null,
     pointLines: layerKind === 'pointcloud' ? built.lines : null,
     visible: layer.visible !== false,
     activeFieldIdx: Number.isInteger(layer.active_field_idx) ? layer.active_field_idx : 0,
     activeValues: layer.values || null,
-    activeCmap: layer.scalar_meta && layer.scalar_meta.cmap ? layer.scalar_meta.cmap : NO_CMAP,
+    activeCmap: layer.active_cmap || (layer.scalar_meta && layer.scalar_meta.cmap) || NO_CMAP,
     currentColors: decodeArraySpec(layer.colors, Uint8Array) || new Uint8Array(0),
     unmaskedPointCount: layerKind === 'pointcloud' ? Math.floor(layer.points.length / 3) : 0,
     maskedPointCount: 0,

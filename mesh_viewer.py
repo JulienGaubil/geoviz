@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from io import BytesIO
 from typing import Any, Mapping
 
 import numpy as np
@@ -37,6 +38,57 @@ def _encode_array_payload(arr: np.ndarray, *, dtype: np.dtype | str | None = Non
     }
 
 
+def _encode_texture_image(image: Any) -> dict[str, Any]:
+    buffer = BytesIO()
+    rgba = image.convert("RGBA")
+    rgba.save(buffer, format="PNG")
+    return {
+        "image_data_uri": "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii"),
+        "width": int(rgba.size[0]),
+        "height": int(rgba.size[1]),
+    }
+
+
+def _extract_trimesh_texture(mesh: Any) -> dict[str, Any] | None:
+    visual = getattr(mesh, "visual", None)
+    if visual is None or getattr(visual, "kind", None) != "texture":
+        return None
+
+    uv = getattr(visual, "uv", None)
+    material = getattr(visual, "material", None)
+    image = getattr(material, "image", None) if material is not None else None
+    if uv is None or image is None:
+        return None
+
+    uv_arr = np.asarray(uv, dtype=np.float32)
+    if uv_arr.ndim != 2 or uv_arr.shape[1] != 2 or uv_arr.shape[0] != len(mesh.vertices):
+        return None
+
+    texture = _encode_texture_image(image)
+    texture["uv"] = uv_arr
+    return texture
+
+
+def _encode_texture_payload(texture: dict[str, Any] | None, valid_mask: np.ndarray) -> dict[str, Any] | None:
+    if not texture:
+        return None
+    uv = np.asarray(texture.get("uv"), dtype=np.float32)
+    if uv.ndim != 2 or uv.shape[1] != 2 or uv.shape[0] != valid_mask.shape[0]:
+        return None
+    return {
+        "uv": _encode_array_payload(uv[valid_mask] if np.any(valid_mask) else np.zeros((0, 2), dtype=np.float32), dtype=np.float32),
+        "image_data_uri": str(texture["image_data_uri"]),
+        "width": int(texture.get("width", 0)),
+        "height": int(texture.get("height", 0)),
+    }
+
+
+def _resolve_active_cmap(cmap: str | None, texture: dict[str, Any] | None) -> str | None:
+    if cmap is None and texture is not None:
+        return "texture"
+    return cmap
+
+
 def _prepare_mesh_inputs(
     vertices: np.ndarray | torch.Tensor,
     faces: np.ndarray | torch.Tensor,
@@ -62,6 +114,8 @@ def _prepare_vertex_colors(
     vertex_count: int,
     cmap: str | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, dict[str, Any] | None]:
+    if cmap == "texture":
+        cmap = None
     return _prepare_color_data(
         vertex_color,
         raw_geometry_shape=raw_vertex_shape,
@@ -97,6 +151,8 @@ def _encode_mesh_layer(
     visible: bool,
     opacity: float,
     show_edges: bool,
+    texture: dict[str, Any] | None = None,
+    active_cmap: str | None = None,
 ) -> dict[str, Any]:
     if scalar_values is not None and scalar_values.shape[0] != verts.shape[0]:
         raise ValueError("scalar_values must match filtered vertex count")
@@ -121,6 +177,8 @@ def _encode_mesh_layer(
         "opacity": float(np.clip(opacity, 0.05, 1.0)),
         "edge_thickness": 1.0,
         "show_edges": bool(show_edges),
+        "texture": texture,
+        "active_cmap": active_cmap,
     }
 
 
@@ -133,6 +191,7 @@ def _prepare_mesh_layer(
     visible: bool,
     opacity: float,
     show_edges: bool,
+    texture: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     verts, raw_vertex_shape, tri, valid_vertices = _prepare_mesh_inputs(vertices, faces)
     colors, raw_colors, scalar_values, scalar_meta = _prepare_vertex_colors(
@@ -143,6 +202,7 @@ def _prepare_mesh_layer(
     )
 
     valid_mask = valid_vertices & np.isfinite(colors).all(axis=1)
+    texture_payload = _encode_texture_payload(texture, valid_mask)
     verts, tri = _filter_mesh_geometry(verts, tri, valid_mask)
 
     if np.any(valid_mask):
@@ -166,6 +226,8 @@ def _prepare_mesh_layer(
         visible=visible,
         opacity=opacity,
         show_edges=show_edges,
+        texture=texture_payload,
+        active_cmap=_resolve_active_cmap(cmap, texture_payload),
     )
 
 
@@ -225,6 +287,7 @@ class MeshViewerFigure(ViewerFigureBase):
         visible: bool = True,
         opacity: float | None = None,
         show_edges: bool = False,
+        texture: dict[str, Any] | None = None,
     ) -> "MeshViewerFigure":
         self.layers.append(
             _prepare_mesh_layer(
@@ -236,6 +299,7 @@ class MeshViewerFigure(ViewerFigureBase):
                 visible=visible,
                 opacity=float(np.clip(self.opacity if opacity is None else opacity, 0.05, 1.0)),
                 show_edges=show_edges,
+                texture=texture,
             )
         )
         if title is not None:
@@ -256,6 +320,7 @@ def plot_mesh(
     label: str = "Mesh",
     visible: bool = True,
     show_edges: bool = False,
+    texture: dict[str, Any] | None = None,
 ) -> MeshViewerFigure:
     if init_fig is None:
         fig = MeshViewerFigure()
@@ -305,9 +370,18 @@ def plot_mesh(
         if base_valid_mask is None or base_field_name is None:
             raise ValueError("scalar_fields cannot be empty")
 
-        filtered_verts, filtered_faces = _filter_mesh_geometry(verts, tri, base_valid_mask)
-        encoded_fields: list[tuple[str, dict[str, Any]]] = []
         has_valid_vertices = bool(np.any(base_valid_mask))
+        filtered_verts, filtered_faces = _filter_mesh_geometry(verts, tri, base_valid_mask)
+        texture_payload = _encode_texture_payload(texture, base_valid_mask)
+        base_colors, base_raw_colors, _, _ = _prepare_vertex_colors(
+            vertex_color,
+            raw_vertex_shape=raw_vertex_shape,
+            vertex_count=verts.shape[0],
+            cmap=None,
+        )
+        filtered_base_colors = base_colors[base_valid_mask] if has_valid_vertices else np.zeros((0, 3), dtype=np.float32)
+        filtered_base_raw_colors = base_raw_colors[base_valid_mask] if has_valid_vertices else np.zeros((0, 3), dtype=np.float32)
+        encoded_fields: list[tuple[str, dict[str, Any]]] = []
 
         for field_name, colors, raw_colors, scalar_values, scalar_meta in prepared_fields:
             filtered_colors = colors[base_valid_mask] if has_valid_vertices else np.zeros((0, 3), dtype=np.float32)
@@ -327,7 +401,7 @@ def plot_mesh(
                         verts=filtered_verts,
                         tri=filtered_faces,
                         colors=filtered_colors,
-                        raw_colors=filtered_raw_colors,
+                        raw_colors=filtered_base_raw_colors,
                         scalar_meta=scalar_meta,
                         scalar_values=filtered_values,
                         visible=visible,
@@ -345,7 +419,7 @@ def plot_mesh(
             "vertices": base_layer["vertices"],
             "faces": base_layer["faces"],
             "colors": base_layer["colors"],
-            "raw_colors": base_layer["raw_colors"],
+            "raw_colors": _encode_array_payload(_to_uint8_rgb(filtered_base_raw_colors), dtype=np.uint8),
             "vertex_count": base_layer["vertex_count"],
             "face_count": base_layer["face_count"],
             "values": base_layer["values"],
@@ -359,7 +433,11 @@ def plot_mesh(
             "opacity": resolved_opacity,
             "edge_thickness": 1.0,
             "show_edges": bool(show_edges),
+            "texture": texture_payload,
+            "active_cmap": _resolve_active_cmap(cmap, texture_payload),
         }
+        if cmap is None or cmap == "texture":
+            combined_layer["colors"] = _encode_array_payload(_to_uint8_rgb(filtered_base_colors), dtype=np.uint8)
         fig.layers.append(combined_layer)
         if title is not None:
             fig.title = title
@@ -375,6 +453,7 @@ def plot_mesh(
         visible=visible,
         opacity=resolved_opacity,
         show_edges=show_edges,
+        texture=texture,
     )
 
 
@@ -382,6 +461,10 @@ def plot_trimesh(
     trimesh,
     **kwargs,
 ) -> MeshViewerFigure:
+    if "texture" not in kwargs:
+        texture = _extract_trimesh_texture(trimesh)
+        if texture is not None:
+            kwargs["texture"] = texture
     return plot_mesh(
         vertices=np.asarray(trimesh.vertices),
         faces=np.asarray(trimesh.faces),
