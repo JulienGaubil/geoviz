@@ -28,6 +28,9 @@ except ImportError:  # pragma: no cover - allow direct module imports from the r
     )
 
 
+_AUTO_CMAP = object()
+
+
 def _encode_array_payload(arr: np.ndarray, *, dtype: np.dtype | str | None = None) -> dict[str, Any]:
     encoded = np.ascontiguousarray(arr, dtype=dtype)
     return {
@@ -83,10 +86,18 @@ def _encode_texture_payload(texture: dict[str, Any] | None, valid_mask: np.ndarr
     }
 
 
-def _resolve_active_cmap(cmap: str | None, texture: dict[str, Any] | None) -> str | None:
-    if cmap is None and texture is not None:
-        return "texture"
+def _resolve_active_cmap(cmap: Any, texture: dict[str, Any] | None) -> str:
+    if cmap is _AUTO_CMAP:
+        return "texture" if texture is not None else "uniform"
+    if not isinstance(cmap, str):
+        raise ValueError("cmap must be a string")
+    if cmap == "texture" and texture is None:
+        return "uniform"
     return cmap
+
+
+def _uses_raw_colors(cmap: Any) -> bool:
+    return cmap is _AUTO_CMAP or cmap in {"texture", "uniform"}
 
 
 def _prepare_mesh_inputs(
@@ -112,10 +123,10 @@ def _prepare_vertex_colors(
     *,
     raw_vertex_shape: tuple[int, ...],
     vertex_count: int,
-    cmap: str | None,
+    cmap: Any,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, dict[str, Any] | None]:
-    if cmap == "texture":
-        cmap = None
+    if cmap is _AUTO_CMAP:
+        cmap = "uniform"
     return _prepare_color_data(
         vertex_color,
         raw_geometry_shape=raw_vertex_shape,
@@ -151,8 +162,9 @@ def _encode_mesh_layer(
     visible: bool,
     opacity: float,
     show_edges: bool,
+    show_vertices: bool,
     texture: dict[str, Any] | None = None,
-    active_cmap: str | None = None,
+    active_cmap: str = "uniform",
 ) -> dict[str, Any]:
     if scalar_values is not None and scalar_values.shape[0] != verts.shape[0]:
         raise ValueError("scalar_values must match filtered vertex count")
@@ -174,9 +186,10 @@ def _encode_mesh_layer(
         if scalar_values is None
         else _encode_array_payload(scalar_values, dtype=np.float32),
         "visible": bool(visible),
-        "opacity": float(np.clip(opacity, 0.05, 1.0)),
+        "opacity": float(np.clip(opacity, 0.0, 1.0)),
         "edge_thickness": 1.0,
         "show_edges": bool(show_edges),
+        "show_vertices": bool(show_vertices),
         "texture": texture,
         "active_cmap": active_cmap,
     }
@@ -186,11 +199,12 @@ def _prepare_mesh_layer(
     vertices: np.ndarray | torch.Tensor,
     faces: np.ndarray | torch.Tensor,
     vertex_color: np.ndarray | torch.Tensor | str,
-    cmap: str | None,
+    cmap: Any,
     label: str,
     visible: bool,
     opacity: float,
     show_edges: bool,
+    show_vertices: bool,
     texture: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     verts, raw_vertex_shape, tri, valid_vertices = _prepare_mesh_inputs(vertices, faces)
@@ -226,6 +240,7 @@ def _prepare_mesh_layer(
         visible=visible,
         opacity=opacity,
         show_edges=show_edges,
+        show_vertices=show_vertices,
         texture=texture_payload,
         active_cmap=_resolve_active_cmap(cmap, texture_payload),
     )
@@ -242,7 +257,7 @@ class MeshViewerFigure(ViewerFigureBase):
         opacity: float = 1.0,
         share_colormap_scale: bool = False,
     ) -> None:
-        super().__init__(title=title, point_size=5.0, opacity=float(np.clip(opacity, 0.05, 1.0)), share_colormap_scale=share_colormap_scale)
+        super().__init__(title=title, point_size=10.0, opacity=float(np.clip(opacity, 0.0, 1.0)), share_colormap_scale=share_colormap_scale)
 
     def add_pointcloud(
         self,
@@ -250,7 +265,7 @@ class MeshViewerFigure(ViewerFigureBase):
         edges: np.ndarray | torch.Tensor | None = None,
         point_color: np.ndarray | torch.Tensor | str = "blue",
         downsampling_factor: int = 1,
-        cmap: str | None = None,
+        cmap: str = "uniform",
         title: str | None = None,
         label: str = "Points",
         opacity: float | None = None,
@@ -267,7 +282,7 @@ class MeshViewerFigure(ViewerFigureBase):
             downsampling_factor=downsampling_factor,
             cmap=cmap,
             label=label,
-            opacity=float(np.clip(self.opacity if opacity is None else opacity, 0.05, 1.0)),
+            opacity=float(np.clip(self.opacity if opacity is None else opacity, 0.0, 1.0)),
         )
         layer["layer_kind"] = "pointcloud"
         layer["point_size"] = float(np.clip(self.point_size, 1.0, 12.0))
@@ -280,13 +295,14 @@ class MeshViewerFigure(ViewerFigureBase):
         self,
         vertices: np.ndarray | torch.Tensor,
         faces: np.ndarray | torch.Tensor,
-        vertex_color: np.ndarray | torch.Tensor | str = "#94a3b8",
-        cmap: str | None = None,
+        vertex_color: np.ndarray | torch.Tensor | str = "#f97316",
+        cmap: Any = _AUTO_CMAP,
         title: str | None = None,
         label: str = "Mesh",
         visible: bool = True,
         opacity: float | None = None,
         show_edges: bool = False,
+        show_vertices: bool = False,
         texture: dict[str, Any] | None = None,
     ) -> "MeshViewerFigure":
         self.layers.append(
@@ -297,8 +313,9 @@ class MeshViewerFigure(ViewerFigureBase):
                 cmap=cmap,
                 label=label,
                 visible=visible,
-                opacity=float(np.clip(self.opacity if opacity is None else opacity, 0.05, 1.0)),
+                opacity=float(np.clip(self.opacity if opacity is None else opacity, 0.0, 1.0)),
                 show_edges=show_edges,
+                show_vertices=show_vertices,
                 texture=texture,
             )
         )
@@ -311,15 +328,16 @@ def plot_mesh(
     vertices: np.ndarray | torch.Tensor,
     faces: np.ndarray | torch.Tensor,
     init_fig: ViewerFigureBase | None = None,
-    vertex_color: np.ndarray | torch.Tensor | str = "#94a3b8",
+    vertex_color: np.ndarray | torch.Tensor | str = "#f97316",
     scalar_fields: Mapping[str, np.ndarray | torch.Tensor] | None = None,
     opacity: float | None = None,
     share_colormap_scale: bool | None = None,
-    cmap: str | None = None,
+    cmap: Any = _AUTO_CMAP,
     title: str | None = None,
     label: str = "Mesh",
     visible: bool = True,
     show_edges: bool = False,
+    show_vertices: bool = False,
     texture: dict[str, Any] | None = None,
 ) -> MeshViewerFigure:
     if init_fig is None:
@@ -329,14 +347,14 @@ def plot_mesh(
     else:
         fig = MeshViewerFigure(
             title=init_fig.title,
-            opacity=float(np.clip(init_fig.opacity, 0.05, 1.0)),
+            opacity=float(np.clip(init_fig.opacity, 0.0, 1.0)),
             share_colormap_scale=bool(init_fig.share_colormap_scale),
         )
         fig.point_size = float(np.clip(getattr(init_fig, "point_size", fig.point_size), 1.0, 12.0))
         fig.layers.extend(init_fig.layers)
     if share_colormap_scale is not None:
         fig.share_colormap_scale = bool(share_colormap_scale)
-    resolved_opacity = float(np.clip(fig.opacity if opacity is None else opacity, 0.05, 1.0))
+    resolved_opacity = float(np.clip(fig.opacity if opacity is None else opacity, 0.0, 1.0))
 
     if scalar_fields is not None:
         if len(scalar_fields) == 0:
@@ -377,7 +395,7 @@ def plot_mesh(
             vertex_color,
             raw_vertex_shape=raw_vertex_shape,
             vertex_count=verts.shape[0],
-            cmap=None,
+            cmap="uniform",
         )
         filtered_base_colors = base_colors[base_valid_mask] if has_valid_vertices else np.zeros((0, 3), dtype=np.float32)
         filtered_base_raw_colors = base_raw_colors[base_valid_mask] if has_valid_vertices else np.zeros((0, 3), dtype=np.float32)
@@ -407,6 +425,8 @@ def plot_mesh(
                         visible=visible,
                         opacity=resolved_opacity,
                         show_edges=show_edges,
+                        show_vertices=show_vertices,
+                        active_cmap=_resolve_active_cmap(cmap, None),
                     ),
                 )
             )
@@ -433,10 +453,11 @@ def plot_mesh(
             "opacity": resolved_opacity,
             "edge_thickness": 1.0,
             "show_edges": bool(show_edges),
+            "show_vertices": bool(show_vertices),
             "texture": texture_payload,
             "active_cmap": _resolve_active_cmap(cmap, texture_payload),
         }
-        if cmap is None or cmap == "texture":
+        if _uses_raw_colors(cmap):
             combined_layer["colors"] = _encode_array_payload(_to_uint8_rgb(filtered_base_colors), dtype=np.uint8)
         fig.layers.append(combined_layer)
         if title is not None:
@@ -453,6 +474,7 @@ def plot_mesh(
         visible=visible,
         opacity=resolved_opacity,
         show_edges=show_edges,
+        show_vertices=show_vertices,
         texture=texture,
     )
 

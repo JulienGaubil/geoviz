@@ -339,6 +339,11 @@ function getLayerEdgeThickness(layer) {
   return Number.isFinite(value) ? Math.min(12.0, Math.max(1.0, value)) : 1.0;
 }
 
+function clampOpacity(value, fallback = 1.0) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? Math.min(1.0, Math.max(0.0, numeric)) : fallback;
+}
+
 function setLineMaterialResolution(material) {
   if (!material || !material.resolution) return;
   material.resolution.set(Math.max(1, window.innerWidth), Math.max(1, window.innerHeight));
@@ -389,12 +394,11 @@ function createMeshMaterial({
   masked = false,
 } = {}) {
   if (textureMode && textureMap) {
-    return new THREE.MeshBasicMaterial({
+    return new THREE.MeshLambertMaterial({
       vertexColors: false,
       map: textureMap,
       color: 0xffffff,
       side: THREE.FrontSide,
-      alphaTest: 0.5,
       transparent: masked || opacity < 0.999,
       opacity,
       depthWrite: masked ? false : opacity >= 0.999,
@@ -442,7 +446,7 @@ function buildMesh(layer) {
   setIndexAttribute(geometry, layer.faces);
   refreshMeshBounds(geometry);
 
-  const initialOpacity = Number(layer.opacity ?? payload.opacity) || 1.0;
+  const initialOpacity = clampOpacity(layer.opacity ?? payload.opacity);
   const material = createMeshMaterial({
     textureMap,
     textureMode: textureModeActive,
@@ -500,13 +504,42 @@ function buildMesh(layer) {
   return { mesh, maskedMesh, edgeLines, textureMap };
 }
 
+function buildMeshVertexPoints(layer, initialPointSize) {
+  const pointSize = Math.min(12.0, Math.max(1.0, Number(initialPointSize ?? layer.point_size ?? payload.point_size) || 5.0));
+  const material = new THREE.ShaderMaterial({
+    uniforms: {
+      size: { value: pointSize },
+      opacity: { value: 1.0 },
+    },
+    vertexShader: pointVertexShader,
+    fragmentShader: pointFragmentShader,
+    transparent: true,
+    depthWrite: false,
+  });
+  const points = new THREE.Points(new THREE.BufferGeometry(), material);
+  points.frustumCulled = false;
+  points.visible = false;
+  scene.add(points);
+
+  const maskedMaterial = material.clone();
+  maskedMaterial.uniforms = {
+    size: { value: pointSize },
+    opacity: { value: 0.0 },
+  };
+  const maskedPoints = new THREE.Points(new THREE.BufferGeometry(), maskedMaterial);
+  maskedPoints.frustumCulled = false;
+  maskedPoints.visible = false;
+  scene.add(maskedPoints);
+  return { points, maskedPoints };
+}
+
 function buildPoints(layer) {
   const geometry = new THREE.BufferGeometry();
   setPositionAttribute(geometry, layer.points);
   geometry.setAttribute('color', createStoredColorAttribute(layer.colors));
 
   const pointSize = Math.min(12.0, Math.max(1.0, Number(layer.point_size ?? payload.point_size) || 5.0));
-  const initialOpacity = Number(layer.opacity ?? payload.opacity) || 1.0;
+  const initialOpacity = clampOpacity(layer.opacity ?? payload.opacity);
   const material = new THREE.ShaderMaterial({
     uniforms: {
       size: { value: pointSize },
@@ -577,10 +610,11 @@ function updateMaskedObjectVisibility(entry) {
   const maskedVisible = entry.visible && hasMaskedData && filterState.maskedOpacity > 0.0;
   if (entry.maskedMesh) entry.maskedMesh.visible = maskedVisible;
   if (entry.maskedPoints) entry.maskedPoints.visible = maskedVisible;
+  if (entry.maskedVertexPoints) entry.maskedVertexPoints.visible = maskedVisible && entry.showVertices;
 }
 
 function updateEntryOpacity(entry, opacity) {
-  const nextOpacity = Math.min(1.0, Math.max(0.05, Number(opacity) || 1.0));
+  const nextOpacity = clampOpacity(opacity, entry.opacity ?? 1.0);
   entry.opacity = nextOpacity;
   if (entry.mesh) {
     entry.mesh.material.opacity = nextOpacity;
@@ -598,6 +632,12 @@ function updateEntryOpacity(entry, opacity) {
   }
   if (entry.maskedPoints) {
     entry.maskedPoints.material.uniforms.opacity.value = nextOpacity * filterState.maskedOpacity;
+  }
+  if (entry.vertexPoints) {
+    entry.vertexPoints.material.uniforms.opacity.value = 1.0;
+  }
+  if (entry.maskedVertexPoints) {
+    entry.maskedVertexPoints.material.uniforms.opacity.value = filterState.maskedOpacity;
   }
   if (entry.pointLines) {
     entry.pointLines.material.opacity = (isDayMode ? 0.28 : 0.35) * nextOpacity;
@@ -628,6 +668,28 @@ function updateEntryEdgeOverlay(entry) {
     entry.pointLines.material.color.setHex(isDayMode ? 0x0f172a : 0xe4e4e7);
     entry.pointLines.material.opacity = (isDayMode ? 0.28 : 0.35) * entry.opacity;
   }
+  updateEntryVertexOverlay(entry);
+}
+
+function updateEntryVertexOverlay(entry) {
+  if (entry.vertexPoints) {
+    entry.vertexPoints.visible = entry.visible && entry.showVertices && (entry.unmaskedPointCount || 0) > 0;
+  }
+  if (entry.maskedVertexPoints) {
+    entry.maskedVertexPoints.visible = entry.visible
+      && entry.showVertices
+      && (entry.maskedPointCount || 0) > 0
+      && filterState.maskedOpacity > 0.0;
+  }
+}
+
+function updateEntryPointSize(entry, pointSize) {
+  const value = Math.min(12.0, Math.max(1.0, Number(pointSize) || entry.pointSize || 5.0));
+  entry.pointSize = value;
+  const pointObjects = [entry.points, entry.maskedPoints, entry.vertexPoints, entry.maskedVertexPoints];
+  for (const obj of pointObjects) {
+    if (obj) obj.material.uniforms.size.value = value;
+  }
 }
 
 function refreshEdgeOverlay() {
@@ -636,15 +698,15 @@ function refreshEdgeOverlay() {
   }
 }
 
-const NO_CMAP = 'none';
+const UNIFORM_CMAP = 'uniform';
 const TEXTURE_CMAP = 'texture';
 
 function getFallbackCmap() {
   return availableCmaps[0] || 'viridis';
 }
 
-function isNoCmap(cmapName) {
-  return !cmapName || cmapName === NO_CMAP;
+function isUniformCmap(cmapName) {
+  return !cmapName || cmapName === UNIFORM_CMAP;
 }
 
 function isTextureCmap(cmapName) {
@@ -652,7 +714,7 @@ function isTextureCmap(cmapName) {
 }
 
 function usesScalarCmap(cmapName) {
-  return !isNoCmap(cmapName) && !isTextureCmap(cmapName);
+  return !isUniformCmap(cmapName) && !isTextureCmap(cmapName);
 }
 
 function getColormapPreset(cmapName) {
@@ -724,7 +786,7 @@ function getEntryRawColors(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
 }
 
 function getEntryColorModeOptions(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
-  const options = [NO_CMAP];
+  const options = [UNIFORM_CMAP];
   if (entry.layer?.texture) {
     options.push(TEXTURE_CMAP);
   }
@@ -877,7 +939,7 @@ function createCmapSwatch(entry, fieldIdx, cmapName) {
     swatch.style.background = 'linear-gradient(135deg, #f8fafc 0%, #f8fafc 34%, #0f172a 35%, #0f172a 43%, #dc2626 44%, #dc2626 56%, #2563eb 57%, #2563eb 66%, #f8fafc 67%, #f8fafc 100%)';
     return swatch;
   }
-  const gradient = isNoCmap(cmapName)
+  const gradient = isUniformCmap(cmapName)
     ? getEntryRawGradient(entry, fieldIdx)
     : (getColormapPreset(cmapName)?.gradient || null);
   swatch.style.background = gradientCss(gradient);
@@ -891,7 +953,7 @@ function setCmapButtonContent(button, cmapName) {
   prefix.textContent = 'Colormap:';
   const value = document.createElement('span');
   value.className = 'layer-id';
-  value.textContent = isNoCmap(cmapName) ? NO_CMAP : cmapName;
+  value.textContent = cmapName || UNIFORM_CMAP;
   button.appendChild(prefix);
   button.appendChild(value);
 }
@@ -1154,7 +1216,7 @@ function toggleDropdownMenu(button, menu) {
 }
 
 function getEntryCmap(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
-  return entry.activeCmap || NO_CMAP;
+  return entry.activeCmap || UNIFORM_CMAP;
 }
 
 function getEntryScaleRange(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
@@ -1350,6 +1412,7 @@ function setLayerCmap(entry, cmapName) {
   const fieldIdx = entry.activeFieldIdx ?? 0;
   entry.activeCmap = cmapName;
   renderEntryColors(entry, fieldIdx);
+  updateEntryOpacity(entry, entry.opacity);
   updateColorbars();
 }
 
@@ -1580,7 +1643,7 @@ function collectMaskIndices(mask, keepPassed) {
 }
 
 function buildPointSubsetData(entry, sourceIndices) {
-  const basePositions = entry.layer.points;
+  const basePositions = getEntryPositions(entry);
   const baseColors = entry.currentColors || decodeArraySpec(entry.layer.colors, Uint8Array) || new Uint8Array(0);
   const positions = new Float32Array(sourceIndices.length * 3);
   const colors = new Uint8Array(sourceIndices.length * 3);
@@ -1599,6 +1662,7 @@ function buildPointSubsetData(entry, sourceIndices) {
 }
 
 function setPointObjectSubset(entry, object3d, sourceIndices, kind = 'unmasked') {
+  if (!object3d) return;
   const geometry = object3d.geometry;
   const subset = buildPointSubsetData(entry, sourceIndices);
   setPositionAttribute(geometry, subset.positions);
@@ -1607,6 +1671,37 @@ function setPointObjectSubset(entry, object3d, sourceIndices, kind = 'unmasked')
   geometry.computeBoundingSphere();
   object3d.userData.sourceIndices = sourceIndices;
   object3d.userData.maskKind = kind;
+}
+
+function ensureMeshVertexPoints(entry) {
+  if (entry.layerKind !== 'mesh') return;
+  if (!entry.vertexPoints || !entry.maskedVertexPoints) {
+    const built = buildMeshVertexPoints(entry.layer, entry.pointSize);
+    entry.vertexPoints = built.points;
+    entry.maskedVertexPoints = built.maskedPoints;
+  }
+  if (entry.passMask) {
+    updateMeshVertexPointSubsets(entry, entry.passMask);
+  } else {
+    const allIndices = Array.from({ length: getEntryElementCount(entry) }, (_, idx) => idx);
+    setPointObjectSubset(entry, entry.vertexPoints, allIndices, 'unmasked');
+    setPointObjectSubset(entry, entry.maskedVertexPoints, [], 'masked');
+    entry.unmaskedPointCount = allIndices.length;
+    entry.maskedPointCount = 0;
+  }
+  updateEntryPointSize(entry, entry.pointSize);
+  updateEntryOpacity(entry, entry.opacity);
+  updateEntryVertexOverlay(entry);
+}
+
+function updateMeshVertexPointSubsets(entry, passMask) {
+  if (!entry.vertexPoints || !entry.maskedVertexPoints) return;
+  const unmaskedIndices = collectMaskIndices(passMask, true);
+  const maskedIndices = collectMaskIndices(passMask, false);
+  setPointObjectSubset(entry, entry.vertexPoints, unmaskedIndices, 'unmasked');
+  setPointObjectSubset(entry, entry.maskedVertexPoints, maskedIndices, 'masked');
+  entry.unmaskedPointCount = unmaskedIndices.length;
+  entry.maskedPointCount = maskedIndices.length;
 }
 
 function splitMeshFacesByMask(faces, passMask) {
@@ -1747,6 +1842,7 @@ function applyFiltersToEntry(entry) {
     refreshMeshBounds(entry.maskedMesh.geometry);
     entry.unmaskedFaceCount = Math.floor(splitFaces.unmaskedFaces.length / 3);
     entry.maskedFaceCount = Math.floor(splitFaces.maskedFaces.length / 3);
+    updateMeshVertexPointSubsets(entry, passMask);
     updateMeshEdgeLinesFromGeometry(entry);
   }
 
@@ -2123,7 +2219,7 @@ function createCmapDropdown(entry, fieldIdx, controlsEnabled) {
   button.className = 'layer-select-button cmap-dropdown-button';
   button.disabled = !controlsEnabled;
   const options = getEntryColorModeOptions(entry, fieldIdx);
-  const currentCmap = options.includes(getEntryCmap(entry, fieldIdx)) ? getEntryCmap(entry, fieldIdx) : NO_CMAP;
+  const currentCmap = options.includes(getEntryCmap(entry, fieldIdx)) ? getEntryCmap(entry, fieldIdx) : UNIFORM_CMAP;
   setCmapButtonContent(button, currentCmap);
   const menu = document.createElement('div');
   menu.className = 'custom-dropdown-menu';
@@ -2147,7 +2243,7 @@ function createCmapDropdown(entry, fieldIdx, controlsEnabled) {
 
   const selectCmap = (cmapName) => {
     if (!controlsEnabled) return;
-    const nextCmap = options.includes(cmapName) ? cmapName : NO_CMAP;
+    const nextCmap = options.includes(cmapName) ? cmapName : UNIFORM_CMAP;
     setLayerCmap(entry, nextCmap);
     updateCmapControls(nextCmap);
   };
@@ -2172,7 +2268,7 @@ function createCmapDropdown(entry, fieldIdx, controlsEnabled) {
     item.appendChild(prefix);
     const value = document.createElement('span');
     value.className = 'layer-id';
-    value.textContent = isNoCmap(cmapName) ? NO_CMAP : cmapName;
+    value.textContent = cmapName || UNIFORM_CMAP;
     item.appendChild(value);
     item.addEventListener('click', () => {
       if (!controlsEnabled) return;
@@ -2561,7 +2657,7 @@ function updateHoverFromPointer() {
   let best = null;
   for (const entry of layers) {
     if (!entry.visible) continue;
-    const pointObjects = [entry.points, entry.maskedPoints].filter((obj) => obj && obj.visible);
+    const pointObjects = [entry.points, entry.maskedPoints, entry.vertexPoints, entry.maskedVertexPoints].filter((obj) => obj && obj.visible);
     for (const obj of pointObjects) {
       raycaster.params.Points.threshold = computePointHoverThreshold(rect.height, entry);
       const hits = raycaster.intersectObject(obj, false);
@@ -2588,7 +2684,7 @@ function updateHoverFromPointer() {
   }
 
   let idx = -1;
-  if (best.entry.layerKind === 'pointcloud') {
+  if (best.hit.object?.isPoints) {
     idx = getPointSourceIndexFromHit(best.hit);
   } else {
     const posAttr = best.hit.object?.geometry?.getAttribute('position') || null;
@@ -2665,21 +2761,14 @@ function appendPointLayerOptions(entry, optionGrid) {
     value: entry.pointSize,
     disabled: !entry.visible,
     onInput: (nextValue) => {
-      const value = Math.min(12.0, Math.max(1.0, Number(nextValue) || entry.pointSize));
-      entry.pointSize = value;
-      if (entry.points) {
-        entry.points.material.uniforms.size.value = value;
-      }
-      if (entry.maskedPoints) {
-        entry.maskedPoints.material.uniforms.size.value = value;
-      }
+      updateEntryPointSize(entry, nextValue);
       requestRenderAndHover();
     },
   }));
 
   optionGrid.appendChild(createRangeOptionControl({
     labelText: 'Point opacity',
-    min: 0.05,
+    min: 0,
     max: 1,
     step: 0.05,
     value: entry.opacity,
@@ -2709,7 +2798,7 @@ function appendPointLayerOptions(entry, optionGrid) {
 function appendMeshLayerOptions(entry, optionGrid) {
   optionGrid.appendChild(createRangeOptionControl({
     labelText: 'Mesh opacity',
-    min: 0.05,
+    min: 0,
     max: 1,
     step: 0.05,
     value: entry.opacity,
@@ -2719,6 +2808,9 @@ function appendMeshLayerOptions(entry, optionGrid) {
       requestRenderAndHover();
     },
   }));
+
+  const toggleRow = document.createElement('div');
+  toggleRow.className = 'layer-option-toggle-row';
 
   const edgeToggleLabel = document.createElement('label');
   edgeToggleLabel.className = 'layer-option-toggle';
@@ -2732,8 +2824,28 @@ function appendMeshLayerOptions(entry, optionGrid) {
     rebuildLayerList();
   });
   edgeToggleLabel.appendChild(edgeToggleInput);
-  edgeToggleLabel.appendChild(document.createTextNode('Show mesh edges'));
-  optionGrid.appendChild(edgeToggleLabel);
+  edgeToggleLabel.appendChild(document.createTextNode('Show edges'));
+  toggleRow.appendChild(edgeToggleLabel);
+
+  const vertexToggleLabel = document.createElement('label');
+  vertexToggleLabel.className = 'layer-option-toggle';
+  const vertexToggleInput = document.createElement('input');
+  vertexToggleInput.type = 'checkbox';
+  vertexToggleInput.checked = Boolean(entry.showVertices);
+  vertexToggleInput.disabled = !entry.visible;
+  vertexToggleInput.addEventListener('change', () => {
+    entry.showVertices = vertexToggleInput.checked;
+    if (entry.showVertices) {
+      ensureMeshVertexPoints(entry);
+    }
+    updateEntryVertexOverlay(entry);
+    rebuildLayerList();
+    requestRenderAndHover();
+  });
+  vertexToggleLabel.appendChild(vertexToggleInput);
+  vertexToggleLabel.appendChild(document.createTextNode('Show vertices'));
+  toggleRow.appendChild(vertexToggleLabel);
+  optionGrid.appendChild(toggleRow);
 
   if (entry.edgeLines && entry.showEdges && entry.visible) {
     optionGrid.appendChild(createRangeOptionControl({
@@ -2745,6 +2857,22 @@ function appendMeshLayerOptions(entry, optionGrid) {
       disabled: !entry.visible,
       onInput: (nextValue) => {
         updateEntryEdgeThickness(entry, nextValue);
+        requestRenderAndHover();
+      },
+    }));
+  }
+
+  if (entry.showVertices && entry.visible) {
+    optionGrid.appendChild(createRangeOptionControl({
+      labelText: 'Point size',
+      min: 1,
+      max: 12,
+      step: 0.5,
+      value: entry.pointSize,
+      disabled: !entry.visible,
+      onInput: (nextValue) => {
+        ensureMeshVertexPoints(entry);
+        updateEntryPointSize(entry, nextValue);
         requestRenderAndHover();
       },
     }));
@@ -3044,6 +3172,8 @@ payload.layers.forEach((rawLayer, layerIdx) => {
     mesh: layerKind === 'mesh' ? built.mesh : null,
     maskedMesh: layerKind === 'mesh' ? built.maskedMesh : null,
     edgeLines: layerKind === 'mesh' ? built.edgeLines : null,
+    vertexPoints: null,
+    maskedVertexPoints: null,
     textureMap: layerKind === 'mesh' ? built.textureMap : null,
     points: layerKind === 'pointcloud' ? built.points : null,
     maskedPoints: layerKind === 'pointcloud' ? built.maskedPoints : null,
@@ -3051,7 +3181,7 @@ payload.layers.forEach((rawLayer, layerIdx) => {
     visible: layer.visible !== false,
     activeFieldIdx: Number.isInteger(layer.active_field_idx) ? layer.active_field_idx : 0,
     activeValues: layer.values || null,
-    activeCmap: layer.active_cmap || (layer.scalar_meta && layer.scalar_meta.cmap) || NO_CMAP,
+    activeCmap: layer.active_cmap || (layer.scalar_meta && layer.scalar_meta.cmap) || UNIFORM_CMAP,
     currentColors: decodeArraySpec(layer.colors, Uint8Array) || new Uint8Array(0),
     unmaskedPointCount: layerKind === 'pointcloud' ? Math.floor(layer.points.length / 3) : 0,
     maskedPointCount: 0,
@@ -3060,8 +3190,9 @@ payload.layers.forEach((rawLayer, layerIdx) => {
     fieldClipStates: Array.from({ length: Math.max(fieldCount, 1) }, () => createClipState()),
     sharedFieldClip: createClipState(),
     shareFieldScale: Boolean(layer.share_field_scale ?? payload.initial_share_field_scale),
-    opacity: Math.min(1.0, Math.max(0.05, Number(layer.opacity ?? payload.opacity) || 1.0)),
+    opacity: clampOpacity(layer.opacity ?? payload.opacity),
     showEdges: layerKind === 'mesh' && layer.show_edges === true,
+    showVertices: layerKind === 'mesh' && layer.show_vertices === true,
     edgeThickness: getLayerEdgeThickness(layer),
     pointSize: Math.min(12.0, Math.max(1.0, Number(layer.point_size ?? payload.point_size) || 5.0)),
     optionsExpanded: layer.visible !== false,
@@ -3086,6 +3217,9 @@ payload.layers.forEach((rawLayer, layerIdx) => {
   }
   if (entry.maskedPoints) {
     entry.maskedPoints.material.uniforms.size.value = entry.pointSize;
+  }
+  if (entry.showVertices) {
+    ensureMeshVertexPoints(entry);
   }
   updateEntryEdgeOverlay(entry);
   layers.push(entry);

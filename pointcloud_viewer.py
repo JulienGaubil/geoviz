@@ -31,7 +31,7 @@ def _prepare_layer(
     edges: np.ndarray | torch.Tensor | None,
     point_color: np.ndarray | torch.Tensor | str,
     downsampling_factor: int,
-    cmap: str | None,
+    cmap: str,
     label: str,
     opacity: float,
 ) -> dict[str, Any]:
@@ -97,7 +97,7 @@ def _prepare_layer(
         "scalar_meta": scalar_meta,
         "values": None if scalar_values is None else np.ascontiguousarray(scalar_values, dtype=np.float32).tolist(),
         "visible": True,
-        "opacity": float(np.clip(opacity, 0.05, 1.0)),
+        "opacity": float(np.clip(opacity, 0.0, 1.0)),
     }
     return layer
 
@@ -112,7 +112,7 @@ class PointCloudViewerFigure(ViewerFigureBase):
         edges: np.ndarray | torch.Tensor | None = None,
         point_color: np.ndarray | torch.Tensor | str = "blue",
         downsampling_factor: int = 1,
-        cmap: str | None = None,
+        cmap: str = "uniform",
         title: str | None = None,
         label: str = "Points",
         opacity: float | None = None,
@@ -124,7 +124,7 @@ class PointCloudViewerFigure(ViewerFigureBase):
             downsampling_factor=downsampling_factor,
             cmap=cmap,
             label=label,
-            opacity=float(np.clip(self.opacity if opacity is None else opacity, 0.05, 1.0)),
+            opacity=float(np.clip(self.opacity if opacity is None else opacity, 0.0, 1.0)),
         )
         layer["layer_kind"] = "pointcloud"
         layer["point_size"] = float(np.clip(self.point_size, 1.0, 12.0))
@@ -144,7 +144,7 @@ def plot_pointcloud(
     point_size: float | None = None,
     opacity: float | None = None,
     share_colormap_scale: bool | None = None,
-    cmap: str | None = None,
+    cmap: str = "uniform",
     title: str | None = None,
     label: str = "Points",
 ) -> ViewerFigureBase:
@@ -155,7 +155,7 @@ def plot_pointcloud(
         fig.point_size = float(point_size)
     if share_colormap_scale is not None:
         fig.share_colormap_scale = bool(share_colormap_scale)
-    resolved_opacity = float(np.clip(fig.opacity if opacity is None else opacity, 0.05, 1.0))
+    resolved_opacity = float(np.clip(fig.opacity if opacity is None else opacity, 0.0, 1.0))
     if scalar_fields is not None:
         if len(scalar_fields) == 0:
             raise ValueError("scalar_fields cannot be empty")

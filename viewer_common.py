@@ -96,12 +96,17 @@ def _prepare_color_data(
     *,
     raw_geometry_shape: tuple[int, ...],
     item_count: int,
-    cmap: str | None,
+    cmap: str,
     color_label: str,
     downsampling_factor: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, dict[str, Any] | None]:
     scalar_meta = None
     scalar_values: np.ndarray | None = None
+    if not isinstance(cmap, str):
+        raise ValueError("cmap must be a string")
+    render_cmap = None if cmap in {"texture", "uniform"} else cmap
+    if render_cmap is not None:
+        plt.get_cmap(render_cmap)
 
     if isinstance(color_value, str):
         rgb = np.asarray(mcolors.to_rgb(color_value), dtype=np.float32)
@@ -147,13 +152,13 @@ def _prepare_color_data(
         "min": min_val,
         "max": max_val,
         "cmap": cmap,
-        "gradient": _sample_cmap(cmap) if cmap is not None else _raw_scalar_gradient(min_val, max_val),
+        "gradient": _sample_cmap(render_cmap) if render_cmap is not None else _raw_scalar_gradient(min_val, max_val),
     }
 
-    if cmap is not None:
+    if render_cmap is not None:
         norm = (scalar_vals - min_val) / max(max_val - min_val, 1e-8)
         norm = np.nan_to_num(norm, nan=0.0, posinf=1.0, neginf=0.0)
-        colors = plt.get_cmap(cmap)(norm)[:, :3].astype(np.float32)
+        colors = plt.get_cmap(render_cmap)(norm)[:, :3].astype(np.float32)
     else:
         colors = color_arr
 
@@ -284,7 +289,7 @@ class ViewerFigureBase:
         return {
             "title": self.title or self.default_title,
             "point_size": float(np.clip(self.point_size, 1.0, 12.0)),
-            "opacity": float(np.clip(self.opacity, 0.05, 1.0)),
+            "opacity": float(np.clip(self.opacity, 0.0, 1.0)),
             "initial_share_field_scale": self.share_colormap_scale,
             "layers": self.layers,
             "available_cmaps": cmap_names,
