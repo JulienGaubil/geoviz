@@ -483,6 +483,27 @@ def plot_trimesh(
     trimesh,
     **kwargs,
 ) -> MeshViewerFigure:
+    if isinstance(trimesh, (list, tuple)):
+        if len(trimesh) == 0:
+            raise ValueError("trimesh list cannot be empty")
+
+        init_fig = kwargs.pop("init_fig", None)
+        label = kwargs.pop("label", None)
+        fig = init_fig
+
+        for idx, mesh in enumerate(trimesh):
+            mesh_kwargs = dict(kwargs)
+            mesh_kwargs["init_fig"] = fig
+            if isinstance(label, (list, tuple)):
+                mesh_kwargs["label"] = label[idx]
+            elif label is not None:
+                mesh_kwargs["label"] = label
+            else:
+                mesh_kwargs["label"] = f"Mesh {idx + 1}"
+            fig = plot_trimesh(mesh, **mesh_kwargs)
+
+        return fig
+
     if "texture" not in kwargs:
         texture = _extract_trimesh_texture(trimesh)
         if texture is not None:

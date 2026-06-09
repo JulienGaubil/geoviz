@@ -700,6 +700,7 @@ function refreshEdgeOverlay() {
 
 const UNIFORM_CMAP = 'uniform';
 const TEXTURE_CMAP = 'texture';
+const POINT_CLOUD_DEFAULT_COLOR = [0, 0, 255];
 
 function getFallbackCmap() {
   return availableCmaps[0] || 'viridis';
@@ -1642,7 +1643,7 @@ function collectMaskIndices(mask, keepPassed) {
   return list;
 }
 
-function buildPointSubsetData(entry, sourceIndices) {
+function buildPointSubsetData(entry, sourceIndices, useDefaultColor = false) {
   const basePositions = getEntryPositions(entry);
   const baseColors = entry.currentColors || decodeArraySpec(entry.layer.colors, Uint8Array) || new Uint8Array(0);
   const positions = new Float32Array(sourceIndices.length * 3);
@@ -1654,17 +1655,23 @@ function buildPointSubsetData(entry, sourceIndices) {
     positions[dstBase] = basePositions[srcBase];
     positions[dstBase + 1] = basePositions[srcBase + 1];
     positions[dstBase + 2] = basePositions[srcBase + 2];
-    colors[dstBase] = baseColors[srcBase];
-    colors[dstBase + 1] = baseColors[srcBase + 1];
-    colors[dstBase + 2] = baseColors[srcBase + 2];
+    if (useDefaultColor) {
+      colors[dstBase] = POINT_CLOUD_DEFAULT_COLOR[0];
+      colors[dstBase + 1] = POINT_CLOUD_DEFAULT_COLOR[1];
+      colors[dstBase + 2] = POINT_CLOUD_DEFAULT_COLOR[2];
+    } else {
+      colors[dstBase] = baseColors[srcBase];
+      colors[dstBase + 1] = baseColors[srcBase + 1];
+      colors[dstBase + 2] = baseColors[srcBase + 2];
+    }
   }
   return { positions, colors };
 }
 
-function setPointObjectSubset(entry, object3d, sourceIndices, kind = 'unmasked') {
+function setPointObjectSubset(entry, object3d, sourceIndices, kind = 'unmasked', useDefaultColor = false) {
   if (!object3d) return;
   const geometry = object3d.geometry;
-  const subset = buildPointSubsetData(entry, sourceIndices);
+  const subset = buildPointSubsetData(entry, sourceIndices, useDefaultColor);
   setPositionAttribute(geometry, subset.positions);
   setStoredColorAttribute(geometry, subset.colors);
   geometry.computeBoundingBox();
@@ -1684,8 +1691,8 @@ function ensureMeshVertexPoints(entry) {
     updateMeshVertexPointSubsets(entry, entry.passMask);
   } else {
     const allIndices = Array.from({ length: getEntryElementCount(entry) }, (_, idx) => idx);
-    setPointObjectSubset(entry, entry.vertexPoints, allIndices, 'unmasked');
-    setPointObjectSubset(entry, entry.maskedVertexPoints, [], 'masked');
+    setPointObjectSubset(entry, entry.vertexPoints, allIndices, 'unmasked', true);
+    setPointObjectSubset(entry, entry.maskedVertexPoints, [], 'masked', true);
     entry.unmaskedPointCount = allIndices.length;
     entry.maskedPointCount = 0;
   }
@@ -1698,8 +1705,8 @@ function updateMeshVertexPointSubsets(entry, passMask) {
   if (!entry.vertexPoints || !entry.maskedVertexPoints) return;
   const unmaskedIndices = collectMaskIndices(passMask, true);
   const maskedIndices = collectMaskIndices(passMask, false);
-  setPointObjectSubset(entry, entry.vertexPoints, unmaskedIndices, 'unmasked');
-  setPointObjectSubset(entry, entry.maskedVertexPoints, maskedIndices, 'masked');
+  setPointObjectSubset(entry, entry.vertexPoints, unmaskedIndices, 'unmasked', true);
+  setPointObjectSubset(entry, entry.maskedVertexPoints, maskedIndices, 'masked', true);
   entry.unmaskedPointCount = unmaskedIndices.length;
   entry.maskedPointCount = maskedIndices.length;
 }
