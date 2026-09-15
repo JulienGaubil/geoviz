@@ -10,6 +10,14 @@ import {
 } from 'three-mesh-bvh';
 
 const payload = JSON.parse(document.getElementById('viewer-payload').textContent);
+const loadingOverlay = document.getElementById('viewer-loading');
+function setLoadingStatus(message, { hidden = false, error = false } = {}) {
+  if (!loadingOverlay) return;
+  loadingOverlay.textContent = message;
+  loadingOverlay.classList.toggle('hidden', hidden);
+  loadingOverlay.classList.toggle('error', error);
+}
+setLoadingStatus('Loading visible geometry…');
 const colormapPresets = payload.colormap_presets || {};
 const availableCmaps = payload.available_cmaps || Object.keys(colormapPresets);
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
@@ -25,15 +33,6 @@ const arrayCtors = {
 function decodeArraySpec(spec, fallbackCtor = Float32Array) {
   if (spec === null || spec === undefined) return null;
   if (ArrayBuffer.isView(spec)) return spec;
-  if (spec && spec.encoding === 'base64' && typeof spec.data === 'string') {
-    const ctor = arrayCtors[spec.dtype] || fallbackCtor;
-    const binary = atob(spec.data);
-    const bytes = new Uint8Array(binary.length);
-    for (let idx = 0; idx < binary.length; idx += 1) {
-      bytes[idx] = binary.charCodeAt(idx);
-    }
-    return new ctor(bytes.buffer);
-  }
   if (!Array.isArray(spec)) {
     return null;
   }
@@ -43,14 +42,89 @@ function decodeArraySpec(spec, fallbackCtor = Float32Array) {
   return new fallbackCtor(Array.isArray(spec[0]) ? spec.flat() : spec);
 }
 
+async function hydrateArraySpec(spec) {
+  if (spec && spec.encoding === 'raw-url' && typeof spec.url === 'string') {
+    const response = await fetch(spec.url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch geometry buffer ${spec.url}: HTTP ${response.status}`);
+    }
+    const buffer = await response.arrayBuffer();
+    const expectedBytes = Number(spec.nbytes) || 0;
+    if (buffer.byteLength !== expectedBytes) {
+      throw new Error(
+        `Geometry buffer ${spec.url} has ${buffer.byteLength}/${expectedBytes} bytes`,
+      );
+    }
+    const ctor = arrayCtors[spec.dtype] || Float32Array;
+    return new ctor(buffer);
+  }
+  if (!spec || spec.encoding !== 'gzip-base64-chunks' || !Array.isArray(spec.chunks)) return spec;
+  const byteLength = Number(spec.nbytes) || 0;
+  const bytes = new Uint8Array(byteLength);
+  let offset = 0;
+  for (let chunkIdx = 0; chunkIdx < spec.chunks.length; chunkIdx += 1) {
+    try {
+      const encoded = spec.chunks[chunkIdx];
+      const binary = atob(encoded);
+      const compressed = new Uint8Array(binary.length);
+      for (let idx = 0; idx < binary.length; idx += 1) {
+        compressed[idx] = binary.charCodeAt(idx);
+      }
+      const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream('gzip'));
+      const chunk = new Uint8Array(await new Response(stream).arrayBuffer());
+      if (offset + chunk.length > bytes.length) {
+        throw new Error('decoded data exceeded its declared size');
+      }
+      bytes.set(chunk, offset);
+      offset += chunk.length;
+    } catch (error) {
+      throw new Error(
+        `Failed to decode geometry chunk ${chunkIdx + 1}/${spec.chunks.length}: ${error}`,
+      );
+    }
+  }
+  if (offset !== bytes.length) {
+    throw new Error(`Geometry buffer was truncated: received ${offset}/${bytes.length} bytes`);
+  }
+  const ctor = arrayCtors[spec.dtype] || Float32Array;
+  return new ctor(bytes.buffer);
+}
+
+async function hydrateLayerArrays(layer) {
+  const directKeys = [
+    'vertices', 'faces', 'face_edges', 'points', 'edges',
+    'colors', 'default_colors', 'raw_colors', 'values',
+  ];
+  await Promise.all(directKeys.map(async (key) => {
+    layer[key] = await hydrateArraySpec(layer[key]);
+  }));
+  for (const key of [
+    'field_colors', 'field_values',
+    'edge_field_colors', 'edge_field_values',
+    'face_field_colors', 'face_field_values',
+  ]) {
+    if (Array.isArray(layer[key])) {
+      layer[key] = await Promise.all(layer[key].map(hydrateArraySpec));
+    }
+  }
+  if (layer.texture && typeof layer.texture === 'object') {
+    layer.texture.uv = await hydrateArraySpec(layer.texture.uv);
+  }
+}
+
 function normalizeLayerData(layer) {
   const kind = String(layer.layer_kind || (layer.points ? 'pointcloud' : 'mesh')).toLowerCase();
   layer.layer_kind = (kind === 'pointcloud') ? 'pointcloud' : 'mesh';
   layer.vertices = decodeArraySpec(layer.vertices, Float32Array) || new Float32Array(0);
   layer.faces = decodeArraySpec(layer.faces, Uint32Array) || new Uint32Array(0);
+  layer.face_size = Number.isFinite(Number(layer.face_size))
+    ? Math.max(3, Math.min(4, Math.floor(Number(layer.face_size))))
+    : 3;
   layer.points = decodeArraySpec(layer.points, Float32Array) || new Float32Array(0);
   layer.edges = decodeArraySpec(layer.edges, Uint32Array);
+  layer.face_edges = decodeArraySpec(layer.face_edges, Uint32Array);
   layer.colors = decodeArraySpec(layer.colors, Uint8Array) || new Uint8Array(0);
+  layer.default_colors = decodeArraySpec(layer.default_colors, Uint8Array);
   layer.raw_colors = decodeArraySpec(layer.raw_colors, Uint8Array) || layer.colors;
   layer.values = decodeArraySpec(layer.values, Float32Array);
   layer.field_colors = Array.isArray(layer.field_colors)
@@ -58,6 +132,18 @@ function normalizeLayerData(layer) {
     : null;
   layer.field_values = Array.isArray(layer.field_values)
     ? layer.field_values.map((values) => decodeArraySpec(values, Float32Array))
+    : null;
+  layer.edge_field_colors = Array.isArray(layer.edge_field_colors)
+    ? layer.edge_field_colors.map((colors) => decodeArraySpec(colors, Uint8Array) || new Uint8Array(0))
+    : null;
+  layer.edge_field_values = Array.isArray(layer.edge_field_values)
+    ? layer.edge_field_values.map((values) => decodeArraySpec(values, Float32Array))
+    : null;
+  layer.face_field_colors = Array.isArray(layer.face_field_colors)
+    ? layer.face_field_colors.map((colors) => decodeArraySpec(colors, Uint8Array) || new Uint8Array(0))
+    : null;
+  layer.face_field_values = Array.isArray(layer.face_field_values)
+    ? layer.face_field_values.map((values) => decodeArraySpec(values, Float32Array))
     : null;
   if (layer.texture && typeof layer.texture === 'object') {
     layer.texture.uv = decodeArraySpec(layer.texture.uv, Float32Array) || new Float32Array(0);
@@ -72,7 +158,7 @@ function normalizeLayerData(layer) {
     : fallbackVertexCount;
   layer.face_count = Number.isFinite(layer.face_count)
     ? Number(layer.face_count)
-    : Math.floor(layer.faces.length / 3);
+    : Math.floor(layer.faces.length / layer.face_size);
   layer.point_size = Number.isFinite(Number(layer.point_size))
     ? Number(layer.point_size)
     : Number(payload.point_size);
@@ -106,23 +192,73 @@ function setStoredColorAttribute(geometry, colors) {
   return attr;
 }
 
+const canvasContainer = document.getElementById('canvas-container');
+
+function getViewerViewportSize() {
+  const rect = canvasContainer.getBoundingClientRect();
+  return {
+    width: Math.max(1, Math.round(rect.width || canvasContainer.clientWidth || window.innerWidth)),
+    height: Math.max(1, Math.round(rect.height || canvasContainer.clientHeight || window.innerHeight)),
+  };
+}
+
+const initialViewport = getViewerViewportSize();
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.001, 1e7);
+const camera = new THREE.PerspectiveCamera(
+  60,
+  initialViewport.width / initialViewport.height,
+  0.001,
+  1e7,
+);
 camera.position.set(0, 0, 4);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
+renderer.setSize(initialViewport.width, initialViewport.height, false);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.setClearColor(0x111827, 1.0);
-document.getElementById('canvas-container').appendChild(renderer.domElement);
+canvasContainer.appendChild(renderer.domElement);
+
+// Layer hydration can select an initial scalar field and request a render.
+// Initialize this state before visible layers are loaded below.
+let renderQueued = false;
+let filterApplyQueued = false;
 
 const controls = new TrackballControls(camera, renderer.domElement);
 controls.rotateSpeed = 2.0;
 controls.zoomSpeed = 1.2;
 controls.panSpeed = 0.8;
 controls.dynamicDampingFactor = 0.15;
-controls.staticMoving = false;
+controls.staticMoving = true;
+
+let viewerWidth = initialViewport.width;
+let viewerHeight = initialViewport.height;
+function syncViewerSize({ closeMenus = false } = {}) {
+  const { width, height } = getViewerViewportSize();
+  if (closeMenus) closeAllDropdownMenus();
+  if (width === viewerWidth && height === viewerHeight) return false;
+  viewerWidth = width;
+  viewerHeight = height;
+  camera.aspect = width / height;
+  camera.updateProjectionMatrix();
+  renderer.setSize(width, height, false);
+  refreshLineMaterialResolutions();
+  controls.handleResize?.();
+  requestRenderAndHover();
+  return true;
+}
+
+// Register before geometry hydration. Large layers may take long enough for a
+// browser window or notebook iframe to finish laying out while arrays decode.
+window.addEventListener('resize', () => {
+  syncViewerSize({ closeMenus: true });
+});
+const viewerResizeObserver = typeof ResizeObserver === 'undefined'
+  ? null
+  : new ResizeObserver(() => {
+    syncViewerSize();
+  });
+viewerResizeObserver?.observe(canvasContainer);
 
 const layers = [];
 let isDayMode = false;
@@ -159,6 +295,13 @@ let filterRuleCounter = 0;
 const FILTER_SLIDER_MAX = 1000;
 const FILTER_POSITION = 'position';
 const FILTER_SCOPE_ALL_KEY = '__all__';
+// THREE.Points raycasting is linear in the number of points. Keep rendering
+// fully lossless at larger scales, but avoid an O(N) scan on every pointer
+// movement once the cloud is beyond an interactive picking size.
+const MAX_INTERACTIVE_POINT_PICK_COUNT = 1000000;
+const MAX_INTERACTIVE_MESH_PICK_FACE_COUNT = 1000000;
+const MAX_MESH_INTERACTION_PROXY_POINTS = 10000;
+const MESH_EDGE_CHUNK_FACE_COUNT = 500000;
 const filterState = {
   open: false,
   maskedOpacity: 0.0,
@@ -195,6 +338,7 @@ function scheduleHoverRefresh() {
 }
 
 function requestRenderAndHover() {
+  requestRender();
   scheduleHoverRefresh();
 }
 
@@ -213,36 +357,44 @@ function createClipState(minFrac = 0.0, maxFrac = 1.0) {
   };
 }
 
-function getEntryFieldCount(entry) {
+function getEntryFieldCount(entry, association = 'vertex') {
+  const data = getAssociationFieldData(entry, association);
   return Math.max(
-    Array.isArray(entry.layer.field_names) ? entry.layer.field_names.length : 0,
-    Array.isArray(entry.layer.field_values) ? entry.layer.field_values.length : 0,
-    Array.isArray(entry.layer.field_scalar_meta) ? entry.layer.field_scalar_meta.length : 0,
-    Array.isArray(entry.layer.field_colors) ? entry.layer.field_colors.length : 0,
-    1,
+    Array.isArray(data.names) ? data.names.length : 0,
+    Array.isArray(data.values) ? data.values.length : 0,
+    Array.isArray(data.metas) ? data.metas.length : 0,
+    Array.isArray(data.colors) ? data.colors.length : 0,
+    association === 'vertex' ? 1 : 0,
   );
 }
 
-function ensureFieldClipStates(entry) {
-  const fieldCount = getEntryFieldCount(entry);
-  if (!Array.isArray(entry.fieldClipStates)) {
-    entry.fieldClipStates = [];
-  }
-  while (entry.fieldClipStates.length < fieldCount) {
-    entry.fieldClipStates.push(createClipState());
-  }
-  return entry.fieldClipStates;
+function hasEntryFields(entry, association = 'vertex') {
+  const data = getAssociationFieldData(entry, association);
+  const hasArrayData = [data.names, data.values, data.metas, data.colors]
+    .some((items) => Array.isArray(items) && items.length > 0);
+  if (hasArrayData) return true;
+  return association === 'vertex' && Boolean(entry.layer.values || entry.layer.scalar_meta);
 }
 
-function getClipState(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
-  if (entry.shareFieldScale) {
-    if (!entry.sharedFieldClip) {
-      entry.sharedFieldClip = createClipState();
-    }
-    return entry.sharedFieldClip;
+function ensureFieldClipStates(entry, association = 'vertex') {
+  const fieldCount = getEntryFieldCount(entry, association);
+  const state = getAssociationState(entry, association);
+  if (!Array.isArray(state.clipStates)) state.clipStates = [];
+  while (state.clipStates.length < fieldCount) {
+    state.clipStates.push(createClipState());
   }
-  const states = ensureFieldClipStates(entry);
-  const clampedIdx = Math.max(0, Math.min(states.length - 1, fieldIdx));
+  return state.clipStates;
+}
+
+function getClipState(entry, fieldIdx = null, association = 'vertex') {
+  const associationState = getAssociationState(entry, association);
+  const resolvedIdx = fieldIdx ?? associationState.activeFieldIdx ?? 0;
+  if (entry.shareFieldScale) {
+    if (!associationState.sharedClip) associationState.sharedClip = createClipState();
+    return associationState.sharedClip;
+  }
+  const states = ensureFieldClipStates(entry, association);
+  const clampedIdx = Math.max(0, Math.min(states.length - 1, resolvedIdx));
   if (!states[clampedIdx]) {
     states[clampedIdx] = createClipState();
   }
@@ -344,15 +496,20 @@ function clampOpacity(value, fallback = 1.0) {
   return Number.isFinite(numeric) ? Math.min(1.0, Math.max(0.0, numeric)) : fallback;
 }
 
-function setLineMaterialResolution(material) {
+function setLineMaterialResolution(material, width = null, height = null) {
   if (!material || !material.resolution) return;
-  material.resolution.set(Math.max(1, window.innerWidth), Math.max(1, window.innerHeight));
+  const viewport = getViewerViewportSize();
+  material.resolution.set(width ?? viewport.width, height ?? viewport.height);
 }
 
-function refreshLineMaterialResolutions() {
+function refreshLineMaterialResolutions(width = null, height = null) {
   for (const entry of layers) {
-    if (entry.edgeLines?.material) setLineMaterialResolution(entry.edgeLines.material);
-    if (entry.pointLines?.material) setLineMaterialResolution(entry.pointLines.material);
+    if (entry.edgeLines?.material) {
+      setLineMaterialResolution(entry.edgeLines.material, width, height);
+    }
+    if (entry.pointLines?.material) {
+      setLineMaterialResolution(entry.pointLines.material, width, height);
+    }
   }
 }
 
@@ -376,11 +533,89 @@ function setIndexAttribute(geometry, indices) {
   return attr;
 }
 
-function refreshMeshBounds(geometry) {
-  geometry.computeVertexNormals();
+function meshFaceSize(layer) {
+  return Math.max(3, Math.min(4, Math.floor(Number(layer?.face_size || 3))));
+}
+
+function triangulateFaces(faces, faceSize = 3) {
+  const width = Math.max(3, Math.min(4, Math.floor(Number(faceSize || 3))));
+  if (width === 3) {
+    return faces instanceof Uint32Array ? faces : new Uint32Array(faces || []);
+  }
+  const faceCount = Math.floor((faces?.length || 0) / width);
+  const out = new Uint32Array(faceCount * 6);
+  for (let faceIdx = 0; faceIdx < faceCount; faceIdx += 1) {
+    const src = faceIdx * width;
+    const dst = faceIdx * 6;
+    const a = faces[src];
+    const b = faces[src + 1];
+    const c = faces[src + 2];
+    const d = faces[src + 3];
+    out[dst] = a;
+    out[dst + 1] = b;
+    out[dst + 2] = c;
+    out[dst + 3] = a;
+    out[dst + 4] = c;
+    out[dst + 5] = d;
+  }
+  return out;
+}
+
+function buildFaceLoopEdgeIndices(
+  faces,
+  faceSize = 3,
+  vertexPassMask = null,
+  facePassMask = null,
+  faceBegin = 0,
+  faceEnd = null,
+) {
+  const width = Math.max(3, Math.min(4, Math.floor(Number(faceSize || 3))));
+  const faceCount = Math.floor((faces?.length || 0) / width);
+  const begin = Math.max(0, Math.min(faceCount, Math.floor(faceBegin)));
+  const end = Math.max(begin, Math.min(faceCount, Math.floor(faceEnd ?? faceCount)));
+  const indices = new Uint32Array((end - begin) * width * 2);
+  let writeIdx = 0;
+  for (let faceIdx = begin; faceIdx < end; faceIdx += 1) {
+    const base = faceIdx * width;
+    if (facePassMask && !facePassMask[faceIdx]) continue;
+    if (vertexPassMask) {
+      let facePasses = true;
+      for (let local = 0; local < width; local += 1) {
+        facePasses = facePasses && Boolean(vertexPassMask[faces[base + local]]);
+      }
+      if (!facePasses) continue;
+    }
+    for (let local = 0; local < width; local += 1) {
+      indices[writeIdx] = faces[base + local];
+      indices[writeIdx + 1] = faces[base + ((local + 1) % width)];
+      writeIdx += 2;
+    }
+  }
+  return writeIdx === indices.length ? indices : indices.slice(0, writeIdx);
+}
+
+function expandEdgePositions(vertices, indices) {
+  const positions = new Float32Array(indices.length * 3);
+  for (let idx = 0; idx < indices.length; idx += 1) {
+    const source = indices[idx] * 3;
+    const target = idx * 3;
+    positions[target] = vertices[source];
+    positions[target + 1] = vertices[source + 1];
+    positions[target + 2] = vertices[source + 2];
+  }
+  return positions;
+}
+
+function refreshMeshBounds(geometry, computeNormals = true) {
+  if (computeNormals) geometry.computeVertexNormals();
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
   geometry.disposeBoundsTree?.();
+}
+
+function ensureMeshBoundsTree(object3d) {
+  const geometry = object3d?.geometry;
+  if (!geometry || geometry.boundsTree) return;
   const index = geometry.getIndex();
   if (index && index.count > 0) {
     geometry.computeBoundsTree?.();
@@ -392,7 +627,20 @@ function createMeshMaterial({
   textureMode = false,
   opacity = 1.0,
   masked = false,
+  unlit = false,
 } = {}) {
+  if (unlit) {
+    return new THREE.MeshBasicMaterial({
+      vertexColors: true,
+      side: THREE.DoubleSide,
+      transparent: masked || opacity < 0.999,
+      opacity,
+      depthWrite: masked ? false : opacity >= 0.999,
+      polygonOffset: true,
+      polygonOffsetFactor: 1,
+      polygonOffsetUnits: 1,
+    });
+  }
   if (textureMode && textureMap) {
     return new THREE.MeshLambertMaterial({
       vertexColors: false,
@@ -443,65 +691,190 @@ function buildMesh(layer) {
     textureMap.needsUpdate = true;
   }
   const textureModeActive = Boolean(textureMap && layer.active_cmap === TEXTURE_CMAP);
-  setIndexAttribute(geometry, layer.faces);
-  refreshMeshBounds(geometry);
+  setIndexAttribute(geometry, triangulateFaces(layer.faces, meshFaceSize(layer)));
+  refreshMeshBounds(geometry, !layer.unlit);
 
   const initialOpacity = clampOpacity(layer.opacity ?? payload.opacity);
   const material = createMeshMaterial({
     textureMap,
     textureMode: textureModeActive,
     opacity: initialOpacity,
+    unlit: Boolean(layer.unlit),
   });
   const mesh = new THREE.Mesh(geometry, material);
   mesh.frustumCulled = true;
   scene.add(mesh);
 
+  // Filtering is optional. Keep the masked geometry empty until the user adds
+  // a filter instead of eagerly duplicating every vertex/color/UV buffer.
   const maskedGeometry = new THREE.BufferGeometry();
-  setPositionAttribute(maskedGeometry, layer.vertices.slice());
-  maskedGeometry.setAttribute('color', createStoredColorAttribute(layer.colors.slice()));
-  if (hasTexture) {
-    maskedGeometry.setAttribute('uv', new THREE.BufferAttribute(layer.texture.uv.slice(), 2));
-  }
+  setPositionAttribute(maskedGeometry, new Float32Array(0));
+  maskedGeometry.setAttribute('color', createStoredColorAttribute(new Uint8Array(0)));
   setIndexAttribute(maskedGeometry, new Uint32Array(0));
-  refreshMeshBounds(maskedGeometry);
   const maskedMaterial = createMeshMaterial({
     textureMap,
     textureMode: textureModeActive,
     opacity: 0.0,
     masked: true,
+    unlit: Boolean(layer.unlit),
   });
   const maskedMesh = new THREE.Mesh(maskedGeometry, maskedMaterial);
   maskedMesh.frustumCulled = true;
   maskedMesh.visible = false;
   scene.add(maskedMesh);
 
-  const wireframeGeometry = new THREE.WireframeGeometry(geometry);
-  const wirePositionsAttr = wireframeGeometry.getAttribute('position');
-  const wirePositions = wirePositionsAttr ? Array.from(wirePositionsAttr.array) : [];
-  wireframeGeometry.dispose();
-  const edgeThickness = getLayerEdgeThickness(layer);
-  const edgeMaterial = new LineMaterial({
+  return { mesh, maskedMesh, edgeLines: null, textureMap };
+}
+
+function shouldUseMeshEdgeDomain(entry) {
+  return Boolean(
+    entry.layer?.edges?.length
+    && (entry.activeFieldAssociation === 'edge' || entry.edgeFilterActive),
+  );
+}
+
+function buildChunkedMeshTopologyEdges(entry) {
+  const layer = entry.layer;
+  const faceSize = meshFaceSize(layer);
+  const faceCount = Math.floor(layer.faces.length / faceSize);
+  const material = new THREE.LineBasicMaterial({
     color: edgeColorHex(),
     transparent: true,
     opacity: isDayMode ? 0.92 : 1.0,
     depthTest: true,
     depthWrite: false,
-    linewidth: edgeThickness,
   });
-  setLineMaterialResolution(edgeMaterial);
-  let edgeLines = null;
-  if (wirePositions.length > 0) {
+  const group = new THREE.Group();
+  const sharedPositions = new THREE.BufferAttribute(layer.vertices, 3);
+  let edgeCount = 0;
+  for (let begin = 0; begin < faceCount; begin += MESH_EDGE_CHUNK_FACE_COUNT) {
+    const end = Math.min(begin + MESH_EDGE_CHUNK_FACE_COUNT, faceCount);
+    const edgeIndices = buildFaceLoopEdgeIndices(
+      layer.faces,
+      faceSize,
+      entry.filterActive ? entry.passMask : null,
+      entry.facePassMask || null,
+      begin,
+      end,
+    );
+    if (edgeIndices.length === 0) continue;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', sharedPositions);
+    geometry.setIndex(new THREE.BufferAttribute(edgeIndices, 1));
+    const lines = new THREE.LineSegments(geometry, material);
+    lines.frustumCulled = false;
+    lines.renderOrder = 3;
+    group.add(lines);
+    edgeCount += edgeIndices.length / 2;
+  }
+  if (edgeCount === 0) {
+    material.dispose();
+    return null;
+  }
+  group.material = material;
+  group.userData.wideEdges = false;
+  group.userData.meshEdgeDomain = false;
+  group.userData.edgeCount = edgeCount;
+  group.visible = false;
+  group.renderOrder = 3;
+  scene.add(group);
+  entry.unmaskedEdgeCount = edgeCount;
+  return group;
+}
+
+function buildChunkedWideMeshTopologyEdges(entry) {
+  const layer = entry.layer;
+  const faceSize = meshFaceSize(layer);
+  const faceCount = Math.floor(layer.faces.length / faceSize);
+  const material = new LineMaterial({
+    color: edgeColorHex(),
+    transparent: true,
+    opacity: isDayMode ? 0.92 : 1.0,
+    depthTest: true,
+    depthWrite: false,
+    linewidth: entry.edgeThickness,
+  });
+  setLineMaterialResolution(material);
+  const group = new THREE.Group();
+  let edgeCount = 0;
+  for (let begin = 0; begin < faceCount; begin += MESH_EDGE_CHUNK_FACE_COUNT) {
+    const end = Math.min(begin + MESH_EDGE_CHUNK_FACE_COUNT, faceCount);
+    const edgeIndices = buildFaceLoopEdgeIndices(
+      layer.faces,
+      faceSize,
+      entry.filterActive ? entry.passMask : null,
+      entry.facePassMask || null,
+      begin,
+      end,
+    );
+    if (edgeIndices.length === 0) continue;
+    const geometry = new LineSegmentsGeometry();
+    geometry.setPositions(expandEdgePositions(layer.vertices, edgeIndices));
+    geometry.instanceCount = edgeIndices.length / 2;
+    const lines = new LineSegments2(geometry, material);
+    lines.frustumCulled = false;
+    lines.renderOrder = 3;
+    group.add(lines);
+    edgeCount += edgeIndices.length / 2;
+  }
+  if (edgeCount === 0) {
+    material.dispose();
+    return null;
+  }
+  group.material = material;
+  group.userData.wideEdges = true;
+  group.userData.meshEdgeDomain = false;
+  group.userData.edgeCount = edgeCount;
+  group.visible = false;
+  group.renderOrder = 3;
+  scene.add(group);
+  entry.unmaskedEdgeCount = edgeCount;
+  return group;
+}
+
+function buildMeshEdgeLines(entry) {
+  const layer = entry.layer;
+  if (shouldUseMeshEdgeDomain(entry)) {
+    const edgeColors = entry.activeFieldAssociation === 'edge'
+      ? entry.currentEdgeColors
+      : null;
+    const segmentData = buildPointEdgeSegmentData(
+      layer,
+      entry.filterActive ? entry.passMask : null,
+      entry.edgePassMask || null,
+      edgeColors,
+    );
+    if (segmentData.edgeCount === 0) return null;
     const edgeGeometry = new LineSegmentsGeometry();
-    edgeGeometry.setPositions(wirePositions);
-    edgeLines = new LineSegments2(edgeGeometry, edgeMaterial);
+    edgeGeometry.setPositions(segmentData.positions);
+    if (segmentData.colors) edgeGeometry.setColors(segmentData.colors);
+    edgeGeometry.instanceCount = segmentData.edgeCount;
+    const edgeMaterial = new LineMaterial({
+      color: segmentData.colors ? 0xffffff : edgeColorHex(),
+      vertexColors: Boolean(segmentData.colors),
+      transparent: true,
+      opacity: isDayMode ? 0.92 : 1.0,
+      depthTest: true,
+      depthWrite: false,
+      linewidth: entry.edgeThickness,
+    });
+    setLineMaterialResolution(edgeMaterial);
+    const edgeLines = new LineSegments2(edgeGeometry, edgeMaterial);
+    edgeLines.userData.wideEdges = true;
+    edgeLines.userData.meshEdgeDomain = true;
+    edgeLines.userData.edgeCount = segmentData.edgeCount;
     edgeLines.visible = false;
     edgeLines.frustumCulled = false;
     edgeLines.renderOrder = 3;
     scene.add(edgeLines);
-  } else {
-    edgeMaterial.dispose();
+    entry.unmaskedEdgeCount = segmentData.edgeCount;
+    return edgeLines;
   }
-  return { mesh, maskedMesh, edgeLines, textureMap };
+  const edgeThickness = entry.edgeThickness;
+  if (edgeThickness <= 1.0) {
+    return buildChunkedMeshTopologyEdges(entry);
+  }
+  return buildChunkedWideMeshTopologyEdges(entry);
 }
 
 function buildMeshVertexPoints(layer, initialPointSize) {
@@ -531,6 +904,42 @@ function buildMeshVertexPoints(layer, initialPointSize) {
   maskedPoints.visible = false;
   scene.add(maskedPoints);
   return { points, maskedPoints };
+}
+
+function ensureMeshInteractionProxy(entry) {
+  if (!entry?.mesh) return null;
+  if (!entry.interactionProxy) {
+    const sourcePositions = entry.mesh.geometry.getAttribute('position');
+    const sourceColors = entry.mesh.geometry.getAttribute('color');
+    const stride = Math.max(1, Math.ceil(sourcePositions.count / MAX_MESH_INTERACTION_PROXY_POINTS));
+    const proxyCount = Math.ceil(sourcePositions.count / stride);
+    const positions = new Float32Array(proxyCount * 3);
+    const colors = new Uint8Array(proxyCount * 3);
+    let targetIdx = 0;
+    for (let sourceIdx = 0; sourceIdx < sourcePositions.count; sourceIdx += stride) {
+      positions[targetIdx * 3] = sourcePositions.getX(sourceIdx);
+      positions[targetIdx * 3 + 1] = sourcePositions.getY(sourceIdx);
+      positions[targetIdx * 3 + 2] = sourcePositions.getZ(sourceIdx);
+      colors[targetIdx * 3] = Math.round(sourceColors.getX(sourceIdx) * 255);
+      colors[targetIdx * 3 + 1] = Math.round(sourceColors.getY(sourceIdx) * 255);
+      colors[targetIdx * 3 + 2] = Math.round(sourceColors.getZ(sourceIdx) * 255);
+      targetIdx += 1;
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3, true));
+    geometry.boundingBox = entry.mesh.geometry.boundingBox?.clone() || null;
+    geometry.boundingSphere = entry.mesh.geometry.boundingSphere?.clone() || null;
+    const material = new THREE.PointsMaterial({
+      size: 1.5,
+      sizeAttenuation: false,
+      vertexColors: true,
+    });
+    entry.interactionProxy = new THREE.Points(geometry, material);
+    entry.interactionProxy.visible = false;
+    scene.add(entry.interactionProxy);
+  }
+  return entry.interactionProxy;
 }
 
 function buildPoints(layer) {
@@ -574,30 +983,24 @@ function buildPoints(layer) {
   let lines = null;
   if (layer.edges && layer.edges.length >= 2) {
     const edgeThickness = getLayerEdgeThickness(layer);
-    const positions = [];
-    for (let idx = 0; idx + 1 < layer.edges.length; idx += 2) {
-      const i = layer.edges[idx];
-      const j = layer.edges[idx + 1];
-      if (i < 0 || j < 0) continue;
-      const iBase = i * 3;
-      const jBase = j * 3;
-      if (jBase + 2 >= layer.points.length || iBase + 2 >= layer.points.length) continue;
-      positions.push(
-        layer.points[iBase], layer.points[iBase + 1], layer.points[iBase + 2],
-        layer.points[jBase], layer.points[jBase + 1], layer.points[jBase + 2],
-      );
-    }
+    const edgeColors = layer.edge_field_colors?.[layer.active_edge_field_idx || 0] || null;
+    const segmentData = buildPointEdgeSegmentData(layer, null, null, edgeColors);
+    const { positions, colors, edgeCount } = segmentData;
     if (positions.length > 0) {
       const lineGeometry = new LineSegmentsGeometry();
       lineGeometry.setPositions(positions);
+      if (colors) lineGeometry.setColors(colors);
+      lineGeometry.instanceCount = edgeCount;
       const lineMaterial = new LineMaterial({
-        color: isDayMode ? 0x0f172a : 0xe4e4e7,
-        opacity: (isDayMode ? 0.28 : 0.35) * initialOpacity,
-        transparent: true,
+        color: new THREE.Color(colors ? '#ffffff' : (layer.edge_color || '#000000')),
+        vertexColors: Boolean(colors),
+        opacity: 1.0,
+        transparent: false,
         linewidth: edgeThickness,
       });
       setLineMaterialResolution(lineMaterial);
       lines = new LineSegments2(lineGeometry, lineMaterial);
+      lines.userData.edgeCount = edgeCount;
       lines.frustumCulled = false;
       scene.add(lines);
     }
@@ -640,35 +1043,94 @@ function updateEntryOpacity(entry, opacity) {
     entry.maskedVertexPoints.material.uniforms.opacity.value = filterState.maskedOpacity;
   }
   if (entry.pointLines) {
-    entry.pointLines.material.opacity = (isDayMode ? 0.28 : 0.35) * nextOpacity;
+    entry.pointLines.material.opacity = 1.0;
+    entry.pointLines.material.transparent = false;
   }
   updateMaskedObjectVisibility(entry);
 }
 
+function disposeMeshEdgeOverlay(entry) {
+  const overlay = entry?.edgeLines;
+  if (!overlay) return;
+  scene.remove(overlay);
+  const materials = new Set();
+  overlay.traverse((object3d) => {
+    object3d.geometry?.dispose?.();
+    if (object3d.material) materials.add(object3d.material);
+  });
+  if (overlay.material) materials.add(overlay.material);
+  materials.forEach((material) => material.dispose?.());
+  entry.edgeLines = null;
+}
+
 function updateEntryEdgeThickness(entry, thickness) {
-  const nextThickness = Math.min(12.0, Math.max(1.0, Number(thickness) || 1.0));
-  entry.edgeThickness = nextThickness;
+  const requestedThickness = Math.min(12.0, Math.max(1.0, Number(thickness) || 1.0));
+  const needsWideEdges = requestedThickness > 1.0;
+  entry.edgeThickness = requestedThickness;
   if (entry.edgeLines) {
-    entry.edgeLines.material.linewidth = nextThickness;
+    const hasWideEdges = Boolean(entry.edgeLines.userData.wideEdges);
+    if (hasWideEdges !== needsWideEdges) {
+      const wasVisible = entry.edgeLines.visible;
+      disposeMeshEdgeOverlay(entry);
+      entry.edgeLines = buildMeshEdgeLines(entry);
+      if (entry.edgeLines) entry.edgeLines.visible = wasVisible;
+    } else if (hasWideEdges) {
+      entry.edgeLines.material.linewidth = requestedThickness;
+    }
   }
   if (entry.pointLines) {
-    entry.pointLines.material.linewidth = nextThickness;
+    entry.pointLines.material.linewidth = requestedThickness;
   }
 }
 
+function isMeshEdgeFieldActive(entry) {
+  return entry.layerKind === 'mesh' && entry.activeFieldAssociation === 'edge';
+}
+
+function shouldDisplayMeshEdges(entry) {
+  return Boolean(entry.showEdges || isMeshEdgeFieldActive(entry));
+}
+
 function updateEntryEdgeOverlay(entry) {
+  const displayMeshEdges = shouldDisplayMeshEdges(entry);
+  if (entry.layerKind === 'mesh' && displayMeshEdges && !entry.edgeLines) {
+    entry.edgeLines = buildMeshEdgeLines(entry);
+    updateEntryEdgeThickness(entry, entry.edgeThickness);
+  }
   if (entry.edgeLines) {
     const color = edgeColorHex();
-    entry.edgeLines.visible = entry.visible && entry.showEdges && (entry.unmaskedFaceCount || 0) > 0;
-    entry.edgeLines.material.color.setHex(color);
+    const displayedEdgeCount = Number(entry.edgeLines.userData.edgeCount)
+      || Number(entry.unmaskedEdgeCount)
+      || 0;
+    entry.edgeLines.visible = entry.visible && displayMeshEdges && displayedEdgeCount > 0;
+    const hasEdgeColors = entry.activeFieldAssociation === 'edge'
+      && Boolean(entry.currentEdgeColors?.length);
+    entry.edgeLines.material.color.setHex(hasEdgeColors ? 0xffffff : color);
+    entry.edgeLines.material.vertexColors = hasEdgeColors;
+    entry.edgeLines.material.needsUpdate = true;
     entry.edgeLines.material.opacity = isDayMode ? 0.82 : 0.92;
   }
   if (entry.pointLines) {
-    entry.pointLines.visible = entry.visible && (entry.unmaskedPointCount || 0) > 0;
-    entry.pointLines.material.color.setHex(isDayMode ? 0x0f172a : 0xe4e4e7);
-    entry.pointLines.material.opacity = (isDayMode ? 0.28 : 0.35) * entry.opacity;
+    entry.pointLines.visible = entry.visible && (entry.unmaskedEdgeCount || 0) > 0;
+    const hasPointEdgeColors = entry.activeFieldAssociation === 'edge'
+      && Boolean(entry.currentEdgeColors?.length);
+    entry.pointLines.material.vertexColors = hasPointEdgeColors;
+    entry.pointLines.material.needsUpdate = true;
+    if (!hasPointEdgeColors) {
+      entry.pointLines.material.color.set(entry.layer.edge_color || '#000000');
+    } else {
+      entry.pointLines.material.color.set('#ffffff');
+    }
+    entry.pointLines.material.opacity = 1.0;
+    entry.pointLines.material.transparent = false;
   }
   updateEntryVertexOverlay(entry);
+}
+
+function rebuildMeshEdgeOverlay(entry) {
+  if (!entry || entry.layerKind !== 'mesh') return;
+  disposeMeshEdgeOverlay(entry);
+  updateEntryEdgeOverlay(entry);
 }
 
 function updateEntryVertexOverlay(entry) {
@@ -731,9 +1193,50 @@ function gradientCss(gradient) {
   return `linear-gradient(90deg, ${gradient.join(', ')})`;
 }
 
-function getEntryDisplayedValues(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
-  const fieldValues = entry.layer.field_values || null;
-  return fieldValues ? fieldValues[fieldIdx] : entry.layer.values || null;
+function getAssociationFieldPrefix(association = 'vertex') {
+  if (association === 'edge') return 'edge_field';
+  if (association === 'face') return 'face_field';
+  return 'field';
+}
+
+function getAssociationFieldData(entry, association = 'vertex') {
+  const prefix = getAssociationFieldPrefix(association);
+  return {
+    names: entry.layer[`${prefix}_names`] || [],
+    colors: entry.layer[`${prefix}_colors`] || null,
+    values: entry.layer[`${prefix}_values`] || null,
+    metas: entry.layer[`${prefix}_scalar_meta`] || null,
+  };
+}
+
+function getAssociationState(entry, association = 'vertex') {
+  if (!entry.associationFieldStates) entry.associationFieldStates = {};
+  if (!entry.associationFieldStates[association]) {
+    const initialIdx = association === 'edge'
+      ? (entry.activeEdgeFieldIdx ?? 0)
+      : association === 'face'
+        ? (entry.activeFaceFieldIdx ?? 0)
+        : (entry.activeFieldIdx ?? 0);
+    const initialCmap = association === 'vertex'
+      ? (entry.activeCmap || UNIFORM_CMAP)
+      : (getAssociationFieldData(entry, association).metas?.[initialIdx]?.cmap || getFallbackCmap());
+    entry.associationFieldStates[association] = {
+      activeFieldIdx: initialIdx,
+      activeCmap: initialCmap,
+      clipStates: [],
+      sharedClip: createClipState(),
+      currentColors: null,
+    };
+  }
+  return entry.associationFieldStates[association];
+}
+
+function getEntryDisplayedValues(entry, fieldIdx = null, association = 'vertex') {
+  const state = getAssociationState(entry, association);
+  const resolvedIdx = fieldIdx ?? state.activeFieldIdx ?? 0;
+  const fieldValues = getAssociationFieldData(entry, association).values;
+  if (association !== 'vertex') return fieldValues ? fieldValues[resolvedIdx] : null;
+  return fieldValues ? fieldValues[resolvedIdx] : entry.layer.values || null;
 }
 
 function computeFiniteValueRange(values) {
@@ -778,31 +1281,34 @@ function buildRawScalarGradient(range, stepCount = 7) {
   return gradient;
 }
 
-function getEntryRawColors(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
-  const fieldColors = entry.layer.field_colors || null;
-  if (fieldColors && fieldIdx >= 0 && fieldIdx < fieldColors.length && fieldColors[fieldIdx]) {
-    return fieldColors[fieldIdx];
+function getEntryRawColors(entry, fieldIdx = null, association = 'vertex') {
+  const state = getAssociationState(entry, association);
+  const resolvedIdx = fieldIdx ?? state.activeFieldIdx ?? 0;
+  const fieldColors = getAssociationFieldData(entry, association).colors;
+  if (fieldColors && resolvedIdx >= 0 && resolvedIdx < fieldColors.length && fieldColors[resolvedIdx]) {
+    return fieldColors[resolvedIdx];
   }
+  if (association !== 'vertex') return null;
   return entry.layer.raw_colors || entry.layer.colors || null;
 }
 
-function getEntryColorModeOptions(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
+function getEntryColorModeOptions(entry, fieldIdx = null, association = 'vertex') {
   const options = [UNIFORM_CMAP];
-  if (entry.layer?.texture) {
+  if (association === 'vertex' && entry.layer?.texture) {
     options.push(TEXTURE_CMAP);
   }
-  const values = getEntryDisplayedValues(entry, fieldIdx);
+  const values = getEntryDisplayedValues(entry, fieldIdx, association);
   if (values && typeof values.length === 'number') {
     availableCmaps.forEach((cmapName) => options.push(cmapName));
   }
   return Array.from(new Set(options));
 }
 
-function getEntryRawGradient(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
-  const values = getEntryDisplayedValues(entry, fieldIdx);
+function getEntryRawGradient(entry, fieldIdx = null, association = 'vertex') {
+  const values = getEntryDisplayedValues(entry, fieldIdx, association);
   const valueRange = computeFiniteValueRange(values);
   if (valueRange) return buildRawScalarGradient(valueRange);
-  return sampleRawGradientFromColors(getEntryRawColors(entry, fieldIdx));
+  return sampleRawGradientFromColors(getEntryRawColors(entry, fieldIdx, association));
 }
 
 function buildDistributionSvg(values, meta) {
@@ -933,7 +1439,7 @@ function buildDistributionSvg(values, meta) {
   return { svg, setClipFractions };
 }
 
-function createCmapSwatch(entry, fieldIdx, cmapName) {
+function createCmapSwatch(entry, fieldIdx, cmapName, association = 'vertex') {
   const swatch = document.createElement('span');
   swatch.className = 'cmap-swatch';
   if (isTextureCmap(cmapName)) {
@@ -941,7 +1447,7 @@ function createCmapSwatch(entry, fieldIdx, cmapName) {
     return swatch;
   }
   const gradient = isUniformCmap(cmapName)
-    ? getEntryRawGradient(entry, fieldIdx)
+    ? getEntryRawGradient(entry, fieldIdx, association)
     : (getColormapPreset(cmapName)?.gradient || null);
   swatch.style.background = gradientCss(gradient);
   return swatch;
@@ -1216,14 +1722,16 @@ function toggleDropdownMenu(button, menu) {
   positionDropdownMenu(button, menu);
 }
 
-function getEntryCmap(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
-  return entry.activeCmap || UNIFORM_CMAP;
+function getEntryCmap(entry, fieldIdx = null, association = 'vertex') {
+  return getAssociationState(entry, association).activeCmap || UNIFORM_CMAP;
 }
 
-function getEntryScaleRange(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
-  const values = getEntryDisplayedValues(entry, fieldIdx);
-  const fieldMetas = entry.layer.field_scalar_meta || null;
-  const baseMeta = fieldMetas ? fieldMetas[fieldIdx] : entry.layer.scalar_meta;
+function getEntryScaleRange(entry, fieldIdx = null, association = 'vertex') {
+  const state = getAssociationState(entry, association);
+  const resolvedIdx = fieldIdx ?? state.activeFieldIdx ?? 0;
+  const values = getEntryDisplayedValues(entry, resolvedIdx, association);
+  const fieldMetas = getAssociationFieldData(entry, association).metas;
+  const baseMeta = fieldMetas ? fieldMetas[resolvedIdx] : (association === 'vertex' ? entry.layer.scalar_meta : null);
   const metaMin = Number(baseMeta && baseMeta.min);
   const metaMax = Number(baseMeta && baseMeta.max);
   if (Number.isFinite(metaMin) && Number.isFinite(metaMax)) {
@@ -1232,10 +1740,11 @@ function getEntryScaleRange(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
   return computeFiniteValueRange(values);
 }
 
-function getEntryAllScaleRanges(entry) {
+function getEntryAllScaleRanges(entry, association = 'vertex') {
   const ranges = [];
-  const fieldValues = entry.layer.field_values || null;
-  const fieldMetas = entry.layer.field_scalar_meta || null;
+  const data = getAssociationFieldData(entry, association);
+  const fieldValues = data.values;
+  const fieldMetas = data.metas;
   if (fieldValues && fieldValues.length > 0) {
     for (let fieldIdx = 0; fieldIdx < fieldValues.length; fieldIdx += 1) {
       const values = fieldValues[fieldIdx];
@@ -1251,15 +1760,15 @@ function getEntryAllScaleRanges(entry) {
     }
     return ranges;
   }
-  const range = getEntryScaleRange(entry);
+  const range = getEntryScaleRange(entry, null, association);
   return range ? [range] : [];
 }
 
-function getSharedFieldScaleRange(entry) {
-  if (!entry || !usesScalarCmap(getEntryCmap(entry))) return null;
+function getSharedFieldScaleRange(entry, association = 'vertex') {
+  if (!entry || !usesScalarCmap(getEntryCmap(entry, null, association))) return null;
   let minVal = Infinity;
   let maxVal = -Infinity;
-  for (const range of getEntryAllScaleRanges(entry)) {
+  for (const range of getEntryAllScaleRanges(entry, association)) {
     minVal = Math.min(minVal, range.min);
     maxVal = Math.max(maxVal, range.max);
   }
@@ -1267,11 +1776,13 @@ function getSharedFieldScaleRange(entry) {
   return { min: minVal, max: maxVal };
 }
 
-function getScalarMeta(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
-  const values = getEntryDisplayedValues(entry, fieldIdx);
-  const fieldMetas = entry.layer.field_scalar_meta || null;
-  const baseMeta = fieldMetas ? fieldMetas[fieldIdx] : entry.layer.scalar_meta;
-  const cmapName = getEntryCmap(entry, fieldIdx);
+function getScalarMeta(entry, fieldIdx = null, association = 'vertex') {
+  const state = getAssociationState(entry, association);
+  const resolvedIdx = fieldIdx ?? state.activeFieldIdx ?? 0;
+  const values = getEntryDisplayedValues(entry, resolvedIdx, association);
+  const fieldMetas = getAssociationFieldData(entry, association).metas;
+  const baseMeta = fieldMetas ? fieldMetas[resolvedIdx] : (association === 'vertex' ? entry.layer.scalar_meta : null);
+  const cmapName = getEntryCmap(entry, resolvedIdx, association);
   if (!baseMeta) {
     const range = computeFiniteValueRange(values);
     if (!range) return null;
@@ -1281,9 +1792,9 @@ function getScalarMeta(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
       cmap: cmapName,
       gradient: usesScalarCmap(cmapName)
         ? (getColormapPreset(cmapName)?.gradient || null)
-        : getEntryRawGradient(entry, fieldIdx),
+        : getEntryRawGradient(entry, resolvedIdx, association),
     };
-    const sharedFieldScaleRange = getSharedFieldScaleRange(entry);
+    const sharedFieldScaleRange = getSharedFieldScaleRange(entry, association);
     if (usesScalarCmap(cmapName) && entry.shareFieldScale && sharedFieldScaleRange) {
       resolved.min = sharedFieldScaleRange.min;
       resolved.max = sharedFieldScaleRange.max;
@@ -1293,7 +1804,7 @@ function getScalarMeta(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
     if (usesScalarCmap(cmapName)) {
       const clippedRange = applyClipToRange(
         { min: resolved.fullMin, max: resolved.fullMax },
-        getClipState(entry, fieldIdx),
+        getClipState(entry, resolvedIdx, association),
       );
       if (clippedRange) {
         resolved.min = clippedRange.min;
@@ -1301,8 +1812,8 @@ function getScalarMeta(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
       }
     }
     resolved.clipState = createClipState(
-      getClipState(entry, fieldIdx).minFrac,
-      getClipState(entry, fieldIdx).maxFrac,
+      getClipState(entry, resolvedIdx, association).minFrac,
+      getClipState(entry, resolvedIdx, association).maxFrac,
     );
     resolved.clipEnabled = usesScalarCmap(cmapName) && Math.abs(resolved.fullMax - resolved.fullMin) > 1e-12;
     return resolved;
@@ -1312,9 +1823,9 @@ function getScalarMeta(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
     cmap: cmapName,
     gradient: usesScalarCmap(cmapName)
       ? (getColormapPreset(cmapName)?.gradient || baseMeta.gradient)
-      : (baseMeta.gradient || getEntryRawGradient(entry, fieldIdx)),
+      : (baseMeta.gradient || getEntryRawGradient(entry, resolvedIdx, association)),
   };
-  const sharedFieldScaleRange = getSharedFieldScaleRange(entry);
+  const sharedFieldScaleRange = getSharedFieldScaleRange(entry, association);
   if (usesScalarCmap(cmapName) && entry.shareFieldScale && sharedFieldScaleRange) {
     resolved.min = sharedFieldScaleRange.min;
     resolved.max = sharedFieldScaleRange.max;
@@ -1324,7 +1835,7 @@ function getScalarMeta(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
   if (usesScalarCmap(cmapName)) {
     const clippedRange = applyClipToRange(
       { min: resolved.fullMin, max: resolved.fullMax },
-      getClipState(entry, fieldIdx),
+      getClipState(entry, resolvedIdx, association),
     );
     if (clippedRange) {
       resolved.min = clippedRange.min;
@@ -1332,8 +1843,8 @@ function getScalarMeta(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
     }
   }
   resolved.clipState = createClipState(
-    getClipState(entry, fieldIdx).minFrac,
-    getClipState(entry, fieldIdx).maxFrac,
+    getClipState(entry, resolvedIdx, association).minFrac,
+    getClipState(entry, resolvedIdx, association).maxFrac,
   );
   resolved.clipEnabled = usesScalarCmap(cmapName) && Math.abs(resolved.fullMax - resolved.fullMin) > 1e-12;
   return resolved;
@@ -1367,11 +1878,13 @@ function buildColorsFromValues(values, meta) {
   return colors;
 }
 
-function resolveEntryRawColors(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
-  const rawColors = getEntryRawColors(entry, fieldIdx);
+function resolveEntryRawColors(entry, fieldIdx = null, association = 'vertex') {
+  const rawColors = getEntryRawColors(entry, fieldIdx, association);
   const decoded = decodeArraySpec(rawColors, Uint8Array);
   if (decoded && decoded.length > 0) return decoded;
-  return decodeArraySpec(entry.layer.colors, Uint8Array) || new Uint8Array(0);
+  return association === 'vertex'
+    ? (decodeArraySpec(entry.layer.colors, Uint8Array) || new Uint8Array(0))
+    : new Uint8Array(0);
 }
 
 function setMeshTextureMode(entry, enabled) {
@@ -1384,6 +1897,7 @@ function setMeshTextureMode(entry, enabled) {
       textureMode: enabled,
       opacity: oldMaterial.opacity,
       masked,
+      unlit: Boolean(entry.layer.unlit) && !enabled,
     });
     object3d.material = nextMaterial;
     oldMaterial.dispose?.();
@@ -1392,49 +1906,154 @@ function setMeshTextureMode(entry, enabled) {
   replaceMaterial(entry.maskedMesh, true);
 }
 
-function renderEntryColors(entry, fieldIdx = entry.activeFieldIdx ?? 0) {
-  const fieldValues = entry.layer.field_values || null;
-  const values = fieldValues ? fieldValues[fieldIdx] : entry.layer.values || null;
-  const rawColors = resolveEntryRawColors(entry, fieldIdx);
-  const cmapName = getEntryCmap(entry, fieldIdx);
-  const meta = getScalarMeta(entry, fieldIdx);
+function setMeshFaceColorMode(entry, enabled) {
+  const nextEnabled = Boolean(enabled);
+  if (Boolean(entry.faceColorMaterialActive) === nextEnabled) return;
+  const replaceMaterial = (object3d, masked = false) => {
+    if (!object3d?.material) return;
+    const oldMaterial = object3d.material;
+    object3d.material = createMeshMaterial({
+      opacity: oldMaterial.opacity,
+      masked,
+      unlit: nextEnabled || Boolean(entry.layer.unlit),
+    });
+    oldMaterial.dispose?.();
+  };
+  replaceMaterial(entry.mesh, false);
+  replaceMaterial(entry.maskedMesh, true);
+  entry.faceColorMaterialActive = nextEnabled;
+}
+
+function getEntryDefaultColors(entry) {
+  return entry.layer.default_colors
+    || entry.layer.raw_colors
+    || entry.layer.colors
+    || new Uint8Array(0);
+}
+
+function syncActiveFieldRadios() {
+  document.querySelectorAll('input[data-field-association]').forEach((input) => {
+    const entry = layers.find((candidate) => String(candidate.layerId) === input.dataset.layerId);
+    input.checked = Boolean(entry && entry.activeFieldAssociation === input.dataset.association);
+  });
+}
+
+function clearEntryFieldDisplay(entry, requestUpdate = true) {
+  entry.activeFieldAssociation = null;
+  entry.activeSurfaceAssociation = null;
+  entry.activeValues = null;
+  entry.currentColors = getEntryDefaultColors(entry);
+  entry.currentEdgeColors = null;
+  entry.currentFaceColors = null;
+  if (entry.pointLines?.material) {
+    entry.pointLines.material.vertexColors = false;
+    entry.pointLines.material.needsUpdate = true;
+  }
+  if (entry.layerKind === 'mesh') {
+    setMeshFaceColorMode(entry, false);
+    setMeshTextureMode(entry, false);
+  }
+  applyFiltersToEntry(entry);
+  syncActiveFieldRadios();
+  if (requestUpdate) requestRenderAndHover();
+}
+
+function renderEntryColors(entry, fieldIdx = null, association = 'vertex') {
+  const state = getAssociationState(entry, association);
+  const resolvedIdx = fieldIdx ?? state.activeFieldIdx ?? 0;
+  const values = getEntryDisplayedValues(entry, resolvedIdx, association);
+  const rawColors = resolveEntryRawColors(entry, resolvedIdx, association);
+  const cmapName = getEntryCmap(entry, resolvedIdx, association);
+  const meta = getScalarMeta(entry, resolvedIdx, association);
   const colorFromValues = usesScalarCmap(cmapName) && values && meta ? buildColorsFromValues(values, meta) : null;
 
-  entry.activeFieldIdx = fieldIdx;
-  entry.activeValues = values;
-  entry.activeCmap = cmapName;
-  entry.currentColors = colorFromValues || rawColors;
-  setMeshTextureMode(entry, isTextureCmap(cmapName));
+  state.activeFieldIdx = resolvedIdx;
+  state.activeCmap = cmapName;
+  state.currentColors = colorFromValues || rawColors;
+  entry.activeFieldAssociation = association;
+  if (association !== 'edge') {
+    entry.currentEdgeColors = null;
+    if (entry.pointLines?.material) {
+      entry.pointLines.material.vertexColors = false;
+      entry.pointLines.material.needsUpdate = true;
+    }
+  }
+  if (association !== 'face') entry.currentFaceColors = null;
+  if (association === 'edge') {
+    entry.activeEdgeFieldIdx = resolvedIdx;
+    entry.currentEdgeColors = state.currentColors;
+    entry.activeSurfaceAssociation = null;
+    entry.activeValues = null;
+    entry.currentColors = getEntryDefaultColors(entry);
+    if (entry.layerKind === 'mesh') {
+      setMeshFaceColorMode(entry, false);
+      setMeshTextureMode(entry, false);
+    }
+    if (entry.pointLines) {
+      entry.pointLines.material.vertexColors = Boolean(entry.currentEdgeColors?.length);
+      entry.pointLines.material.needsUpdate = true;
+    }
+  } else if (association === 'face') {
+    entry.activeFaceFieldIdx = resolvedIdx;
+    entry.currentFaceColors = state.currentColors;
+    entry.activeSurfaceAssociation = 'face';
+  } else {
+    entry.activeFieldIdx = resolvedIdx;
+    entry.activeValues = values;
+    entry.activeCmap = cmapName;
+    entry.currentColors = state.currentColors;
+    entry.activeSurfaceAssociation = 'vertex';
+    setMeshFaceColorMode(entry, false);
+    setMeshTextureMode(entry, isTextureCmap(cmapName));
+  }
   applyFiltersToEntry(entry);
+  syncActiveFieldRadios();
   requestRenderAndHover();
 }
 
-function setLayerCmap(entry, cmapName) {
-  const fieldIdx = entry.activeFieldIdx ?? 0;
-  entry.activeCmap = cmapName;
-  renderEntryColors(entry, fieldIdx);
+function setLayerCmap(entry, cmapName, association = 'vertex') {
+  const previousSurfaceAssociation = entry.activeSurfaceAssociation;
+  const state = getAssociationState(entry, association);
+  const fieldIdx = state.activeFieldIdx ?? 0;
+  state.activeCmap = cmapName;
+  if (association === 'vertex') entry.activeCmap = cmapName;
+  renderEntryColors(entry, fieldIdx, association);
   updateEntryOpacity(entry, entry.opacity);
-  updateColorbars();
+  if (
+    entry.layerKind === 'mesh'
+    && association !== 'edge'
+    && previousSurfaceAssociation !== entry.activeSurfaceAssociation
+  ) {
+    rebuildLayerList();
+  } else {
+    updateColorbars();
+  }
 }
 
 function setLayerShareFieldScale(entry, enabled) {
   entry.shareFieldScale = Boolean(enabled);
-  const fieldIdx = Math.max(
-    0,
-    Math.min(
-      entry.activeFieldIdx ?? 0,
-      getEntryFieldCount(entry) - 1,
-    ),
-  );
-  renderEntryColors(entry, fieldIdx);
+  const association = entry.activeFieldAssociation;
+  if (association && getEntryFieldCount(entry, association) > 0) {
+    const state = getAssociationState(entry, association);
+    const fieldIdx = Math.max(0, Math.min(state.activeFieldIdx ?? 0, getEntryFieldCount(entry, association) - 1));
+    renderEntryColors(entry, fieldIdx, association);
+  }
   updateColorbars();
   hideHoverTooltip();
 }
 
-function setColorClipBoundary(entry, fieldIdx, boundary, value) {
-  const state = getClipState(entry, fieldIdx);
+function setColorClipBoundary(entry, fieldIdx, boundary, value, association = 'vertex') {
+  const previousSurfaceAssociation = entry.activeSurfaceAssociation;
+  const state = getClipState(entry, fieldIdx, association);
   setClipBoundary(state, boundary, sliderValueToClip(value, boundary === 'max' ? 1.0 : 0.0));
-  renderEntryColors(entry, fieldIdx);
+  renderEntryColors(entry, fieldIdx, association);
+  if (
+    entry.layerKind === 'mesh'
+    && association !== 'edge'
+    && previousSurfaceAssociation !== entry.activeSurfaceAssociation
+  ) {
+    rebuildLayerList();
+  }
   syncAllColorbarClipControls();
   hideHoverTooltip();
 }
@@ -1503,6 +2122,16 @@ function getEntryFieldValuesByName(entry, fieldName) {
   return entry.fieldLookup.get(fieldName) || null;
 }
 
+function getEntryEdgeFieldValuesByName(entry, fieldName) {
+  if (!fieldName || !entry.edgeFieldLookup) return null;
+  return entry.edgeFieldLookup.get(fieldName) || null;
+}
+
+function getEntryFaceFieldValuesByName(entry, fieldName) {
+  if (!fieldName || !entry.faceFieldLookup) return null;
+  return entry.faceFieldLookup.get(fieldName) || null;
+}
+
 function computeFiniteAxisRange(positions, axisIdx) {
   if (!positions || positions.length === 0) return null;
   let minVal = Infinity;
@@ -1559,6 +2188,38 @@ function computeScopeFieldRange(scopeKey, fieldName) {
   return { min: minVal, max: maxVal };
 }
 
+function computeScopeEdgeFieldRange(scopeKey, fieldName) {
+  let minVal = Infinity;
+  let maxVal = -Infinity;
+  let hasValue = false;
+  for (const entry of getScopedEntries(scopeKey, false)) {
+    const values = getEntryEdgeFieldValuesByName(entry, fieldName);
+    if (!values || values.length === 0) continue;
+    const range = computeFiniteValueRange(values);
+    if (!range) continue;
+    hasValue = true;
+    minVal = Math.min(minVal, range.min);
+    maxVal = Math.max(maxVal, range.max);
+  }
+  return hasValue ? { min: minVal, max: maxVal } : null;
+}
+
+function computeScopeFaceFieldRange(scopeKey, fieldName) {
+  let minVal = Infinity;
+  let maxVal = -Infinity;
+  let hasValue = false;
+  for (const entry of getScopedEntries(scopeKey, false)) {
+    const values = getEntryFaceFieldValuesByName(entry, fieldName);
+    if (!values || values.length === 0) continue;
+    const range = computeFiniteValueRange(values);
+    if (!range) continue;
+    hasValue = true;
+    minVal = Math.min(minVal, range.min);
+    maxVal = Math.max(maxVal, range.max);
+  }
+  return hasValue ? { min: minVal, max: maxVal } : null;
+}
+
 function getFilterFieldNames() {
   const names = new Set();
   for (const entry of layers) {
@@ -1568,10 +2229,34 @@ function getFilterFieldNames() {
   return Array.from(names);
 }
 
+function getFilterEdgeFieldNames() {
+  const names = new Set();
+  for (const entry of layers) {
+    const fieldNames = entry.layer.edge_field_names || [];
+    fieldNames.forEach((name) => names.add(String(name)));
+  }
+  return Array.from(names);
+}
+
+function getFilterFaceFieldNames() {
+  const names = new Set();
+  for (const entry of layers) {
+    const fieldNames = entry.layer.face_field_names || [];
+    fieldNames.forEach((name) => names.add(String(name)));
+  }
+  return Array.from(names);
+}
+
 function getFilterPropertyOptions() {
   const options = [{ value: FILTER_POSITION, label: 'Position (x/y/z)' }];
   getFilterFieldNames().forEach((fieldName) => {
-    options.push({ value: `field:${fieldName}`, label: fieldName });
+    options.push({ value: `field:${fieldName}`, label: `Point/Vertex: ${fieldName}` });
+  });
+  getFilterEdgeFieldNames().forEach((fieldName) => {
+    options.push({ value: `edge-field:${fieldName}`, label: `Edge: ${fieldName}` });
+  });
+  getFilterFaceFieldNames().forEach((fieldName) => {
+    options.push({ value: `face-field:${fieldName}`, label: `Triangle/Face: ${fieldName}` });
   });
   return options;
 }
@@ -1589,6 +2274,18 @@ function getRuleDomain(rule, scopeKeys) {
     if (!range) return null;
     return { kind: 'field', fieldName, range };
   }
+  if (rule.property.startsWith('edge-field:')) {
+    const fieldName = rule.property.slice(11);
+    const range = computeScopeEdgeFieldRange(scopeKeys, fieldName);
+    if (!range) return null;
+    return { kind: 'edge-field', fieldName, range };
+  }
+  if (rule.property.startsWith('face-field:')) {
+    const fieldName = rule.property.slice(11);
+    const range = computeScopeFaceFieldRange(scopeKeys, fieldName);
+    if (!range) return null;
+    return { kind: 'face-field', fieldName, range };
+  }
   return null;
 }
 
@@ -1605,6 +2302,22 @@ function filterFracToSlider(frac, fallback = 0.0) {
 function rangeFromClip(range, clipState) {
   if (!range) return null;
   return applyClipToRange(range, clipState);
+}
+
+function isClipStateRestrictive(clipState) {
+  if (!clipState) return false;
+  return clampUnit(clipState.minFrac, 0.0) > 0.0
+    || clampUnit(clipState.maxFrac, 1.0) < 1.0;
+}
+
+function isFilterRuleRestrictive(rule, domain) {
+  if (!rule || !domain) return false;
+  if (domain.kind === FILTER_POSITION) {
+    return ['x', 'y', 'z'].some((axis) => (
+      isClipStateRestrictive(rule.positionClip?.[axis])
+    ));
+  }
+  return isClipStateRestrictive(rule.scalarClip);
 }
 
 function createDefaultRule(property) {
@@ -1711,56 +2424,222 @@ function updateMeshVertexPointSubsets(entry, passMask) {
   entry.maskedPointCount = maskedIndices.length;
 }
 
-function splitMeshFacesByMask(faces, passMask) {
+function splitMeshFacesByMask(faces, vertexPassMask = null, faceSize = 3, facePassMask = null) {
   const unmasked = [];
   const masked = [];
-  for (let idx = 0; idx + 2 < faces.length; idx += 3) {
-    const a = faces[idx];
-    const b = faces[idx + 1];
-    const c = faces[idx + 2];
-    if (passMask[a] && passMask[b] && passMask[c]) {
-      unmasked.push(a, b, c);
-    } else {
-      masked.push(a, b, c);
+  const unmaskedFaceIndices = [];
+  const maskedFaceIndices = [];
+  const width = Math.max(3, Math.min(4, Math.floor(Number(faceSize || 3))));
+  for (let idx = 0, faceIdx = 0; idx + width - 1 < faces.length; idx += width, faceIdx += 1) {
+    let pass = !facePassMask || Boolean(facePassMask[faceIdx]);
+    for (let local = 0; local < width; local += 1) {
+      if (vertexPassMask) pass = pass && Boolean(vertexPassMask[faces[idx + local]]);
+    }
+    const target = pass ? unmasked : masked;
+    (pass ? unmaskedFaceIndices : maskedFaceIndices).push(faceIdx);
+    for (let local = 0; local < width; local += 1) {
+      target.push(faces[idx + local]);
     }
   }
   return {
     unmaskedFaces: new Uint32Array(unmasked),
     maskedFaces: new Uint32Array(masked),
+    unmaskedFaceIndices,
+    maskedFaceIndices,
   };
+}
+
+function buildFlatFaceSubset(layer, faceIndices, faceColors) {
+  const width = meshFaceSize(layer);
+  const verticesPerFace = width === 4 ? 6 : 3;
+  const faceCount = faceIndices
+    ? faceIndices.length
+    : Math.floor(layer.faces.length / width);
+  const positions = new Float32Array(faceCount * verticesPerFace * 3);
+  const colors = new Uint8Array(faceCount * verticesPerFace * 3);
+  const localOrder = width === 4 ? [0, 1, 2, 0, 2, 3] : [0, 1, 2];
+  let writeVertex = 0;
+  for (let subsetIdx = 0; subsetIdx < faceCount; subsetIdx += 1) {
+    const faceIdx = faceIndices ? faceIndices[subsetIdx] : subsetIdx;
+    const colorBase = faceIdx * 3;
+    for (const localIdx of localOrder) {
+      const sourceVertex = layer.faces[faceIdx * width + localIdx];
+      const sourceBase = sourceVertex * 3;
+      const targetBase = writeVertex * 3;
+      positions[targetBase] = layer.vertices[sourceBase];
+      positions[targetBase + 1] = layer.vertices[sourceBase + 1];
+      positions[targetBase + 2] = layer.vertices[sourceBase + 2];
+      colors[targetBase] = faceColors[colorBase];
+      colors[targetBase + 1] = faceColors[colorBase + 1];
+      colors[targetBase + 2] = faceColors[colorBase + 2];
+      writeVertex += 1;
+    }
+  }
+  return { positions, colors };
+}
+
+function setFlatFaceGeometry(object3d, layer, faceIndices, faceColors) {
+  const subset = buildFlatFaceSubset(layer, faceIndices, faceColors);
+  setPositionAttribute(object3d.geometry, subset.positions);
+  setStoredColorAttribute(object3d.geometry, subset.colors);
+  object3d.geometry.setIndex(null);
+  object3d.geometry.deleteAttribute('uv');
+  object3d.geometry.deleteAttribute('normal');
+  object3d.userData.sourceFaceIndices = faceIndices;
+  refreshMeshBounds(object3d.geometry, false);
+}
+
+function restoreIndexedMeshGeometry(entry, colors) {
+  setPositionAttribute(entry.mesh.geometry, entry.layer.vertices);
+  setStoredColorAttribute(entry.mesh.geometry, colors);
+  if (entry.layer.texture?.uv) {
+    entry.mesh.geometry.setAttribute('uv', new THREE.BufferAttribute(entry.layer.texture.uv, 2));
+  }
 }
 
 function updateMeshEdgeLinesFromGeometry(entry) {
   if (!entry.edgeLines || !entry.mesh) return;
-  const wireframeGeometry = new THREE.WireframeGeometry(entry.mesh.geometry);
-  const attr = wireframeGeometry.getAttribute('position');
-  const positions = attr ? Array.from(attr.array) : [];
-  wireframeGeometry.dispose();
-  entry.edgeLines.geometry.setPositions(positions);
-}
-
-function updatePointLinesFromMask(entry, passMask) {
-  if (!entry.pointLines) return;
-  const baseEdges = entry.layer.edges;
-  const basePositions = entry.layer.points;
-  if (!baseEdges || baseEdges.length < 2) {
-    entry.pointLines.geometry.setPositions([]);
+  const useMeshEdgeDomain = shouldUseMeshEdgeDomain(entry);
+  if (Boolean(entry.edgeLines.userData.meshEdgeDomain) !== useMeshEdgeDomain) {
+    rebuildMeshEdgeOverlay(entry);
     return;
   }
-  const positions = [];
-  for (let idx = 0; idx + 1 < baseEdges.length; idx += 2) {
-    const i = baseEdges[idx];
-    const j = baseEdges[idx + 1];
-    if (!passMask[i] || !passMask[j]) continue;
+  if (useMeshEdgeDomain) {
+    const edgeColors = entry.activeFieldAssociation === 'edge'
+      ? entry.currentEdgeColors
+      : null;
+    const segmentData = buildPointEdgeSegmentData(
+      entry.layer,
+      entry.filterActive ? entry.passMask : null,
+      entry.edgePassMask || null,
+      edgeColors,
+    );
+    entry.edgeLines.geometry.setPositions(segmentData.positions);
+    if (segmentData.colors) entry.edgeLines.geometry.setColors(segmentData.colors);
+    entry.edgeLines.geometry.instanceCount = segmentData.edgeCount;
+    entry.edgeLines.material.vertexColors = Boolean(segmentData.colors);
+    entry.edgeLines.material.needsUpdate = true;
+    entry.edgeLines.userData.edgeCount = segmentData.edgeCount;
+    entry.unmaskedEdgeCount = segmentData.edgeCount;
+    return;
+  }
+  rebuildMeshEdgeOverlay(entry);
+}
+
+function buildPointEdgeSegmentData(layer, pointPassMask = null, edgePassMask = null, edgeColors = null) {
+  const baseEdges = layer.edges;
+  const basePositions = layer.points?.length ? layer.points : layer.vertices;
+  const sourceEdgeCount = Math.floor((baseEdges?.length || 0) / 2);
+  if (!baseEdges || sourceEdgeCount === 0) {
+    return { positions: new Float32Array(0), colors: null, edgeCount: 0 };
+  }
+
+  let edgeCount = 0;
+  for (let edgeIdx = 0; edgeIdx < sourceEdgeCount; edgeIdx += 1) {
+    if (edgePassMask && !edgePassMask[edgeIdx]) continue;
+    const i = baseEdges[edgeIdx * 2];
+    const j = baseEdges[edgeIdx * 2 + 1];
+    if (pointPassMask && (!pointPassMask[i] || !pointPassMask[j])) continue;
     const iBase = i * 3;
     const jBase = j * 3;
     if (iBase + 2 >= basePositions.length || jBase + 2 >= basePositions.length) continue;
-    positions.push(
-      basePositions[iBase], basePositions[iBase + 1], basePositions[iBase + 2],
-      basePositions[jBase], basePositions[jBase + 1], basePositions[jBase + 2],
-    );
+    edgeCount += 1;
   }
-  entry.pointLines.geometry.setPositions(positions);
+
+  const positions = new Float32Array(edgeCount * 6);
+  const hasEdgeColors = Boolean(edgeColors && edgeColors.length >= sourceEdgeCount * 3);
+  const colors = hasEdgeColors ? new Float32Array(edgeCount * 6) : null;
+  let writeBase = 0;
+  for (let edgeIdx = 0; edgeIdx < sourceEdgeCount; edgeIdx += 1) {
+    if (edgePassMask && !edgePassMask[edgeIdx]) continue;
+    const i = baseEdges[edgeIdx * 2];
+    const j = baseEdges[edgeIdx * 2 + 1];
+    if (pointPassMask && (!pointPassMask[i] || !pointPassMask[j])) continue;
+    const iBase = i * 3;
+    const jBase = j * 3;
+    if (iBase + 2 >= basePositions.length || jBase + 2 >= basePositions.length) continue;
+    positions[writeBase] = basePositions[iBase];
+    positions[writeBase + 1] = basePositions[iBase + 1];
+    positions[writeBase + 2] = basePositions[iBase + 2];
+    positions[writeBase + 3] = basePositions[jBase];
+    positions[writeBase + 4] = basePositions[jBase + 1];
+    positions[writeBase + 5] = basePositions[jBase + 2];
+    if (colors) {
+      const colorBase = edgeIdx * 3;
+      const r = edgeColors[colorBase] / 255;
+      const g = edgeColors[colorBase + 1] / 255;
+      const b = edgeColors[colorBase + 2] / 255;
+      colors[writeBase] = r;
+      colors[writeBase + 1] = g;
+      colors[writeBase + 2] = b;
+      colors[writeBase + 3] = r;
+      colors[writeBase + 4] = g;
+      colors[writeBase + 5] = b;
+    }
+    writeBase += 6;
+  }
+  return { positions, colors, edgeCount };
+}
+
+function updatePointLinesFromMask(entry, passMask, edgePassMask = null) {
+  if (!entry.pointLines) return;
+  const geometry = entry.pointLines.geometry;
+  const positionData = geometry.getAttribute('instanceStart')?.data || null;
+  const colorData = geometry.getAttribute('instanceColorStart')?.data || null;
+  const positions = positionData?.array || null;
+  const colors = colorData?.array || null;
+  const baseEdges = entry.layer.edges;
+  const basePositions = entry.layer.points;
+  const edgeColors = entry.currentEdgeColors || null;
+  const sourceEdgeCount = Math.floor((baseEdges?.length || 0) / 2);
+  let edgeCount = 0;
+  for (let edgeIdx = 0; edgeIdx < sourceEdgeCount; edgeIdx += 1) {
+    if (edgePassMask && !edgePassMask[edgeIdx]) continue;
+    const i = baseEdges[edgeIdx * 2];
+    const j = baseEdges[edgeIdx * 2 + 1];
+    if (passMask && (!passMask[i] || !passMask[j])) continue;
+    const iBase = i * 3;
+    const jBase = j * 3;
+    const writeBase = edgeCount * 6;
+    if (
+      iBase + 2 >= basePositions.length
+      || jBase + 2 >= basePositions.length
+      || !positions
+      || writeBase + 5 >= positions.length
+    ) continue;
+    positions[writeBase] = basePositions[iBase];
+    positions[writeBase + 1] = basePositions[iBase + 1];
+    positions[writeBase + 2] = basePositions[iBase + 2];
+    positions[writeBase + 3] = basePositions[jBase];
+    positions[writeBase + 4] = basePositions[jBase + 1];
+    positions[writeBase + 5] = basePositions[jBase + 2];
+    if (colors && edgeColors && edgeColors.length >= (edgeIdx + 1) * 3) {
+      const colorBase = edgeIdx * 3;
+      const r = edgeColors[colorBase] / 255;
+      const g = edgeColors[colorBase + 1] / 255;
+      const b = edgeColors[colorBase + 2] / 255;
+      colors[writeBase] = r;
+      colors[writeBase + 1] = g;
+      colors[writeBase + 2] = b;
+      colors[writeBase + 3] = r;
+      colors[writeBase + 4] = g;
+      colors[writeBase + 5] = b;
+    }
+    edgeCount += 1;
+  }
+  if (positionData) positionData.needsUpdate = true;
+  if (colorData) colorData.needsUpdate = true;
+  geometry.instanceCount = edgeCount;
+  entry.pointLines.userData.edgeCount = edgeCount;
+  entry.unmaskedEdgeCount = edgeCount;
+}
+
+function setLayerEdgeField(entry, fieldIdx) {
+  const fieldCount = getEntryFieldCount(entry, 'edge');
+  if (fieldCount <= 0) return;
+  const nextIdx = Math.max(0, Math.min(fieldCount - 1, fieldIdx));
+  renderEntryColors(entry, nextIdx, 'edge');
+  updateColorbars();
 }
 
 function evaluateFieldRuleOnMask(entry, mask, rule, domain) {
@@ -1815,7 +2694,7 @@ function computeEntryPassMask(entry) {
     if (ruleScopeKeys.length === 0) continue;
     if (!isEntryWithinScope(entry, ruleScopeKeys, false)) continue;
     const domain = getRuleDomain(rule, ruleScopeKeys);
-    if (!domain) continue;
+    if (!domain || !isFilterRuleRestrictive(rule, domain)) continue;
     if (domain.kind === FILTER_POSITION) {
       evaluatePositionRuleOnMask(entry, mask, rule, domain);
     } else if (domain.kind === 'field') {
@@ -1825,31 +2704,248 @@ function computeEntryPassMask(entry) {
   return mask;
 }
 
+function computeEntryEdgePassMask(entry) {
+  const count = Math.floor((entry.layer.edges?.length || 0) / 2);
+  const mask = new Uint8Array(count);
+  mask.fill(1);
+  for (const rule of filterState.rules || []) {
+    const ruleScopeKeys = resolveScopeKeys(rule.scopeKeys, false);
+    if (ruleScopeKeys.length === 0 || !isEntryWithinScope(entry, ruleScopeKeys, false)) continue;
+    const domain = getRuleDomain(rule, ruleScopeKeys);
+    if (
+      !domain
+      || domain.kind !== 'edge-field'
+      || !isFilterRuleRestrictive(rule, domain)
+    ) continue;
+    const values = getEntryEdgeFieldValuesByName(entry, domain.fieldName);
+    const activeRange = rangeFromClip(domain.range, rule.scalarClip || createClipState());
+    if (!values || !activeRange) continue;
+    for (let idx = 0; idx < Math.min(values.length, mask.length); idx += 1) {
+      const value = Number(values[idx]);
+      if (!Number.isFinite(value) || value < activeRange.min || value > activeRange.max) mask[idx] = 0;
+    }
+  }
+  return mask;
+}
+
+function computeEntryFacePassMask(entry) {
+  const count = Math.floor((entry.layer.faces?.length || 0) / meshFaceSize(entry.layer));
+  const mask = new Uint8Array(count);
+  mask.fill(1);
+  for (const rule of filterState.rules || []) {
+    const ruleScopeKeys = resolveScopeKeys(rule.scopeKeys, false);
+    if (ruleScopeKeys.length === 0 || !isEntryWithinScope(entry, ruleScopeKeys, false)) continue;
+    const domain = getRuleDomain(rule, ruleScopeKeys);
+    if (
+      !domain
+      || domain.kind !== 'face-field'
+      || !isFilterRuleRestrictive(rule, domain)
+    ) continue;
+    const values = getEntryFaceFieldValuesByName(entry, domain.fieldName);
+    const activeRange = rangeFromClip(domain.range, rule.scalarClip || createClipState());
+    if (!values || !activeRange) continue;
+    for (let idx = 0; idx < Math.min(values.length, mask.length); idx += 1) {
+      const value = Number(values[idx]);
+      if (!Number.isFinite(value) || value < activeRange.min || value > activeRange.max) mask[idx] = 0;
+    }
+  }
+  return mask;
+}
+
+function computeEntryEdgeFacePassMask(entry, edgePassMask) {
+  const faceEdges = entry.layer.face_edges;
+  if (!edgePassMask || !faceEdges?.length) return null;
+  const faceSize = meshFaceSize(entry.layer);
+  const faceCount = Math.floor(entry.layer.faces.length / faceSize);
+  if (faceEdges.length < faceCount * faceSize) return null;
+  const mask = new Uint8Array(faceCount);
+  mask.fill(1);
+  const missingEdge = 0xffffffff;
+  for (let faceIdx = 0; faceIdx < faceCount; faceIdx += 1) {
+    const base = faceIdx * faceSize;
+    for (let localIdx = 0; localIdx < faceSize; localIdx += 1) {
+      const edgeIdx = faceEdges[base + localIdx];
+      if (edgeIdx !== missingEdge && !edgePassMask[edgeIdx]) {
+        mask[faceIdx] = 0;
+        break;
+      }
+    }
+  }
+  return mask;
+}
+
+function intersectPassMasks(first, second) {
+  if (!first) return second;
+  if (!second) return first;
+  const count = Math.min(first.length, second.length);
+  for (let idx = 0; idx < count; idx += 1) {
+    first[idx] = first[idx] && second[idx] ? 1 : 0;
+  }
+  return first;
+}
+
+function getEntryFilterActivity(entry) {
+  let point = false;
+  let edge = false;
+  let face = false;
+  for (const rule of filterState.rules || []) {
+    const ruleScopeKeys = resolveScopeKeys(rule.scopeKeys, false);
+    if (ruleScopeKeys.length === 0 || !isEntryWithinScope(entry, ruleScopeKeys, false)) continue;
+    const domain = getRuleDomain(rule, ruleScopeKeys);
+    if (!domain || !isFilterRuleRestrictive(rule, domain)) continue;
+    if (domain.kind === FILTER_POSITION) {
+      point = true;
+    } else if (domain.kind === 'field' && getEntryFieldValuesByName(entry, domain.fieldName)) {
+      point = true;
+    } else if (
+      domain.kind === 'edge-field'
+      && getEntryEdgeFieldValuesByName(entry, domain.fieldName)
+    ) {
+      edge = true;
+    } else if (
+      domain.kind === 'face-field'
+      && getEntryFaceFieldValuesByName(entry, domain.fieldName)
+    ) {
+      face = true;
+    }
+  }
+  return { point, edge, face };
+}
+
 function applyFiltersToEntry(entry) {
   if (!entry) return;
   const colors = entry.currentColors || decodeArraySpec(entry.layer.colors, Uint8Array) || new Uint8Array(0);
-  const passMask = computeEntryPassMask(entry);
+  const activity = getEntryFilterActivity(entry);
+  const usesFaceColors = entry.layerKind === 'mesh'
+    && entry.activeSurfaceAssociation === 'face'
+    && entry.currentFaceColors;
+
+  // The overwhelmingly common display path has no filters. Rendering the
+  // original typed arrays directly avoids an O(N) mask, an N-element JS index
+  // list, and full copies of point positions/colors (or mesh indices).
+  if (!activity.point && !activity.edge && !activity.face) {
+    entry.passMask = null;
+    entry.edgePassMask = null;
+    entry.facePassMask = null;
+    if (entry.layerKind === 'pointcloud') {
+      if (entry.pointFilterActive) {
+        setPositionAttribute(entry.points.geometry, entry.layer.points);
+        setStoredColorAttribute(entry.points.geometry, colors);
+        entry.points.geometry.computeBoundingBox();
+        entry.points.geometry.computeBoundingSphere();
+        setPositionAttribute(entry.maskedPoints.geometry, new Float32Array(0));
+        setStoredColorAttribute(entry.maskedPoints.geometry, new Uint8Array(0));
+        entry.points.userData.sourceIndices = null;
+      } else {
+        setStoredColorAttribute(entry.points.geometry, colors);
+      }
+      entry.unmaskedPointCount = getEntryElementCount(entry);
+      entry.maskedPointCount = 0;
+      if (entry.pointLines && entry.filterActive) {
+        updatePointLinesFromMask(entry, null, null);
+      }
+    } else {
+      const faceSize = meshFaceSize(entry.layer);
+      if (usesFaceColors) {
+        setMeshFaceColorMode(entry, true);
+        setFlatFaceGeometry(entry.mesh, entry.layer, null, entry.currentFaceColors);
+      } else {
+        restoreIndexedMeshGeometry(entry, colors);
+        setIndexAttribute(entry.mesh.geometry, triangulateFaces(entry.layer.faces, faceSize));
+        refreshMeshBounds(entry.mesh.geometry, !entry.layer.unlit);
+      }
+      if (entry.filterActive || usesFaceColors) {
+        setPositionAttribute(entry.maskedMesh.geometry, new Float32Array(0));
+        setStoredColorAttribute(entry.maskedMesh.geometry, new Uint8Array(0));
+        setIndexAttribute(entry.maskedMesh.geometry, new Uint32Array(0));
+        entry.maskedMesh.geometry.deleteAttribute('uv');
+      }
+      entry.unmaskedFaceCount = Math.floor(entry.layer.faces.length / meshFaceSize(entry.layer));
+      entry.maskedFaceCount = 0;
+      if (entry.vertexPoints || entry.maskedVertexPoints) {
+        ensureMeshVertexPoints(entry);
+      }
+    }
+    const wasFiltered = entry.filterActive;
+    entry.filterActive = false;
+    entry.pointFilterActive = false;
+    entry.edgeFilterActive = false;
+    entry.faceFilterActive = false;
+    if (entry.layerKind === 'mesh' && (wasFiltered || entry.layer.edges?.length)) {
+      updateMeshEdgeLinesFromGeometry(entry);
+    }
+    updateEntryOpacity(entry, entry.opacity);
+    updateEntryEdgeOverlay(entry);
+    return;
+  }
+
+  const wasPointFilterActive = Boolean(entry.pointFilterActive);
+  const passMask = activity.point ? computeEntryPassMask(entry) : null;
+  const edgePassMask = activity.edge ? computeEntryEdgePassMask(entry) : null;
+  let facePassMask = activity.face ? computeEntryFacePassMask(entry) : null;
+  if (activity.edge && entry.layerKind === 'mesh') {
+    facePassMask = intersectPassMasks(
+      facePassMask,
+      computeEntryEdgeFacePassMask(entry, edgePassMask),
+    );
+  }
   entry.passMask = passMask;
+  entry.edgePassMask = edgePassMask;
+  entry.facePassMask = facePassMask;
+  entry.filterActive = true;
+  entry.pointFilterActive = activity.point;
+  entry.edgeFilterActive = activity.edge;
+  entry.faceFilterActive = Boolean(facePassMask);
 
   if (entry.layerKind === 'pointcloud') {
-    const unmaskedIndices = collectMaskIndices(passMask, true);
-    const maskedIndices = collectMaskIndices(passMask, false);
-    setPointObjectSubset(entry, entry.points, unmaskedIndices, 'unmasked');
-    setPointObjectSubset(entry, entry.maskedPoints, maskedIndices, 'masked');
-    entry.unmaskedPointCount = unmaskedIndices.length;
-    entry.maskedPointCount = maskedIndices.length;
-    updatePointLinesFromMask(entry, passMask);
+    if (activity.point) {
+      const unmaskedIndices = collectMaskIndices(passMask, true);
+      const maskedIndices = collectMaskIndices(passMask, false);
+      setPointObjectSubset(entry, entry.points, unmaskedIndices, 'unmasked');
+      setPointObjectSubset(entry, entry.maskedPoints, maskedIndices, 'masked');
+      entry.unmaskedPointCount = unmaskedIndices.length;
+      entry.maskedPointCount = maskedIndices.length;
+    } else {
+      if (wasPointFilterActive) {
+        setPositionAttribute(entry.points.geometry, entry.layer.points);
+        entry.points.geometry.computeBoundingBox();
+        entry.points.geometry.computeBoundingSphere();
+        setPositionAttribute(entry.maskedPoints.geometry, new Float32Array(0));
+        setStoredColorAttribute(entry.maskedPoints.geometry, new Uint8Array(0));
+        entry.points.userData.sourceIndices = null;
+      }
+      setStoredColorAttribute(entry.points.geometry, colors);
+      entry.unmaskedPointCount = getEntryElementCount(entry);
+      entry.maskedPointCount = 0;
+    }
+    updatePointLinesFromMask(entry, passMask, edgePassMask);
   } else {
-    setStoredColorAttribute(entry.mesh.geometry, colors);
-    setStoredColorAttribute(entry.maskedMesh.geometry, colors);
-    const splitFaces = splitMeshFacesByMask(entry.layer.faces, passMask);
-    setIndexAttribute(entry.mesh.geometry, splitFaces.unmaskedFaces);
-    refreshMeshBounds(entry.mesh.geometry);
-    setIndexAttribute(entry.maskedMesh.geometry, splitFaces.maskedFaces);
-    refreshMeshBounds(entry.maskedMesh.geometry);
-    entry.unmaskedFaceCount = Math.floor(splitFaces.unmaskedFaces.length / 3);
-    entry.maskedFaceCount = Math.floor(splitFaces.maskedFaces.length / 3);
-    updateMeshVertexPointSubsets(entry, passMask);
+    const faceSize = meshFaceSize(entry.layer);
+    const splitFaces = splitMeshFacesByMask(entry.layer.faces, passMask, faceSize, facePassMask);
+    if (usesFaceColors) {
+      setMeshFaceColorMode(entry, true);
+      setFlatFaceGeometry(entry.mesh, entry.layer, splitFaces.unmaskedFaceIndices, entry.currentFaceColors);
+      setFlatFaceGeometry(entry.maskedMesh, entry.layer, splitFaces.maskedFaceIndices, entry.currentFaceColors);
+    } else {
+      restoreIndexedMeshGeometry(entry, colors);
+      setPositionAttribute(entry.maskedMesh.geometry, entry.layer.vertices);
+      setStoredColorAttribute(entry.maskedMesh.geometry, colors);
+      if (entry.layer.texture?.uv) {
+        entry.maskedMesh.geometry.setAttribute('uv', new THREE.BufferAttribute(entry.layer.texture.uv, 2));
+      }
+      setIndexAttribute(entry.mesh.geometry, triangulateFaces(splitFaces.unmaskedFaces, faceSize));
+      refreshMeshBounds(entry.mesh.geometry, !entry.layer.unlit);
+      setIndexAttribute(entry.maskedMesh.geometry, triangulateFaces(splitFaces.maskedFaces, faceSize));
+      refreshMeshBounds(entry.maskedMesh.geometry, !entry.layer.unlit);
+    }
+    entry.unmaskedFaceCount = Math.floor(splitFaces.unmaskedFaces.length / faceSize);
+    entry.maskedFaceCount = Math.floor(splitFaces.maskedFaces.length / faceSize);
+    if (passMask) {
+      updateMeshVertexPointSubsets(entry, passMask);
+    } else if (wasPointFilterActive && (entry.vertexPoints || entry.maskedVertexPoints)) {
+      entry.passMask = null;
+      ensureMeshVertexPoints(entry);
+    }
     updateMeshEdgeLinesFromGeometry(entry);
   }
 
@@ -1862,6 +2958,15 @@ function applyFiltersToAllEntries() {
     applyFiltersToEntry(entry);
   }
   requestRenderAndHover();
+}
+
+function requestApplyFiltersToAllEntries() {
+  if (filterApplyQueued) return;
+  filterApplyQueued = true;
+  window.requestAnimationFrame(() => {
+    filterApplyQueued = false;
+    applyFiltersToAllEntries();
+  });
 }
 
 function formatFilterValue(value) {
@@ -1951,9 +3056,14 @@ function pickDefaultRuleProperty(scopeKeys = null) {
 }
 
 function onFilterRulesUpdated() {
-  applyFiltersToAllEntries();
   updateFilterPanelUI();
   hideHoverTooltip();
+  const needsFilterUpdate = layers.some((entry) => {
+    if (entry.filterActive) return true;
+    const activity = getEntryFilterActivity(entry);
+    return activity.point || activity.edge || activity.face;
+  });
+  if (needsFilterUpdate) requestApplyFiltersToAllEntries();
 }
 
 function updateFilterPanelUI() {
@@ -2073,7 +3183,7 @@ function updateFilterPanelUI() {
             range: domain.ranges[axis],
             label: `Position ${axis.toUpperCase()}`,
             onChanged: () => {
-              applyFiltersToAllEntries();
+              requestApplyFiltersToAllEntries();
               hideHoverTooltip();
             },
           });
@@ -2089,7 +3199,7 @@ function updateFilterPanelUI() {
           range: domain.range,
           label: domain.fieldName,
           onChanged: () => {
-            applyFiltersToAllEntries();
+            requestApplyFiltersToAllEntries();
             hideHoverTooltip();
           },
         }));
@@ -2209,7 +3319,7 @@ function fitCamera() {
   requestRenderAndHover();
 }
 
-function createCmapDropdown(entry, fieldIdx, controlsEnabled) {
+function createCmapDropdown(entry, fieldIdx, controlsEnabled, association = 'vertex') {
   const dropdownWrap = document.createElement('div');
   dropdownWrap.className = 'layer-select-wrapper layer-field-controls';
   const controls = document.createElement('div');
@@ -2225,8 +3335,8 @@ function createCmapDropdown(entry, fieldIdx, controlsEnabled) {
   button.type = 'button';
   button.className = 'layer-select-button cmap-dropdown-button';
   button.disabled = !controlsEnabled;
-  const options = getEntryColorModeOptions(entry, fieldIdx);
-  const currentCmap = options.includes(getEntryCmap(entry, fieldIdx)) ? getEntryCmap(entry, fieldIdx) : UNIFORM_CMAP;
+  const options = getEntryColorModeOptions(entry, fieldIdx, association);
+  const currentCmap = options.includes(getEntryCmap(entry, fieldIdx, association)) ? getEntryCmap(entry, fieldIdx, association) : UNIFORM_CMAP;
   setCmapButtonContent(button, currentCmap);
   const menu = document.createElement('div');
   menu.className = 'custom-dropdown-menu';
@@ -2251,13 +3361,13 @@ function createCmapDropdown(entry, fieldIdx, controlsEnabled) {
   const selectCmap = (cmapName) => {
     if (!controlsEnabled) return;
     const nextCmap = options.includes(cmapName) ? cmapName : UNIFORM_CMAP;
-    setLayerCmap(entry, nextCmap);
+    setLayerCmap(entry, nextCmap, association);
     updateCmapControls(nextCmap);
   };
 
   const moveCmap = (delta) => {
     if (!controlsEnabled) return;
-    const currentIdx = Math.max(0, options.indexOf(getEntryCmap(entry, fieldIdx)));
+    const currentIdx = Math.max(0, options.indexOf(getEntryCmap(entry, fieldIdx, association)));
     const nextIdx = Math.max(0, Math.min(options.length - 1, currentIdx + delta));
     if (nextIdx === currentIdx) return;
     closeDropdownMenu(menu);
@@ -2271,7 +3381,7 @@ function createCmapDropdown(entry, fieldIdx, controlsEnabled) {
     if (cmapName === currentCmap) item.classList.add('selected');
     const prefix = document.createElement('span');
     prefix.className = 'cmap-dropdown-prefix';
-    prefix.appendChild(createCmapSwatch(entry, fieldIdx, cmapName));
+    prefix.appendChild(createCmapSwatch(entry, fieldIdx, cmapName, association));
     item.appendChild(prefix);
     const value = document.createElement('span');
     value.className = 'layer-id';
@@ -2307,14 +3417,24 @@ function createCmapDropdown(entry, fieldIdx, controlsEnabled) {
   return { dropdownWrap, currentCmap };
 }
 
-function createEntryFieldPanel(entry) {
-  const fieldIdx = entry.activeFieldIdx ?? 0;
-  const fieldNames = entry.layer.field_names || null;
-  const meta = getScalarMeta(entry, fieldIdx);
-  if (!meta && !entry.layer?.texture) return null;
+function getAssociationLabel(entry, association) {
+  if (association === 'edge') return 'Edge';
+  if (association === 'face') return meshFaceSize(entry.layer) === 3 ? 'Triangle' : 'Face';
+  return entry.layerKind === 'pointcloud' ? 'Point' : 'Vertex';
+}
+
+function createEntryFieldPanel(entry, association = 'vertex') {
+  const state = getAssociationState(entry, association);
+  const fieldIdx = state.activeFieldIdx ?? 0;
+  const fieldNames = getAssociationFieldData(entry, association).names;
+  const meta = getScalarMeta(entry, fieldIdx, association);
+  const rawColors = getEntryRawColors(entry, fieldIdx, association);
+  const hasDirectColors = rawColors && typeof rawColors.length === 'number' && rawColors.length > 0;
+  if (!meta && !entry.layer?.texture && !hasDirectColors) return null;
 
   const fieldLabel = fieldNames ? fieldNames[fieldIdx] : null;
-  const colorbarLabel = meta ? (fieldLabel ? `Field: ${fieldLabel}` : 'Field colors') : 'Color mode';
+  const associationLabel = getAssociationLabel(entry, association);
+  const colorbarLabel = meta ? (fieldLabel ? `${associationLabel}: ${fieldLabel}` : `${associationLabel} colors`) : `${associationLabel} color mode`;
   const controlsEnabled = entry.visible;
 
   const wrapper = document.createElement('div');
@@ -2322,10 +3442,22 @@ function createEntryFieldPanel(entry) {
   const title = document.createElement('div');
   title.className = 'colorbar-title';
   title.textContent = colorbarLabel;
-  const { dropdownWrap, currentCmap } = createCmapDropdown(entry, fieldIdx, controlsEnabled);
+  const { dropdownWrap, currentCmap } = createCmapDropdown(entry, fieldIdx, controlsEnabled, association);
   wrapper.appendChild(title);
   wrapper.appendChild(dropdownWrap);
   if (!meta) {
+    if (hasDirectColors) {
+      const visual = document.createElement('div');
+      visual.className = 'colorbar-visual';
+      const gradientWrap = document.createElement('div');
+      gradientWrap.className = 'colorbar-gradient-wrap';
+      const gradient = document.createElement('div');
+      gradient.className = 'colorbar-gradient';
+      gradient.style.background = gradientCss(getEntryRawGradient(entry, fieldIdx, association));
+      gradientWrap.appendChild(gradient);
+      visual.appendChild(gradientWrap);
+      wrapper.appendChild(visual);
+    }
     return wrapper;
   }
   const visual = document.createElement('div');
@@ -2333,7 +3465,7 @@ function createEntryFieldPanel(entry) {
   const distributionWrap = document.createElement('div');
   distributionWrap.className = 'colorbar-distribution-wrap';
   const distributionViz = buildDistributionSvg(
-    getEntryDisplayedValues(entry, fieldIdx),
+    getEntryDisplayedValues(entry, fieldIdx, association),
     { min: meta.fullMin, max: meta.fullMax },
   );
   const distribution = distributionViz ? distributionViz.svg : null;
@@ -2399,7 +3531,7 @@ function createEntryFieldPanel(entry) {
           setActiveClipHandle(clipSlider.dataset.activeHandle || 'max');
           return;
         }
-        const currentMeta = getScalarMeta(entry, fieldIdx);
+        const currentMeta = getScalarMeta(entry, fieldIdx, association);
         const clipState = currentMeta?.clipState || createClipState();
         const minPos = rect.width * clampUnit(clipState.minFrac, 0.0);
         const maxPos = rect.width * clampUnit(clipState.maxFrac, 1.0);
@@ -2433,7 +3565,7 @@ function createEntryFieldPanel(entry) {
       });
 
       const syncClipControl = () => {
-        const currentMeta = getScalarMeta(entry, fieldIdx);
+        const currentMeta = getScalarMeta(entry, fieldIdx, association);
         const clipState = currentMeta?.clipState || createClipState();
         const startPct = clampUnit(clipState.minFrac, 0.0) * 100.0;
         const endPct = clampUnit(clipState.maxFrac, 1.0) * 100.0;
@@ -2450,10 +3582,10 @@ function createEntryFieldPanel(entry) {
       };
 
       minInput.addEventListener('input', () => {
-        setColorClipBoundary(entry, fieldIdx, 'min', minInput.value);
+        setColorClipBoundary(entry, fieldIdx, 'min', minInput.value, association);
       });
       maxInput.addEventListener('input', () => {
-        setColorClipBoundary(entry, fieldIdx, 'max', maxInput.value);
+        setColorClipBoundary(entry, fieldIdx, 'max', maxInput.value, association);
       });
 
       wrapper.__syncClipControl = syncClipControl;
@@ -2471,10 +3603,12 @@ function createEntryFieldPanel(entry) {
 
 function updateColorbars() {
   for (const entry of layers) {
-    if (!entry.fieldOptionsContainer) continue;
-    entry.fieldOptionsContainer.innerHTML = '';
-    const panel = createEntryFieldPanel(entry);
-    if (panel) entry.fieldOptionsContainer.appendChild(panel);
+    const containers = entry.fieldOptionsContainers || {};
+    Object.entries(containers).forEach(([association, container]) => {
+      container.innerHTML = '';
+      const panel = createEntryFieldPanel(entry, association);
+      if (panel) container.appendChild(panel);
+    });
   }
 }
 
@@ -2499,11 +3633,20 @@ function updateInfoPanel() {
   if (facesNode) facesNode.textContent = totalFaces.toLocaleString();
 }
 
-function setLayerField(entry, fieldIdx) {
-  const fieldNames = entry.layer.field_names || null;
+function setLayerField(entry, fieldIdx, association = 'vertex') {
+  const fieldNames = getAssociationFieldData(entry, association).names;
   if (!fieldNames || fieldIdx < 0 || fieldIdx >= fieldNames.length) return;
-  renderEntryColors(entry, fieldIdx);
-  updateColorbars();
+  const previousSurfaceAssociation = entry.activeSurfaceAssociation;
+  renderEntryColors(entry, fieldIdx, association);
+  if (
+    entry.layerKind === 'mesh'
+    && association !== 'edge'
+    && previousSurfaceAssociation !== entry.activeSurfaceAssociation
+  ) {
+    rebuildLayerList();
+  } else {
+    updateColorbars();
+  }
 }
 
 function hideHoverTooltip() {
@@ -2665,22 +3808,28 @@ function updateHoverFromPointer() {
   for (const entry of layers) {
     if (!entry.visible) continue;
     const pointObjects = [entry.points, entry.maskedPoints, entry.vertexPoints, entry.maskedVertexPoints].filter((obj) => obj && obj.visible);
-    for (const obj of pointObjects) {
-      raycaster.params.Points.threshold = computePointHoverThreshold(rect.height, entry);
-      const hits = raycaster.intersectObject(obj, false);
-      const hit = pickBestPointHit(hits);
-      if (!hit) continue;
-      if (!best || hit.distance < best.hit.distance) {
-        best = { entry, hit };
+    if (getEntryElementCount(entry) <= MAX_INTERACTIVE_POINT_PICK_COUNT) {
+      for (const obj of pointObjects) {
+        raycaster.params.Points.threshold = computePointHoverThreshold(rect.height, entry);
+        const hits = raycaster.intersectObject(obj, false);
+        const hit = pickBestPointHit(hits);
+        if (!hit) continue;
+        if (!best || hit.distance < best.hit.distance) {
+          best = { entry, hit };
+        }
       }
     }
-    const meshObjects = [entry.mesh, entry.maskedMesh].filter((obj) => obj && obj.visible);
-    for (const obj of meshObjects) {
-      const hits = raycaster.intersectObject(obj, false);
-      const hit = (hits && hits.length > 0) ? hits[0] : null;
-      if (!hit) continue;
-      if (!best || hit.distance < best.hit.distance) {
-        best = { entry, hit };
+    const meshFaceCount = Number(entry.layer.face_count) || 0;
+    if (meshFaceCount <= MAX_INTERACTIVE_MESH_PICK_FACE_COUNT) {
+      const meshObjects = [entry.mesh, entry.maskedMesh].filter((obj) => obj && obj.visible);
+      for (const obj of meshObjects) {
+        ensureMeshBoundsTree(obj);
+        const hits = raycaster.intersectObject(obj, false);
+        const hit = (hits && hits.length > 0) ? hits[0] : null;
+        if (!hit) continue;
+        if (!best || hit.distance < best.hit.distance) {
+          best = { entry, hit };
+        }
       }
     }
   }
@@ -2688,6 +3837,30 @@ function updateHoverFromPointer() {
   if (!best) {
     hideHoverTooltip();
     return;
+  }
+
+  if (!best.hit.object?.isPoints && best.entry.activeFieldAssociation === 'face') {
+    const renderedTriangle = Number(best.hit.faceIndex ?? -1);
+    const trianglesPerFace = meshFaceSize(best.entry.layer) === 4 ? 2 : 1;
+    const subsetFaceIdx = Math.floor(renderedTriangle / trianglesPerFace);
+    const sourceFaceIndices = best.hit.object?.userData?.sourceFaceIndices || [];
+    const sourceFaceIdx = Number(sourceFaceIndices[subsetFaceIdx] ?? -1);
+    const faceState = getAssociationState(best.entry, 'face');
+    const faceData = getAssociationFieldData(best.entry, 'face');
+    const values = faceData.values?.[faceState.activeFieldIdx ?? 0] || null;
+    const color = formatHoverColorFromBytes(best.entry.currentFaceColors, sourceFaceIdx);
+    if (sourceFaceIdx >= 0 && color) {
+      const worldPoint = best.hit.point;
+      const value = values && sourceFaceIdx < values.length ? values[sourceFaceIdx] : null;
+      const fieldLabel = faceData.names?.[faceState.activeFieldIdx ?? 0] || null;
+      showHoverTooltip(pointerState.clientX, pointerState.clientY, {
+        layerLabel: `${best.entry.layer.label}${fieldLabel ? ` (${fieldLabel})` : ''}`,
+        xyz: `(${worldPoint.x.toFixed(4)}, ${worldPoint.y.toFixed(4)}, ${worldPoint.z.toFixed(4)})`,
+        color,
+        valueText: Number.isFinite(value) ? Number(value).toFixed(4) : 'n/a',
+      });
+      return;
+    }
   }
 
   let idx = -1;
@@ -2717,9 +3890,12 @@ function updateHoverFromPointer() {
     return;
   }
 
-  const fieldNames = best.entry.layer.field_names || null;
+  const vertexFieldActive = best.entry.activeFieldAssociation === 'vertex';
+  const fieldNames = vertexFieldActive ? (best.entry.layer.field_names || null) : null;
   const fieldLabel = fieldNames ? fieldNames[best.entry.activeFieldIdx ?? 0] : null;
-  const activeValues = best.entry.activeValues || best.entry.layer.values || null;
+  const activeValues = vertexFieldActive
+    ? (best.entry.activeValues || best.entry.layer.values || null)
+    : null;
   const value = activeValues && idx < activeValues.length ? activeValues[idx] : null;
   const valueText = (value === null || value === undefined || !Number.isFinite(value))
     ? 'n/a'
@@ -2800,6 +3976,7 @@ function appendPointLayerOptions(entry, optionGrid) {
       },
     }));
   }
+
 }
 
 function appendMeshLayerOptions(entry, optionGrid) {
@@ -2823,12 +4000,18 @@ function appendMeshLayerOptions(entry, optionGrid) {
   edgeToggleLabel.className = 'layer-option-toggle';
   const edgeToggleInput = document.createElement('input');
   edgeToggleInput.type = 'checkbox';
-  edgeToggleInput.checked = Boolean(entry.showEdges);
-  edgeToggleInput.disabled = !entry.visible;
+  edgeToggleInput.checked = shouldDisplayMeshEdges(entry);
+  edgeToggleInput.disabled = !entry.visible || isMeshEdgeFieldActive(entry);
   edgeToggleInput.addEventListener('change', () => {
+    if (isMeshEdgeFieldActive(entry)) return;
     entry.showEdges = edgeToggleInput.checked;
-    updateEntryEdgeOverlay(entry);
+    if (entry.showEdges && entry.filterActive && entry.layer.edges?.length) {
+      rebuildMeshEdgeOverlay(entry);
+    } else {
+      updateEntryEdgeOverlay(entry);
+    }
     rebuildLayerList();
+    requestRenderAndHover();
   });
   edgeToggleLabel.appendChild(edgeToggleInput);
   edgeToggleLabel.appendChild(document.createTextNode('Show edges'));
@@ -2854,7 +4037,11 @@ function appendMeshLayerOptions(entry, optionGrid) {
   toggleRow.appendChild(vertexToggleLabel);
   optionGrid.appendChild(toggleRow);
 
-  if (entry.edgeLines && entry.showEdges && entry.visible) {
+  if (
+    entry.edgeLines
+    && shouldDisplayMeshEdges(entry)
+    && entry.visible
+  ) {
     optionGrid.appendChild(createRangeOptionControl({
       labelText: 'Edge thickness',
       min: 1,
@@ -2887,24 +4074,30 @@ function appendMeshLayerOptions(entry, optionGrid) {
 }
 
 function appendShareScaleOption(entry, optionGrid) {
-  if (getEntryFieldCount(entry) <= 1) return;
+  const fieldCount = ['vertex', 'edge', 'face']
+    .reduce(
+      (total, association) => total + (hasEntryFields(entry, association) ? getEntryFieldCount(entry, association) : 0),
+      0,
+    );
+  if (fieldCount <= 1) return;
   const shareScaleLabel = document.createElement('label');
   shareScaleLabel.className = 'layer-option-toggle';
   const shareScaleInput = document.createElement('input');
   shareScaleInput.type = 'checkbox';
   shareScaleInput.checked = Boolean(entry.shareFieldScale);
-  shareScaleInput.disabled = !entry.visible || !getSharedFieldScaleRange(entry);
+  shareScaleInput.disabled = !entry.visible;
   shareScaleInput.addEventListener('change', () => {
     setLayerShareFieldScale(entry, shareScaleInput.checked);
   });
   shareScaleLabel.appendChild(shareScaleInput);
-  shareScaleLabel.appendChild(document.createTextNode('Share colormap scale across fields'));
+  shareScaleLabel.appendChild(document.createTextNode('Share scale within each element type'));
   optionGrid.appendChild(shareScaleLabel);
 }
 
-function createLayerFieldSelector(entry) {
-  const fieldNames = entry.layer.field_names || [];
+function createLayerFieldSelector(entry, association = 'vertex') {
+  const fieldNames = getAssociationFieldData(entry, association).names;
   if (fieldNames.length <= 1) return null;
+  const state = getAssociationState(entry, association);
 
   const wrap = document.createElement('div');
   wrap.className = 'layer-select-wrapper layer-field-controls';
@@ -2941,13 +4134,13 @@ function createLayerFieldSelector(entry) {
 
   const selectField = (fieldIdx) => {
     const nextFieldIdx = Math.max(0, Math.min(fieldNames.length - 1, fieldIdx));
-    setLayerField(entry, nextFieldIdx);
+    setLayerField(entry, nextFieldIdx, association);
     updateFieldControls(nextFieldIdx);
   };
 
   const moveField = (delta) => {
     if (!entry.visible) return false;
-    const currentIdx = entry.activeFieldIdx ?? 0;
+    const currentIdx = state.activeFieldIdx ?? 0;
     const nextIdx = Math.max(0, Math.min(fieldNames.length - 1, currentIdx + delta));
     if (nextIdx === currentIdx) return false;
     closeDropdownMenu(menu);
@@ -2980,7 +4173,7 @@ function createLayerFieldSelector(entry) {
   fieldNames.forEach((name, fieldIdx) => {
     const item = document.createElement('div');
     item.className = 'custom-dropdown-item';
-    if (fieldIdx === (entry.activeFieldIdx ?? 0)) item.classList.add('selected');
+    if (fieldIdx === (state.activeFieldIdx ?? 0)) item.classList.add('selected');
     const value = document.createElement('span');
     value.className = 'layer-id';
     value.textContent = name;
@@ -3020,7 +4213,7 @@ function createLayerFieldSelector(entry) {
     navButton.addEventListener('lostpointercapture', stopFieldRepeat);
   });
 
-  updateFieldControls(Math.max(0, Math.min(fieldNames.length - 1, entry.activeFieldIdx ?? 0)));
+  updateFieldControls(Math.max(0, Math.min(fieldNames.length - 1, state.activeFieldIdx ?? 0)));
   controls.appendChild(prevButton);
   dropdown.appendChild(button);
   dropdown.appendChild(menu);
@@ -3048,21 +4241,34 @@ function rebuildLayerList() {
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
     checkbox.checked = entry.visible;
-    checkbox.addEventListener('change', () => {
+    checkbox.disabled = entry.loading;
+    checkbox.addEventListener('change', async () => {
       entry.visible = checkbox.checked;
+      if (entry.visible && !entry.loaded) {
+        try {
+          await loadLayerEntry(entry);
+        } catch (error) {
+          console.error(`Failed to load layer ${entry.layer.label}`, error);
+        }
+      }
       if (entry.mesh) entry.mesh.visible = entry.visible;
+      if (entry.interactionProxy) entry.interactionProxy.visible = false;
       if (entry.points) entry.points.visible = entry.visible;
       updateMaskedObjectVisibility(entry);
       updateEntryEdgeOverlay(entry);
       rebuildLayerList();
       hideHoverTooltip();
+      requestRender();
     });
 
     const info = document.createElement('div');
     info.className = 'layer-main';
     const label = document.createElement('div');
     label.className = 'layer-label';
-    label.textContent = `${idx + 1}. ${entry.layer.label}`;
+    const loadState = entry.loading
+      ? ' (loading…)'
+      : (entry.loadError ? ' (load failed)' : '');
+    label.textContent = `${idx + 1}. ${entry.layer.label}${loadState}`;
     info.appendChild(label);
 
     if (hasFieldOptions) {
@@ -3100,17 +4306,49 @@ function rebuildLayerList() {
 
     controlsBody.appendChild(optionGrid);
 
-    const fieldSelector = createLayerFieldSelector(entry);
-    if (fieldSelector) controlsBody.appendChild(fieldSelector);
-
-    if (hasScalarOptions) {
+    entry.fieldOptionsContainers = {};
+    const associations = [];
+    if (hasEntryFields(entry, 'vertex')) associations.push('vertex');
+    if (hasEntryFields(entry, 'edge')) associations.push('edge');
+    if (hasEntryFields(entry, 'face')) associations.push('face');
+    associations.forEach((association) => {
+      const hasAssociationFields = getEntryFieldCount(entry, association) > 0;
+      if (!hasAssociationFields && association !== 'vertex') return;
+      const section = document.createElement('div');
+      section.className = `layer-field-section field-association-${association}`;
+      const heading = document.createElement('div');
+      heading.className = 'layer-field-association-title';
+      if (getEntryFieldCount(entry, association) > 0) {
+        const activeInput = document.createElement('input');
+        activeInput.type = 'radio';
+        activeInput.name = `active-viewer-field-${entry.layerId}`;
+        activeInput.dataset.layerId = String(entry.layerId);
+        activeInput.dataset.association = association;
+        activeInput.dataset.fieldAssociation = 'true';
+        activeInput.checked = entry.activeFieldAssociation === association;
+        activeInput.disabled = !entry.visible;
+        activeInput.addEventListener('click', (event) => {
+          event.preventDefault();
+          if (entry.activeFieldAssociation === association) {
+            clearEntryFieldDisplay(entry);
+          } else {
+            const state = getAssociationState(entry, association);
+            renderEntryColors(entry, state.activeFieldIdx ?? 0, association);
+          }
+          rebuildLayerList();
+        });
+        heading.appendChild(activeInput);
+      }
+      heading.appendChild(document.createTextNode(`${getAssociationLabel(entry, association)} fields`));
+      section.appendChild(heading);
+      const fieldSelector = createLayerFieldSelector(entry, association);
+      if (fieldSelector) section.appendChild(fieldSelector);
       const colorbarHost = document.createElement('div');
       colorbarHost.className = 'layer-colorbar-host';
-      controlsBody.appendChild(colorbarHost);
-      entry.fieldOptionsContainer = colorbarHost;
-    } else {
-      entry.fieldOptionsContainer = null;
-    }
+      section.appendChild(colorbarHost);
+      entry.fieldOptionsContainers[association] = colorbarHost;
+      controlsBody.appendChild(section);
+    });
 
     row.appendChild(checkbox);
     row.appendChild(info);
@@ -3141,16 +4379,21 @@ function updateToggleAllLayers() {
   toggleAll.indeterminate = visibleCount > 0 && visibleCount < layers.length;
 }
 
-function setAllLayersVisibility(visible) {
+async function setAllLayersVisibility(visible) {
   for (const entry of layers) {
     entry.visible = visible;
+    if (visible && !entry.loaded) {
+      await loadLayerEntry(entry);
+    }
     if (entry.mesh) entry.mesh.visible = visible;
+    if (entry.interactionProxy) entry.interactionProxy.visible = false;
     if (entry.points) entry.points.visible = visible;
     updateMaskedObjectVisibility(entry);
     updateEntryEdgeOverlay(entry);
   }
   rebuildLayerList();
   hideHoverTooltip();
+  requestRender();
 }
 
 document.addEventListener('click', (ev) => {
@@ -3159,10 +4402,104 @@ document.addEventListener('click', (ev) => {
   }
 });
 
-payload.layers.forEach((rawLayer, layerIdx) => {
-  const layer = normalizeLayerData(rawLayer);
-  const layerKind = getLayerKind(layer);
-  const built = layerKind === 'pointcloud' ? buildPoints(layer) : buildMesh(layer);
+function makeLayerPlaceholder(rawLayer, layerIdx) {
+  const layerKind = String(rawLayer.layer_kind || (rawLayer.points ? 'pointcloud' : 'mesh')).toLowerCase() === 'pointcloud'
+    ? 'pointcloud'
+    : 'mesh';
+  const layer = {
+    ...rawLayer,
+    vertices: new Float32Array(0),
+    faces: new Uint32Array(0),
+    points: new Float32Array(0),
+    edges: null,
+    colors: new Uint8Array(0),
+    raw_colors: new Uint8Array(0),
+    values: null,
+    field_names: null,
+    field_colors: null,
+    field_values: null,
+    field_scalar_meta: null,
+    edge_field_names: null,
+    edge_field_colors: null,
+    edge_field_values: null,
+    edge_field_scalar_meta: null,
+    face_field_names: null,
+    face_field_colors: null,
+    face_field_values: null,
+    face_field_scalar_meta: null,
+    scalar_meta: null,
+    texture: null,
+  };
+  return {
+    layer,
+    sourceLayer: rawLayer,
+    layerId: layerIdx,
+    layerKind,
+    loaded: false,
+    loading: false,
+    loadError: null,
+    mesh: null,
+    maskedMesh: null,
+    edgeLines: null,
+    vertexPoints: null,
+    maskedVertexPoints: null,
+    interactionProxy: null,
+    textureMap: null,
+    points: null,
+    maskedPoints: null,
+    pointLines: null,
+    visible: rawLayer.visible !== false,
+    activeFieldIdx: Number.isInteger(rawLayer.active_field_idx) ? rawLayer.active_field_idx : 0,
+    activeEdgeFieldIdx: Number.isInteger(rawLayer.active_edge_field_idx) ? rawLayer.active_edge_field_idx : 0,
+    activeFaceFieldIdx: Number.isInteger(rawLayer.active_face_field_idx) ? rawLayer.active_face_field_idx : 0,
+    activeValues: null,
+    activeCmap: rawLayer.active_cmap || UNIFORM_CMAP,
+    currentColors: new Uint8Array(0),
+    currentEdgeColors: null,
+    currentFaceColors: null,
+    activeFieldAssociation: null,
+    activeSurfaceAssociation: null,
+    faceColorMaterialActive: false,
+    unmaskedPointCount: 0,
+    maskedPointCount: 0,
+    unmaskedEdgeCount: 0,
+    unmaskedFaceCount: 0,
+    maskedFaceCount: 0,
+    fieldClipStates: [createClipState()],
+    sharedFieldClip: createClipState(),
+    shareFieldScale: Boolean(rawLayer.share_field_scale ?? payload.initial_share_field_scale),
+    opacity: clampOpacity(rawLayer.opacity ?? payload.opacity),
+    showEdges: layerKind === 'mesh' && rawLayer.show_edges === true,
+    showVertices: layerKind === 'mesh' && rawLayer.show_vertices === true,
+    edgeThickness: getLayerEdgeThickness(rawLayer),
+    pointSize: Math.min(12.0, Math.max(1.0, Number(rawLayer.point_size ?? payload.point_size) || 5.0)),
+    optionsExpanded: rawLayer.visible !== false,
+    filterActive: false,
+    edgePassMask: null,
+    facePassMask: null,
+    pointFilterActive: false,
+    edgeFilterActive: false,
+    faceFilterActive: false,
+    fieldOptionsContainer: null,
+    fieldLookup: new Map(),
+    edgeFieldLookup: new Map(),
+    faceFieldLookup: new Map(),
+    associationFieldStates: {},
+    fieldOptionsContainers: {},
+  };
+}
+
+async function loadLayerEntry(entry) {
+  if (entry.loaded || entry.loading) return;
+  entry.loading = true;
+  entry.loadError = null;
+  setLoadingStatus(`Loading ${entry.layer.label}…`);
+  rebuildLayerList();
+  try {
+    await hydrateLayerArrays(entry.sourceLayer);
+    const layer = normalizeLayerData(entry.sourceLayer);
+    const layerKind = getLayerKind(layer);
+    const built = layerKind === 'pointcloud' ? buildPoints(layer) : buildMesh(layer);
   const fieldMetas = layer.field_scalar_meta || null;
   const fieldValues = layer.field_values || null;
   const fieldColorCount = Array.isArray(layer.field_colors) ? layer.field_colors.length : 0;
@@ -3172,40 +4509,28 @@ payload.layers.forEach((rawLayer, layerIdx) => {
     Array.isArray(fieldMetas) ? fieldMetas.length : 0,
     fieldColorCount,
   );
-  const entry = {
-    layer,
-    layerId: layerIdx,
-    layerKind,
-    mesh: layerKind === 'mesh' ? built.mesh : null,
-    maskedMesh: layerKind === 'mesh' ? built.maskedMesh : null,
-    edgeLines: layerKind === 'mesh' ? built.edgeLines : null,
-    vertexPoints: null,
-    maskedVertexPoints: null,
-    textureMap: layerKind === 'mesh' ? built.textureMap : null,
-    points: layerKind === 'pointcloud' ? built.points : null,
-    maskedPoints: layerKind === 'pointcloud' ? built.maskedPoints : null,
-    pointLines: layerKind === 'pointcloud' ? built.lines : null,
-    visible: layer.visible !== false,
-    activeFieldIdx: Number.isInteger(layer.active_field_idx) ? layer.active_field_idx : 0,
-    activeValues: layer.values || null,
-    activeCmap: layer.active_cmap || (layer.scalar_meta && layer.scalar_meta.cmap) || UNIFORM_CMAP,
-    currentColors: decodeArraySpec(layer.colors, Uint8Array) || new Uint8Array(0),
-    unmaskedPointCount: layerKind === 'pointcloud' ? Math.floor(layer.points.length / 3) : 0,
-    maskedPointCount: 0,
-    unmaskedFaceCount: layerKind === 'mesh' ? Math.floor(layer.faces.length / 3) : 0,
-    maskedFaceCount: 0,
-    fieldClipStates: Array.from({ length: Math.max(fieldCount, 1) }, () => createClipState()),
-    sharedFieldClip: createClipState(),
-    shareFieldScale: Boolean(layer.share_field_scale ?? payload.initial_share_field_scale),
-    opacity: clampOpacity(layer.opacity ?? payload.opacity),
-    showEdges: layerKind === 'mesh' && layer.show_edges === true,
-    showVertices: layerKind === 'mesh' && layer.show_vertices === true,
-    edgeThickness: getLayerEdgeThickness(layer),
-    pointSize: Math.min(12.0, Math.max(1.0, Number(layer.point_size ?? payload.point_size) || 5.0)),
-    optionsExpanded: layer.visible !== false,
-    fieldOptionsContainer: null,
-    fieldLookup: new Map(),
-  };
+    Object.assign(entry, {
+      layer,
+      layerKind,
+      loaded: true,
+      mesh: layerKind === 'mesh' ? built.mesh : null,
+      maskedMesh: layerKind === 'mesh' ? built.maskedMesh : null,
+      edgeLines: layerKind === 'mesh' ? built.edgeLines : null,
+      textureMap: layerKind === 'mesh' ? built.textureMap : null,
+      points: layerKind === 'pointcloud' ? built.points : null,
+      maskedPoints: layerKind === 'pointcloud' ? built.maskedPoints : null,
+      pointLines: layerKind === 'pointcloud' ? built.lines : null,
+      activeValues: layer.values || null,
+      activeCmap: layer.active_cmap || (layer.scalar_meta && layer.scalar_meta.cmap) || UNIFORM_CMAP,
+      currentColors: decodeArraySpec(layer.colors, Uint8Array) || new Uint8Array(0),
+      currentEdgeColors: null,
+      currentFaceColors: null,
+      unmaskedPointCount: layerKind === 'pointcloud' ? Math.floor(layer.points.length / 3) : 0,
+      unmaskedEdgeCount: Math.floor((layer.edges?.length || 0) / 2),
+      unmaskedFaceCount: layerKind === 'mesh' ? Math.floor(layer.faces.length / meshFaceSize(layer)) : 0,
+      fieldClipStates: Array.from({ length: Math.max(fieldCount, 1) }, () => createClipState()),
+    });
+    entry.fieldLookup.clear();
   const fieldNamesForLookup = Array.isArray(layer.field_names) ? layer.field_names : [];
   if (Array.isArray(fieldValues)) {
     fieldNamesForLookup.forEach((name, idx) => {
@@ -3213,7 +4538,26 @@ payload.layers.forEach((rawLayer, layerIdx) => {
       if (values) entry.fieldLookup.set(String(name), values);
     });
   }
+  entry.edgeFieldLookup.clear();
+  const edgeFieldNamesForLookup = Array.isArray(layer.edge_field_names) ? layer.edge_field_names : [];
+  const edgeFieldValues = layer.edge_field_values || null;
+  if (Array.isArray(edgeFieldValues)) {
+    edgeFieldNamesForLookup.forEach((name, idx) => {
+      const values = edgeFieldValues[idx];
+      if (values) entry.edgeFieldLookup.set(String(name), values);
+    });
+  }
+  entry.faceFieldLookup.clear();
+  const faceFieldNamesForLookup = Array.isArray(layer.face_field_names) ? layer.face_field_names : [];
+  const faceFieldValues = layer.face_field_values || null;
+  if (Array.isArray(faceFieldValues)) {
+    faceFieldNamesForLookup.forEach((name, idx) => {
+      const values = faceFieldValues[idx];
+      if (values) entry.faceFieldLookup.set(String(name), values);
+    });
+  }
   if (entry.mesh) entry.mesh.visible = entry.visible;
+  if (entry.interactionProxy) entry.interactionProxy.visible = false;
   if (entry.maskedMesh) entry.maskedMesh.visible = false;
   if (entry.points) entry.points.visible = entry.visible;
   if (entry.maskedPoints) entry.maskedPoints.visible = false;
@@ -3229,8 +4573,6 @@ payload.layers.forEach((rawLayer, layerIdx) => {
     ensureMeshVertexPoints(entry);
   }
   updateEntryEdgeOverlay(entry);
-  layers.push(entry);
-
   const fieldNames = layer.field_names || null;
   let didRenderColors = false;
   if (fieldNames && fieldNames.length > 0) {
@@ -3243,22 +4585,64 @@ payload.layers.forEach((rawLayer, layerIdx) => {
   if (!didRenderColors) {
     applyFiltersToEntry(entry);
   }
+  } catch (error) {
+    entry.loadError = error instanceof Error ? error.message : String(error);
+    entry.visible = false;
+    setLoadingStatus(`Failed to load ${entry.layer.label}: ${entry.loadError}`, { error: true });
+    throw error;
+  } finally {
+    entry.loading = false;
+    rebuildLayerList();
+    if (!entry.loadError) setLoadingStatus('', { hidden: true });
+  }
+}
+
+payload.layers.forEach((rawLayer, layerIdx) => {
+  layers.push(makeLayerPlaceholder(rawLayer, layerIdx));
 });
+
+for (const entry of layers) {
+  if (entry.visible) await loadLayerEntry(entry);
+}
+setLoadingStatus('', { hidden: true });
 
 const toggleAllLayersInput = document.getElementById('toggle-all-layers');
 if (toggleAllLayersInput) {
   toggleAllLayersInput.addEventListener('change', () => {
-    setAllLayersVisibility(toggleAllLayersInput.checked);
+    void setAllLayersVisibility(toggleAllLayersInput.checked);
   });
 }
 
 initFilterPanelEvents();
-applyFiltersToAllEntries();
 rebuildLayerList();
 refreshEdgeOverlay();
 
 document.getElementById('btn-theme-mode').addEventListener('click', () => {
   applyThemeMode(!isDayMode);
+});
+const captureButton = document.getElementById('btn-capture');
+captureButton.addEventListener('click', async () => {
+  if (captureButton.disabled) return;
+  captureButton.disabled = true;
+  captureButton.classList.remove('captured');
+  captureButton.classList.add('capturing');
+  try {
+    const saved = await captureCurrentView();
+    if (saved) {
+      captureButton.classList.remove('capturing');
+      void captureButton.offsetWidth;
+      captureButton.classList.add('captured');
+      window.setTimeout(() => captureButton.classList.remove('captured'), 700);
+    }
+  } catch (error) {
+    if (error?.name !== 'AbortError') {
+      console.error('Failed to capture viewer image', error);
+      window.alert(`Could not save screenshot: ${error}`);
+    }
+  } finally {
+    captureButton.classList.remove('capturing');
+    captureButton.disabled = false;
+  }
 });
 const commandsToggleBtn = document.getElementById('btn-toggle-commands');
 const controlsPanel = document.getElementById('controls');
@@ -3291,12 +4675,150 @@ document.getElementById('btn-reset-camera').addEventListener('click', () => {
 controls.addEventListener('change', () => {
   scheduleHoverRefresh();
 });
+let cameraInteractionActive = false;
+let cameraInteractionEndTimer = 0;
+
+function beginCameraInteraction() {
+  clearTimeout(cameraInteractionEndTimer);
+  cameraInteractionActive = true;
+  for (const entry of layers) {
+    if (!entry.visible || !entry.mesh) continue;
+    const faceCount = Number(entry.layer.face_count) || 0;
+    if (faceCount <= MAX_INTERACTIVE_MESH_PICK_FACE_COUNT) continue;
+    const proxy = ensureMeshInteractionProxy(entry);
+    if (!proxy) continue;
+    entry.mesh.visible = false;
+    if (entry.maskedMesh) entry.maskedMesh.visible = false;
+    if (entry.edgeLines) entry.edgeLines.visible = false;
+    proxy.visible = true;
+  }
+  requestRender();
+}
+
+function finishCameraInteraction() {
+  cameraInteractionActive = false;
+  for (const entry of layers) {
+    if (entry.interactionProxy) entry.interactionProxy.visible = false;
+    if (entry.mesh) entry.mesh.visible = entry.visible;
+    updateMaskedObjectVisibility(entry);
+    updateEntryEdgeOverlay(entry);
+  }
+  requestRender();
+}
+
+function scheduleCameraInteractionEnd(delay = 120) {
+  clearTimeout(cameraInteractionEndTimer);
+  cameraInteractionEndTimer = window.setTimeout(finishCameraInteraction, delay);
+}
+
+async function captureCurrentView() {
+  if (cameraInteractionActive) finishCameraInteraction();
+  const titleSlug = String(payload.title || 'geoviz')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '') || 'geoviz';
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const filename = `${titleSlug}-${timestamp}.webp`;
+
+  let fileHandle = null;
+  if (typeof window.showSaveFilePicker === 'function') {
+    fileHandle = await window.showSaveFilePicker({
+      suggestedName: filename,
+      startIn: 'downloads',
+      types: [{
+        description: 'WebP image',
+        accept: { 'image/webp': ['.webp'] },
+      }],
+    });
+  } else {
+    const useDownload = window.confirm(
+      'This browser cannot open the system Save dialog. Save the screenshot through browser downloads instead?',
+    );
+    if (!useDownload) return false;
+  }
+
+  const { width, height } = getViewerViewportSize();
+  const context = renderer.getContext();
+  const maxRenderbufferSize = context.getParameter(context.MAX_RENDERBUFFER_SIZE);
+  const maxCapturePixels = 64_000_000;
+  const captureScale = Math.max(
+    1,
+    Math.min(
+      4,
+      maxRenderbufferSize / width,
+      maxRenderbufferSize / height,
+      Math.sqrt(maxCapturePixels / (width * height)),
+    ),
+  );
+  const captureWidth = Math.max(1, Math.floor(width * captureScale));
+  const captureHeight = Math.max(1, Math.floor(height * captureScale));
+  const previousPixelRatio = renderer.getPixelRatio();
+  let imageUrl;
+  try {
+    renderer.setPixelRatio(1);
+    renderer.setSize(captureWidth, captureHeight, false);
+    refreshLineMaterialResolutions(captureWidth, captureHeight);
+    controls.update();
+    renderer.render(scene, camera);
+    imageUrl = renderer.domElement.toDataURL('image/webp', 0.92);
+  } finally {
+    renderer.setSize(width, height, false);
+    renderer.setPixelRatio(previousPixelRatio);
+    refreshLineMaterialResolutions(width, height);
+    requestRender();
+  }
+
+  const imageBlob = await fetch(imageUrl).then((response) => response.blob());
+  if (fileHandle) {
+    const writable = await fileHandle.createWritable();
+    await writable.write(imageBlob);
+    await writable.close();
+    return true;
+  }
+
+  const download = document.createElement('a');
+  download.href = URL.createObjectURL(imageBlob);
+  download.download = filename;
+  document.body.appendChild(download);
+  download.click();
+  download.remove();
+  window.setTimeout(() => URL.revokeObjectURL(download.href), 0);
+  return true;
+}
+
+function stopStuckCameraDrag() {
+  const position = camera.position.clone();
+  const up = camera.up.clone();
+  const target = controls.target.clone();
+  const zoom = camera.zoom;
+  controls.reset();
+  camera.position.copy(position);
+  camera.up.copy(up);
+  camera.zoom = zoom;
+  camera.updateProjectionMatrix();
+  controls.target.copy(target);
+  controls.update();
+}
+
 renderer.domElement.addEventListener('pointermove', (event) => {
+  if (cameraInteractionActive && event.pointerType === 'mouse' && event.buttons === 0) {
+    stopStuckCameraDrag();
+    scheduleCameraInteractionEnd(0);
+  }
   pointerState.inside = true;
   pointerState.clientX = event.clientX;
   pointerState.clientY = event.clientY;
-  scheduleHoverRefresh();
+  requestRenderAndHover();
 });
+renderer.domElement.addEventListener('wheel', () => {
+  beginCameraInteraction();
+  scheduleCameraInteractionEnd();
+}, { passive: true });
+renderer.domElement.addEventListener('pointerdown', beginCameraInteraction);
+renderer.domElement.addEventListener('pointerup', () => scheduleCameraInteractionEnd());
+window.addEventListener('pointerup', () => scheduleCameraInteractionEnd());
+window.addEventListener('pointercancel', () => scheduleCameraInteractionEnd());
 renderer.domElement.addEventListener('pointerleave', () => {
   pointerState.inside = false;
   hideHoverTooltip();
@@ -3304,33 +4826,25 @@ renderer.domElement.addEventListener('pointerleave', () => {
 
 document.getElementById('btn-quit-top').addEventListener('click', async () => {
   try {
-    await fetch('/_shutdown', { method: 'POST' });
+    await fetch('_shutdown', { method: 'POST' });
   } catch (_err) {
   }
   window.close();
   window.location.href = 'about:blank';
 });
 
-window.addEventListener('resize', () => {
-  closeAllDropdownMenus();
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  refreshLineMaterialResolutions();
-  controls.handleResize?.();
-  requestRenderAndHover();
-});
-
 applyThemeMode(true);
-function animate() {
-  requestAnimationFrame(animate);
+function renderFrame() {
+  renderQueued = false;
   controls.update();
   renderer.render(scene, camera);
 }
-if (layers.length > 0) {
-  requestAnimationFrame(() => {
-    fitCamera();
-    renderer.render(scene, camera);
-  });
+function requestRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(renderFrame);
 }
-animate();
+controls.addEventListener('change', requestRender);
+syncViewerSize();
+if (layers.length > 0) fitCamera();
+requestRender();

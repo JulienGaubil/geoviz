@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import base64
+import gzip
 import os
+import shutil
 import tempfile
 import threading
 import webbrowser
@@ -23,8 +26,14 @@ except Exception:  # pragma: no cover - optional dependency in some environments
 
 
 @lru_cache(maxsize=None)
-def _read_asset_text(name: str) -> str:
+def _read_asset_text_version(name: str, mtime_ns: int) -> str:
+    del mtime_ns  # Included in the cache key so edited assets are reloaded.
     return (Path(__file__).with_name("assets") / name).read_text(encoding="utf-8")
+
+
+def _read_asset_text(name: str) -> str:
+    path = Path(__file__).with_name("assets") / name
+    return _read_asset_text_version(name, path.stat().st_mtime_ns)
 
 
 def _render_viewer_html(
@@ -55,6 +64,106 @@ def _to_numpy(x: np.ndarray | torch.Tensor | None) -> np.ndarray | None:
     if torch is not None and isinstance(x, torch.Tensor):
         return x.detach().cpu().numpy()
     return np.asarray(x)
+
+
+def _encode_array_payload(
+    arr: np.ndarray, *, dtype: np.dtype | str | None = None
+) -> dict[str, Any]:
+    """Encode a NumPy array without expanding it into Python/JSON numbers.
+
+    A nested ``tolist()`` representation is particularly costly for point
+    clouds: every float becomes a Python object and then a decimal JSON token.
+    The viewer consumes typed binary buffers, so keep geometry packed from
+    Python through JavaScript.
+    """
+    encoded = np.ascontiguousarray(arr, dtype=dtype)
+    return {
+        "encoding": "numpy",
+        "dtype": str(encoded.dtype),
+        "shape": list(encoded.shape),
+        "array": encoded,
+    }
+
+
+def _serialize_array_payloads(
+    value: Any,
+) -> Any:
+    """Embed typed arrays as independently compressed base64 chunks.
+
+    The RTX browser bridge copies viewer HTML to a local ``file://`` URL, so
+    geometry cannot depend on any server request. Small independent chunks
+    bound peak decoding memory while gzip keeps the transferred file compact.
+    """
+    if isinstance(value, dict) and value.get("encoding") == "numpy":
+        array = np.ascontiguousarray(value["array"])
+        spec = {
+            "dtype": str(array.dtype),
+            "shape": list(array.shape),
+        }
+        chunk_bytes = 4 * 1024 * 1024
+        chunks = []
+        raw = memoryview(array).cast("B")
+        for start in range(0, array.nbytes, chunk_bytes):
+            end = min(start + chunk_bytes, array.nbytes)
+            compressed = gzip.compress(raw[start:end], compresslevel=1)
+            chunks.append(base64.b64encode(compressed).decode("ascii"))
+        spec.update(
+            encoding="gzip-base64-chunks",
+            chunks=chunks,
+            nbytes=int(array.nbytes),
+        )
+        return spec
+    if isinstance(value, dict):
+        return {
+            key: _serialize_array_payloads(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _serialize_array_payloads(item)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return [
+            _serialize_array_payloads(item)
+            for item in value
+        ]
+    return value
+
+
+def _serialize_array_payloads_to_files(
+    value: Any, directory: Path
+) -> Any:
+    """Store packed arrays beside server-mode HTML for lazy browser loading."""
+    directory.mkdir(parents=True, exist_ok=True)
+    next_id = 0
+
+    def serialize(item: Any) -> Any:
+        nonlocal next_id
+        if isinstance(item, dict) and item.get("encoding") == "numpy":
+            array = np.ascontiguousarray(item["array"])
+            name = f"array_{next_id:05d}.bin"
+            next_id += 1
+            path = directory / name
+            with path.open("wb") as handle:
+                if array.nbytes:
+                    handle.write(memoryview(array).cast("B"))
+            return {
+                "encoding": "raw-url",
+                "dtype": str(array.dtype),
+                "shape": list(array.shape),
+                "url": f"{directory.name}/{name}",
+                "nbytes": int(array.nbytes),
+            }
+        if isinstance(item, dict):
+            return {key: serialize(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [serialize(child) for child in item]
+        if isinstance(item, tuple):
+            return [serialize(child) for child in item]
+        return item
+
+    return serialize(value)
 
 
 def _sample_cmap(cmap: str, n: int = 7) -> list[str]:
@@ -233,16 +342,24 @@ def _collect_layer_cmaps(layers: list[dict[str, Any]]) -> list[str]:
         scalar_meta = layer.get("scalar_meta")
         if isinstance(scalar_meta, Mapping):
             cmap_name = scalar_meta.get("cmap")
-            if isinstance(cmap_name, str):
+            if isinstance(cmap_name, str) and cmap_name not in {"uniform", "texture"}:
                 preferred.append(cmap_name)
-        field_metas = layer.get("field_scalar_meta")
-        if isinstance(field_metas, list):
-            for meta in field_metas:
-                if not isinstance(meta, Mapping):
-                    continue
-                cmap_name = meta.get("cmap")
-                if isinstance(cmap_name, str):
-                    preferred.append(cmap_name)
+        for meta_key in (
+            "field_scalar_meta",
+            "edge_field_scalar_meta",
+            "face_field_scalar_meta",
+        ):
+            field_metas = layer.get(meta_key)
+            if isinstance(field_metas, list):
+                for meta in field_metas:
+                    if not isinstance(meta, Mapping):
+                        continue
+                    cmap_name = meta.get("cmap")
+                    if isinstance(cmap_name, str) and cmap_name not in {
+                        "uniform",
+                        "texture",
+                    }:
+                        preferred.append(cmap_name)
 
     ordered: list[str] = []
     seen: set[str] = set()
@@ -274,6 +391,7 @@ class ViewerFigureBase:
     _server: ThreadingHTTPServer | None = field(default=None, init=False, repr=False)
     _server_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _served_html_path: Path | None = field(default=None, init=False, repr=False)
+    _served_array_dir: Path | None = field(default=None, init=False, repr=False)
     _served_html_is_temp: bool = field(default=False, init=False, repr=False)
     _served_url: str | None = field(default=None, init=False, repr=False)
 
@@ -297,8 +415,9 @@ class ViewerFigureBase:
         }
 
     def to_html(self) -> str:
+        payload = _serialize_array_payloads(self._payload())
         return _render_viewer_html(
-            self._payload(),
+            payload,
             title=self.title or self.default_title,
             meta_names=self.html_meta_names,
         )
@@ -308,28 +427,23 @@ class ViewerFigureBase:
             fd, tmp_path = tempfile.mkstemp(prefix="pointcloud_viewer_", suffix=".html")
             os.close(fd)
             out = Path(tmp_path)
-            out.write_text(self.to_html(), encoding="utf-8")
-            return out
-        out = Path(path)
+        else:
+            out = Path(path)
         out.write_text(self.to_html(), encoding="utf-8")
         return out
 
     def _notebook_iframe_html(
         self,
         *,
+        url: str | None = None,
         width: int | str = "100%",
         height: int = 760,
     ) -> str:
         width_css = f"{width}px" if isinstance(width, int) else str(width)
-        html_content = self.to_html()
-        srcdoc = (
-            html_content
-            .replace("&", "&amp;")
-            .replace('"', "&quot;")
-        )
+        viewer_url = url or self._serve()
         return (
             f'<div style="width:{width_css};max-width:100%;">'
-            f'<iframe srcdoc="{srcdoc}"'
+            f'<iframe src="{escape(viewer_url)}"'
             f' style="display:block;width:100%;height:{int(height)}px;border:0;border-radius:8px;"'
             f' referrerpolicy="no-referrer"'
             f' sandbox="allow-scripts allow-same-origin">'
@@ -337,15 +451,51 @@ class ViewerFigureBase:
             f'</div>'
         )
 
+    def _notebook_embedded_iframe_html(
+        self,
+        *,
+        width: int | str = "100%",
+        height: int = 760,
+    ) -> str:
+        """Return a kernel-independent notebook iframe with embedded arrays."""
+        width_css = f"{width}px" if isinstance(width, int) else str(width)
+        document = escape(self.to_html(), quote=True)
+        return (
+            f'<div style="width:{width_css};max-width:100%;">'
+            f'<iframe srcdoc="{document}"'
+            f' style="display:block;width:100%;height:{int(height)}px;border:0;border-radius:8px;"'
+            f' sandbox="allow-scripts">'
+            f'</iframe>'
+            f'</div>'
+        )
+
     def _repr_html_(self) -> str:
-        return self._notebook_iframe_html()
+        return self._notebook_embedded_iframe_html()
 
     def _serve(self, host: str = "127.0.0.1", port: int = 0, path: str | Path | None = None) -> str:
         if self._server is not None:
             self.close_server()
 
         is_temp_html = path is None
-        html_path = self._write_html(path=path)
+        if path is None:
+            fd, tmp_path = tempfile.mkstemp(prefix="pointcloud_viewer_", suffix=".html")
+            os.close(fd)
+            html_path = Path(tmp_path)
+        else:
+            html_path = Path(path)
+
+        array_dir = Path(
+            tempfile.mkdtemp(prefix=f"{html_path.stem}_arrays_", dir=html_path.parent)
+        )
+        payload = _serialize_array_payloads_to_files(self._payload(), array_dir)
+        html_path.write_text(
+            _render_viewer_html(
+                payload,
+                title=self.title or self.default_title,
+                meta_names=self.html_meta_names,
+            ),
+            encoding="utf-8",
+        )
         viewer = self
         server_ref: dict[str, ThreadingHTTPServer | None] = {"server": None}
 
@@ -387,6 +537,7 @@ class ViewerFigureBase:
         self._server = server
         self._server_thread = thread
         self._served_html_path = html_path
+        self._served_array_dir = array_dir
         self._served_html_is_temp = is_temp_html
         self._served_url = f"http://{host}:{server.server_port}/{html_path.name}"
         return self._served_url
@@ -394,6 +545,7 @@ class ViewerFigureBase:
     def close_server(self) -> None:
         served_html_path = self._served_html_path
         served_html_is_temp = self._served_html_is_temp
+        served_array_dir = self._served_array_dir
 
         if self._server is not None:
             self._server.shutdown()
@@ -408,8 +560,11 @@ class ViewerFigureBase:
                 served_html_path.unlink(missing_ok=True)
             except Exception:
                 pass
+        if served_array_dir is not None:
+            shutil.rmtree(served_array_dir, ignore_errors=True)
 
         self._served_html_path = None
+        self._served_array_dir = None
         self._served_html_is_temp = False
         self._served_url = None
 
@@ -460,7 +615,14 @@ class ViewerFigureBase:
             from IPython.display import HTML, display
 
             _ = notebook_proxy
-            display(HTML(self._notebook_iframe_html(width=width, height=height)))
+            display(
+                HTML(
+                    self._notebook_embedded_iframe_html(
+                        width=width,
+                        height=height,
+                    )
+                )
+            )
             return None
 
         url = self._serve(host=host, port=port, path=path)
