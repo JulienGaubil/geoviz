@@ -109,14 +109,27 @@ def _prepare_layer(
 
     edge_keep_mask: np.ndarray | None = None
     if edg is not None:
-        edge_keep_mask = (
-            (edg >= 0).all(axis=1)
-            & (edg < valid_mask.shape[0]).all(axis=1)
+        all_vertices_valid = bool(np.all(valid_mask))
+        all_edges_in_range = (
+            len(edg) == 0
+            or (int(edg.min()) >= 0 and int(edg.max()) < valid_mask.shape[0])
         )
-        if np.any(edge_keep_mask):
-            in_range_edges = edg[edge_keep_mask]
-            edge_keep_mask[edge_keep_mask] &= valid_mask[in_range_edges].all(axis=1)
-        edg = _remap_filtered_indices(edg, valid_mask)
+        if all_vertices_valid and all_edges_in_range:
+            # The common large-graph path needs no filtering or reindexing.
+            # Avoid multiple full edge-array copies and allocate a keep mask
+            # only when edge scalar fields actually need one.
+            edg = edg.astype(np.int32, copy=False)
+            if edge_scalar_fields is not None:
+                edge_keep_mask = np.ones(len(edg), dtype=bool)
+        else:
+            edge_keep_mask = (
+                (edg >= 0).all(axis=1)
+                & (edg < valid_mask.shape[0]).all(axis=1)
+            )
+            if np.any(edge_keep_mask):
+                in_range_edges = edg[edge_keep_mask]
+                edge_keep_mask[edge_keep_mask] &= valid_mask[in_range_edges].all(axis=1)
+            edg = _remap_filtered_indices(edg, valid_mask)
 
     encoded_edge_fields: list[
         tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]
@@ -179,15 +192,29 @@ def _prepare_layer(
         else _encode_array_payload(raw_colors_uint8, dtype=np.uint8)
     )
 
+    # Keep large graph connectivity in independent buffers. The browser renders
+    # these as indexed line batches sharing one position buffer, avoiding the
+    # multi-gigabyte expanded edge-position allocation of wide-line geometry.
+    edge_chunks = None
+    encoded_edges = None
+    if edg is not None:
+        if edge_scalar_fields is None and edg.nbytes > 16 * 1024 * 1024:
+            chunk_rows = 1_000_000
+            edge_chunks = [
+                _encode_array_payload(edg[start : start + chunk_rows], dtype=np.uint32)
+                for start in range(0, len(edg), chunk_rows)
+            ]
+        else:
+            encoded_edges = _encode_array_payload(edg, dtype=np.uint32)
+
     layer = {
         "layer_kind": "pointcloud",
         "label": label,
         "points": _encode_array_payload(pts, dtype=np.float32),
         "colors": _encode_array_payload(colors_uint8, dtype=np.uint8),
         "raw_colors": raw_colors_payload,
-        "edges": (
-            None if edg is None else _encode_array_payload(edg, dtype=np.uint32)
-        ),
+        "edges": encoded_edges,
+        "edge_chunks": edge_chunks,
         "edge_thickness": 1.0,
         "edge_color": str(edge_color),
         "edge_field_names": [field[0] for field in encoded_edge_fields],

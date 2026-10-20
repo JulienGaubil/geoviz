@@ -183,7 +183,9 @@ def _prepare_face_scalar_fields(
     face_keep_mask: np.ndarray,
     cmap: Any,
 ) -> dict[str, Any]:
-    encoded: list[tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    encoded: list[
+        tuple[str, dict[str, Any], dict[str, Any], dict[str, Any], bool]
+    ] = []
     if face_scalar_fields is not None:
         if len(face_scalar_fields) == 0:
             raise ValueError("face_scalar_fields cannot be empty")
@@ -221,12 +223,20 @@ def _prepare_face_scalar_fields(
                 )
             colors = colors[face_keep_mask]
             scalar_values = scalar_values[face_keep_mask]
+            sorted_ascending = bool(
+                np.isfinite(scalar_values).all()
+                and (
+                    len(scalar_values) < 2
+                    or np.all(scalar_values[1:] >= scalar_values[:-1])
+                )
+            )
             encoded.append(
                 (
                     str(field_name),
                     _encode_array_payload(_to_uint8_rgb(colors), dtype=np.uint8),
                     _encode_array_payload(scalar_values, dtype=np.float32),
                     scalar_meta,
+                    sorted_ascending,
                 )
             )
     return {
@@ -234,6 +244,7 @@ def _prepare_face_scalar_fields(
         "face_field_colors": [field[1] for field in encoded],
         "face_field_values": [field[2] for field in encoded],
         "face_field_scalar_meta": [field[3] for field in encoded],
+        "face_field_sorted_ascending": [field[4] for field in encoded],
         "active_face_field_idx": 0,
     }
 

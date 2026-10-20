@@ -152,11 +152,10 @@ point and color.
 
 The viewer also loads hidden layers only when they are enabled, renders static
 views on demand instead of continuously, and avoids building filter copies,
-mesh edge buffers, and picking acceleration structures until those features are
-requested. Hover picking is disabled above one million points or one million
-mesh faces because large point raycasts and BVH construction otherwise block
-camera interaction; rendering, camera interaction, colors, and filtering remain
-available at full resolution.
+and mesh edge buffers until those features are requested. Hover inspection is
+removed: cursor movement performs no geometry picking, BVH construction, or
+redraw. Camera interaction, colors, and filtering remain available at full
+resolution. Rotation uses a separate GPU depth pick only on primary-button down.
 
 The default one-pixel mesh-edge overlay always follows the complete visible
 face topology, independently of the selected field. It reuses

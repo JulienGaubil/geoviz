@@ -3,11 +3,6 @@ import { TrackballControls } from 'three/addons/controls/TrackballControls.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
-import {
-  acceleratedRaycast,
-  computeBoundsTree,
-  disposeBoundsTree,
-} from 'three-mesh-bvh';
 
 const payload = JSON.parse(document.getElementById('viewer-payload').textContent);
 const loadingOverlay = document.getElementById('viewer-loading');
@@ -20,9 +15,6 @@ function setLoadingStatus(message, { hidden = false, error = false } = {}) {
 setLoadingStatus('Loading visible geometry…');
 const colormapPresets = payload.colormap_presets || {};
 const availableCmaps = payload.available_cmaps || Object.keys(colormapPresets);
-THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
-THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
-THREE.Mesh.prototype.raycast = acceleratedRaycast;
 const arrayCtors = {
   float32: Float32Array,
   uint8: Uint8Array,
@@ -98,6 +90,13 @@ async function hydrateLayerArrays(layer) {
   await Promise.all(directKeys.map(async (key) => {
     layer[key] = await hydrateArraySpec(layer[key]);
   }));
+  if (Array.isArray(layer.edge_chunks)) {
+    const hydratedChunks = [];
+    for (const chunk of layer.edge_chunks) {
+      hydratedChunks.push(await hydrateArraySpec(chunk));
+    }
+    layer.edge_chunks = hydratedChunks;
+  }
   for (const key of [
     'field_colors', 'field_values',
     'edge_field_colors', 'edge_field_values',
@@ -122,6 +121,9 @@ function normalizeLayerData(layer) {
     : 3;
   layer.points = decodeArraySpec(layer.points, Float32Array) || new Float32Array(0);
   layer.edges = decodeArraySpec(layer.edges, Uint32Array);
+  layer.edge_chunks = Array.isArray(layer.edge_chunks)
+    ? layer.edge_chunks.map((chunk) => decodeArraySpec(chunk, Uint32Array) || new Uint32Array(0))
+    : null;
   layer.face_edges = decodeArraySpec(layer.face_edges, Uint32Array);
   layer.colors = decodeArraySpec(layer.colors, Uint8Array) || new Uint8Array(0);
   layer.default_colors = decodeArraySpec(layer.default_colors, Uint8Array);
@@ -230,6 +232,47 @@ controls.zoomSpeed = 1.2;
 controls.panSpeed = 0.8;
 controls.dynamicDampingFactor = 0.15;
 controls.staticMoving = true;
+// Keyboard A/S/D mode overrides can get stuck when focus leaves the canvas.
+// Keep gesture selection explicit: primary drag rotates, secondary drag pans.
+controls.keys = [];
+
+// Trackball zoom normally shrinks the camera-target distance to zero. Keep
+// that orbit radius instead: the camera's dolly also translates its target.
+// Wrapping update preserves the stock wheel, middle-drag and pinch handling,
+// as well as rotation/panning. A new camera fit naturally establishes a new
+// radius because we measure it before each update, not once at startup.
+const trackballUpdate = controls.update.bind(controls);
+const dollyEye = new THREE.Vector3();
+// Keep the orbit anchor in world space, independently of the zoom target.
+let surfaceOrbitPivot = null;
+let surfaceOrbitDragging = false;
+const orbitOldPosition = new THREE.Vector3();
+const orbitOldQuaternion = new THREE.Quaternion();
+const orbitDelta = new THREE.Quaternion();
+const orbitCorrection = new THREE.Vector3();
+controls.update = function updateWithTranslatingZoomTarget() {
+  const previousRadius = camera.position.distanceTo(controls.target);
+  orbitOldPosition.copy(camera.position);
+  orbitOldQuaternion.copy(camera.quaternion);
+  trackballUpdate();
+  if (surfaceOrbitDragging && surfaceOrbitPivot) {
+    // Trackball rotates about its look-at target. Translate that rotation to
+    // the picked point without snapping the view toward an off-centre click.
+    orbitDelta.copy(camera.quaternion).multiply(orbitOldQuaternion.invert());
+    orbitCorrection.copy(orbitOldPosition).sub(surfaceOrbitPivot)
+      .applyQuaternion(orbitDelta).add(surfaceOrbitPivot).sub(camera.position);
+    camera.position.add(orbitCorrection);
+    controls.target.add(orbitCorrection);
+  }
+  dollyEye.subVectors(camera.position, controls.target);
+  const nextRadius = dollyEye.length();
+  if (
+    camera.isPerspectiveCamera && nextRadius > 0 && previousRadius > 0
+    && Math.abs(nextRadius - previousRadius) > previousRadius * 1e-10
+  ) {
+    controls.target.addScaledVector(dollyEye, (nextRadius - previousRadius) / nextRadius);
+  }
+};
 
 let viewerWidth = initialViewport.width;
 let viewerHeight = initialViewport.height;
@@ -244,7 +287,7 @@ function syncViewerSize({ closeMenus = false } = {}) {
   renderer.setSize(width, height, false);
   refreshLineMaterialResolutions();
   controls.handleResize?.();
-  requestRenderAndHover();
+  requestRender();
   return true;
 }
 
@@ -264,10 +307,6 @@ const layers = [];
 let isDayMode = false;
 let commandsVisible = true;
 const CLIP_SLIDER_MAX = 1000;
-const raycaster = new THREE.Raycaster();
-raycaster.firstHitOnly = true;
-const pointerNdc = new THREE.Vector2();
-const hoverTooltip = document.getElementById('hover-tooltip');
 const dropdownPortal = document.getElementById('dropdown-portal');
 const filterPanel = document.getElementById('filter-panel');
 const filterRulesList = document.getElementById('filter-rules-list');
@@ -285,22 +324,12 @@ keyLight.position.set(2.5, 3.5, 4.0);
 const rimLight = new THREE.DirectionalLight(0x93c5fd, 0.4);
 rimLight.position.set(-3.0, 1.5, -2.5);
 scene.add(ambientLight, hemisphereLight, keyLight, rimLight);
-const pointerState = {
-  inside: false,
-  clientX: 0,
-  clientY: 0,
-};
-let hoverRefreshQueued = false;
 let filterRuleCounter = 0;
 const FILTER_SLIDER_MAX = 1000;
 const FILTER_POSITION = 'position';
 const FILTER_SCOPE_ALL_KEY = '__all__';
-// THREE.Points raycasting is linear in the number of points. Keep rendering
-// fully lossless at larger scales, but avoid an O(N) scan on every pointer
-// movement once the cloud is beyond an interactive picking size.
-const MAX_INTERACTIVE_POINT_PICK_COUNT = 1000000;
-const MAX_INTERACTIVE_MESH_PICK_FACE_COUNT = 1000000;
 const MAX_MESH_INTERACTION_PROXY_POINTS = 10000;
+const MESH_INTERACTION_PROXY_FACE_THRESHOLD = 1000000;
 const MESH_EDGE_CHUNK_FACE_COUNT = 500000;
 const filterState = {
   open: false,
@@ -328,19 +357,6 @@ const pointFragmentShader = `
   }
 `;
 
-function scheduleHoverRefresh() {
-  if (!pointerState.inside || hoverRefreshQueued) return;
-  hoverRefreshQueued = true;
-  requestAnimationFrame(() => {
-    hoverRefreshQueued = false;
-    updateHoverFromPointer();
-  });
-}
-
-function requestRenderAndHover() {
-  requestRender();
-  scheduleHoverRefresh();
-}
 
 function clampUnit(value, fallback = 0.0) {
   const numeric = Number(value);
@@ -610,17 +626,8 @@ function refreshMeshBounds(geometry, computeNormals = true) {
   if (computeNormals) geometry.computeVertexNormals();
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
-  geometry.disposeBoundsTree?.();
 }
 
-function ensureMeshBoundsTree(object3d) {
-  const geometry = object3d?.geometry;
-  if (!geometry || geometry.boundsTree) return;
-  const index = geometry.getIndex();
-  if (index && index.count > 0) {
-    geometry.computeBoundsTree?.();
-  }
-}
 
 function createMeshMaterial({
   textureMap = null,
@@ -635,7 +642,7 @@ function createMeshMaterial({
       side: THREE.DoubleSide,
       transparent: masked || opacity < 0.999,
       opacity,
-      depthWrite: masked ? false : opacity >= 0.999,
+      depthWrite: !masked && opacity > 0,
       polygonOffset: true,
       polygonOffsetFactor: 1,
       polygonOffsetUnits: 1,
@@ -649,7 +656,7 @@ function createMeshMaterial({
       side: THREE.FrontSide,
       transparent: masked || opacity < 0.999,
       opacity,
-      depthWrite: masked ? false : opacity >= 0.999,
+      depthWrite: !masked && opacity > 0,
       polygonOffset: true,
       polygonOffsetFactor: 1,
       polygonOffsetUnits: 1,
@@ -660,7 +667,7 @@ function createMeshMaterial({
     side: THREE.DoubleSide,
     transparent: masked || opacity < 0.999,
     opacity,
-    depthWrite: masked ? false : opacity >= 0.999,
+    depthWrite: !masked && opacity > 0,
     polygonOffset: true,
     polygonOffsetFactor: 1,
     polygonOffsetUnits: 1,
@@ -764,6 +771,11 @@ function buildChunkedMeshTopologyEdges(entry) {
     const lines = new THREE.LineSegments(geometry, material);
     lines.frustumCulled = false;
     lines.renderOrder = 3;
+    // Keep the source-face interval so a sorted face-field filter can update
+    // the mesh and its topology edges with matching GPU draw ranges.
+    lines.userData.sourceFaceBegin = begin;
+    lines.userData.sourceFaceEnd = end;
+    lines.userData.segmentsPerFace = faceSize;
     group.add(lines);
     edgeCount += edgeIndices.length / 2;
   }
@@ -774,6 +786,9 @@ function buildChunkedMeshTopologyEdges(entry) {
   group.material = material;
   group.userData.wideEdges = false;
   group.userData.meshEdgeDomain = false;
+  group.userData.contiguousFullTopology = !(
+    entry.filterActive && (entry.passMask || entry.facePassMask)
+  );
   group.userData.edgeCount = edgeCount;
   group.visible = false;
   group.renderOrder = 3;
@@ -942,6 +957,43 @@ function ensureMeshInteractionProxy(entry) {
   return entry.interactionProxy;
 }
 
+function pointGraphEdgeCount(layer) {
+  if (Array.isArray(layer.edge_chunks)) {
+    return layer.edge_chunks.reduce(
+      (total, chunk) => total + Math.floor((chunk?.length || 0) / 2),
+      0,
+    );
+  }
+  return Math.floor((layer.edges?.length || 0) / 2);
+}
+
+function buildIndexedPointEdgeChunks(layer, positionAttribute) {
+  const chunks = Array.isArray(layer.edge_chunks) ? layer.edge_chunks : [];
+  if (chunks.length === 0) return null;
+  const material = new THREE.LineBasicMaterial({
+    color: new THREE.Color(layer.edge_color || '#000000'),
+    opacity: 1.0,
+    transparent: false,
+  });
+  const group = new THREE.Group();
+  group.material = material;
+  group.userData.indexedPointEdgeChunks = true;
+  group.userData.edgeCount = 0;
+  for (const indices of chunks) {
+    if (!indices?.length) continue;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', positionAttribute);
+    geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+    const lines = new THREE.LineSegments(geometry, material);
+    lines.frustumCulled = false;
+    group.add(lines);
+    group.userData.edgeCount += Math.floor(indices.length / 2);
+  }
+  group.frustumCulled = false;
+  scene.add(group);
+  return group;
+}
+
 function buildPoints(layer) {
   const geometry = new THREE.BufferGeometry();
   setPositionAttribute(geometry, layer.points);
@@ -980,8 +1032,8 @@ function buildPoints(layer) {
   maskedPoints.visible = false;
   scene.add(maskedPoints);
 
-  let lines = null;
-  if (layer.edges && layer.edges.length >= 2) {
+  let lines = buildIndexedPointEdgeChunks(layer, geometry.getAttribute('position'));
+  if (!lines && layer.edges && layer.edges.length >= 2) {
     const edgeThickness = getLayerEdgeThickness(layer);
     const edgeColors = layer.edge_field_colors?.[layer.active_edge_field_idx || 0] || null;
     const segmentData = buildPointEdgeSegmentData(layer, null, null, edgeColors);
@@ -1022,7 +1074,10 @@ function updateEntryOpacity(entry, opacity) {
   if (entry.mesh) {
     entry.mesh.material.opacity = nextOpacity;
     entry.mesh.material.transparent = nextOpacity < 0.999;
-    entry.mesh.material.depthWrite = nextOpacity >= 0.999;
+    // Keep the visible surface occluding hidden wire edges when fading it.
+    // Dropping depth writes at 0.999 made the first slider step behave like
+    // an X-ray mode. Only a fully hidden surface should stop writing depth.
+    entry.mesh.material.depthWrite = nextOpacity > 0;
     entry.mesh.material.needsUpdate = true;
   }
   if (entry.maskedMesh) {
@@ -1097,6 +1152,13 @@ function updateEntryEdgeOverlay(entry) {
     entry.edgeLines = buildMeshEdgeLines(entry);
     updateEntryEdgeThickness(entry, entry.edgeThickness);
   }
+  if (entry.sortedFaceFilterActive && entry.edgeLines) {
+    applySortedMeshEdgeDrawRange(
+      entry,
+      entry.sortedFaceFilterBegin,
+      entry.sortedFaceFilterEnd,
+    );
+  }
   if (entry.edgeLines) {
     const color = edgeColorHex();
     const displayedEdgeCount = Number(entry.edgeLines.userData.edgeCount)
@@ -1108,7 +1170,7 @@ function updateEntryEdgeOverlay(entry) {
     entry.edgeLines.material.color.setHex(hasEdgeColors ? 0xffffff : color);
     entry.edgeLines.material.vertexColors = hasEdgeColors;
     entry.edgeLines.material.needsUpdate = true;
-    entry.edgeLines.material.opacity = isDayMode ? 0.82 : 0.92;
+    entry.edgeLines.material.opacity = entry.edgeOpacity ?? (isDayMode ? 0.82 : 0.92);
   }
   if (entry.pointLines) {
     entry.pointLines.visible = entry.visible && (entry.unmaskedEdgeCount || 0) > 0;
@@ -1955,7 +2017,7 @@ function clearEntryFieldDisplay(entry, requestUpdate = true) {
   }
   applyFiltersToEntry(entry);
   syncActiveFieldRadios();
-  if (requestUpdate) requestRenderAndHover();
+  if (requestUpdate) requestRender();
 }
 
 function renderEntryColors(entry, fieldIdx = null, association = 'vertex') {
@@ -2008,7 +2070,7 @@ function renderEntryColors(entry, fieldIdx = null, association = 'vertex') {
   }
   applyFiltersToEntry(entry);
   syncActiveFieldRadios();
-  requestRenderAndHover();
+  requestRender();
 }
 
 function setLayerCmap(entry, cmapName, association = 'vertex') {
@@ -2039,7 +2101,6 @@ function setLayerShareFieldScale(entry, enabled) {
     renderEntryColors(entry, fieldIdx, association);
   }
   updateColorbars();
-  hideHoverTooltip();
 }
 
 function setColorClipBoundary(entry, fieldIdx, boundary, value, association = 'vertex') {
@@ -2055,7 +2116,6 @@ function setColorClipBoundary(entry, fieldIdx, boundary, value, association = 'v
     rebuildLayerList();
   }
   syncAllColorbarClipControls();
-  hideHoverTooltip();
 }
 
 function getEntryScopeKey(entry) {
@@ -2132,6 +2192,19 @@ function getEntryFaceFieldValuesByName(entry, fieldName) {
   return entry.faceFieldLookup.get(fieldName) || null;
 }
 
+function getEntryFieldRangeByName(entry, fieldName, association = 'vertex') {
+  const data = getAssociationFieldData(entry, association);
+  const fieldIdx = data.names.findIndex((name) => String(name) === String(fieldName));
+  if (fieldIdx < 0) return null;
+  const meta = data.metas?.[fieldIdx] || null;
+  const metaMin = Number(meta?.min);
+  const metaMax = Number(meta?.max);
+  if (Number.isFinite(metaMin) && Number.isFinite(metaMax)) {
+    return { min: metaMin, max: metaMax };
+  }
+  return computeFiniteValueRange(data.values?.[fieldIdx]);
+}
+
 function computeFiniteAxisRange(positions, axisIdx) {
   if (!positions || positions.length === 0) return null;
   let minVal = Infinity;
@@ -2176,9 +2249,7 @@ function computeScopeFieldRange(scopeKey, fieldName) {
   let maxVal = -Infinity;
   let hasValue = false;
   for (const entry of getScopedEntries(scopeKey, false)) {
-    const values = getEntryFieldValuesByName(entry, fieldName);
-    if (!values || values.length === 0) continue;
-    const range = computeFiniteValueRange(values);
+    const range = getEntryFieldRangeByName(entry, fieldName, 'vertex');
     if (!range) continue;
     hasValue = true;
     minVal = Math.min(minVal, range.min);
@@ -2193,9 +2264,7 @@ function computeScopeEdgeFieldRange(scopeKey, fieldName) {
   let maxVal = -Infinity;
   let hasValue = false;
   for (const entry of getScopedEntries(scopeKey, false)) {
-    const values = getEntryEdgeFieldValuesByName(entry, fieldName);
-    if (!values || values.length === 0) continue;
-    const range = computeFiniteValueRange(values);
+    const range = getEntryFieldRangeByName(entry, fieldName, 'edge');
     if (!range) continue;
     hasValue = true;
     minVal = Math.min(minVal, range.min);
@@ -2209,9 +2278,7 @@ function computeScopeFaceFieldRange(scopeKey, fieldName) {
   let maxVal = -Infinity;
   let hasValue = false;
   for (const entry of getScopedEntries(scopeKey, false)) {
-    const values = getEntryFaceFieldValuesByName(entry, fieldName);
-    if (!values || values.length === 0) continue;
-    const range = computeFiniteValueRange(values);
+    const range = getEntryFieldRangeByName(entry, fieldName, 'face');
     if (!range) continue;
     hasValue = true;
     minVal = Math.min(minVal, range.min);
@@ -2389,7 +2456,6 @@ function setPointObjectSubset(entry, object3d, sourceIndices, kind = 'unmasked',
   setStoredColorAttribute(geometry, subset.colors);
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
-  object3d.userData.sourceIndices = sourceIndices;
   object3d.userData.maskKind = kind;
 }
 
@@ -2424,29 +2490,123 @@ function updateMeshVertexPointSubsets(entry, passMask) {
   entry.maskedPointCount = maskedIndices.length;
 }
 
-function splitMeshFacesByMask(faces, vertexPassMask = null, faceSize = 3, facePassMask = null) {
-  const unmasked = [];
-  const masked = [];
-  const unmaskedFaceIndices = [];
-  const maskedFaceIndices = [];
+function splitMeshFacesByMask(
+  faces,
+  vertexPassMask = null,
+  faceSize = 3,
+  facePassMask = null,
+  { includeMasked = true, includeFaceIndices = true, includeFaces = true } = {},
+) {
   const width = Math.max(3, Math.min(4, Math.floor(Number(faceSize || 3))));
+  const faceCount = Math.floor((faces?.length || 0) / width);
+  let unmaskedCount = 0;
+  for (let faceIdx = 0; faceIdx < faceCount; faceIdx += 1) {
+    const base = faceIdx * width;
+    let pass = !facePassMask || Boolean(facePassMask[faceIdx]);
+    if (vertexPassMask) {
+      for (let local = 0; local < width && pass; local += 1) {
+        pass = Boolean(vertexPassMask[faces[base + local]]);
+      }
+    }
+    if (pass) unmaskedCount += 1;
+  }
+  const maskedCount = includeMasked ? faceCount - unmaskedCount : 0;
+  const unmaskedFaces = new Uint32Array(includeFaces ? unmaskedCount * width : 0);
+  const maskedFaces = new Uint32Array(includeFaces ? maskedCount * width : 0);
+  const unmaskedFaceIndices = includeFaceIndices
+    ? new Uint32Array(unmaskedCount)
+    : null;
+  const maskedFaceIndices = includeFaceIndices
+    ? new Uint32Array(maskedCount)
+    : null;
+  let unmaskedFaceOffset = 0;
+  let maskedFaceOffset = 0;
   for (let idx = 0, faceIdx = 0; idx + width - 1 < faces.length; idx += width, faceIdx += 1) {
     let pass = !facePassMask || Boolean(facePassMask[faceIdx]);
-    for (let local = 0; local < width; local += 1) {
-      if (vertexPassMask) pass = pass && Boolean(vertexPassMask[faces[idx + local]]);
+    if (vertexPassMask) {
+      for (let local = 0; local < width && pass; local += 1) {
+        pass = Boolean(vertexPassMask[faces[idx + local]]);
+      }
     }
-    const target = pass ? unmasked : masked;
-    (pass ? unmaskedFaceIndices : maskedFaceIndices).push(faceIdx);
-    for (let local = 0; local < width; local += 1) {
-      target.push(faces[idx + local]);
+    if (!pass && !includeMasked) continue;
+    const targetFaceOffset = pass ? unmaskedFaceOffset : maskedFaceOffset;
+    if (includeFaces) {
+      const target = pass ? unmaskedFaces : maskedFaces;
+      const targetBase = targetFaceOffset * width;
+      for (let local = 0; local < width; local += 1) {
+        target[targetBase + local] = faces[idx + local];
+      }
     }
+    const targetIndices = pass ? unmaskedFaceIndices : maskedFaceIndices;
+    if (targetIndices) targetIndices[targetFaceOffset] = faceIdx;
+    if (pass) unmaskedFaceOffset += 1;
+    else maskedFaceOffset += 1;
   }
   return {
-    unmaskedFaces: new Uint32Array(unmasked),
-    maskedFaces: new Uint32Array(masked),
+    unmaskedFaces,
+    maskedFaces,
     unmaskedFaceIndices,
     maskedFaceIndices,
+    unmaskedFaceCount: unmaskedCount,
+    maskedFaceCount: maskedCount,
   };
+}
+
+function buildFlatFaceIndexBuffer(faceIndices, faceSize = 3) {
+  const width = Math.max(3, Math.min(4, Math.floor(Number(faceSize || 3))));
+  const verticesPerFace = width === 4 ? 6 : 3;
+  const indices = new Uint32Array((faceIndices?.length || 0) * verticesPerFace);
+  let writeIdx = 0;
+  for (let subsetIdx = 0; subsetIdx < (faceIndices?.length || 0); subsetIdx += 1) {
+    const base = faceIndices[subsetIdx] * verticesPerFace;
+    for (let local = 0; local < verticesPerFace; local += 1) {
+      indices[writeIdx] = base + local;
+      writeIdx += 1;
+    }
+  }
+  return indices;
+}
+
+function ensureFullFlatFaceGeometry(entry) {
+  const faceSize = meshFaceSize(entry.layer);
+  const verticesPerFace = faceSize === 4 ? 6 : 3;
+  const faceCount = Math.floor(entry.layer.faces.length / faceSize);
+  const position = entry.mesh.geometry.getAttribute('position');
+  if (!position || position.count !== faceCount * verticesPerFace) {
+    setFlatFaceGeometry(
+      entry.mesh,
+      entry.layer,
+      null,
+      entry.currentFaceColors,
+      { refreshBounds: true },
+    );
+  } else if (entry.mesh.userData.flatFaceColorsSource !== entry.currentFaceColors) {
+    // Positions stay resident across face-field/cmap changes; only the
+    // expanded per-corner color buffer needs replacing.
+    setStoredColorAttribute(
+      entry.mesh.geometry,
+      expandFlatFaceColors(entry.currentFaceColors, faceCount, verticesPerFace),
+    );
+    entry.mesh.userData.flatFaceColorsSource = entry.currentFaceColors;
+  }
+}
+
+function expandFlatFaceColors(faceColors, faceCount, verticesPerFace) {
+  const colors = new Uint8Array(faceCount * verticesPerFace * 3);
+  for (let faceIdx = 0; faceIdx < faceCount; faceIdx += 1) {
+    const source = faceIdx * 3;
+    const red = faceColors[source];
+    const green = faceColors[source + 1];
+    const blue = faceColors[source + 2];
+    let target = faceIdx * verticesPerFace * 3;
+    for (let corner = 0; corner < verticesPerFace; corner += 1) {
+      colors[target] = red;
+      colors[target + 1] = green;
+      colors[target + 2] = blue;
+      target += 3;
+    }
+  }
+  return colors;
 }
 
 function buildFlatFaceSubset(layer, faceIndices, faceColors) {
@@ -2478,20 +2638,27 @@ function buildFlatFaceSubset(layer, faceIndices, faceColors) {
   return { positions, colors };
 }
 
-function setFlatFaceGeometry(object3d, layer, faceIndices, faceColors) {
+function setFlatFaceGeometry(
+  object3d,
+  layer,
+  faceIndices,
+  faceColors,
+  { refreshBounds = true } = {},
+) {
   const subset = buildFlatFaceSubset(layer, faceIndices, faceColors);
   setPositionAttribute(object3d.geometry, subset.positions);
   setStoredColorAttribute(object3d.geometry, subset.colors);
   object3d.geometry.setIndex(null);
   object3d.geometry.deleteAttribute('uv');
   object3d.geometry.deleteAttribute('normal');
-  object3d.userData.sourceFaceIndices = faceIndices;
-  refreshMeshBounds(object3d.geometry, false);
+  object3d.userData.flatFaceColorsSource = faceIndices ? null : faceColors;
+  if (refreshBounds) refreshMeshBounds(object3d.geometry, false);
 }
 
 function restoreIndexedMeshGeometry(entry, colors) {
   setPositionAttribute(entry.mesh.geometry, entry.layer.vertices);
   setStoredColorAttribute(entry.mesh.geometry, colors);
+  entry.mesh.userData.flatFaceColorsSource = null;
   if (entry.layer.texture?.uv) {
     entry.mesh.geometry.setAttribute('uv', new THREE.BufferAttribute(entry.layer.texture.uv, 2));
   }
@@ -2583,6 +2750,10 @@ function buildPointEdgeSegmentData(layer, pointPassMask = null, edgePassMask = n
 
 function updatePointLinesFromMask(entry, passMask, edgePassMask = null) {
   if (!entry.pointLines) return;
+  // Chunked indexed graphs deliberately retain complete connectivity while
+  // point filters are active; rebuilding their full edge domain would defeat
+  // the bounded-allocation path.
+  if (entry.pointLines.userData.indexedPointEdgeChunks) return;
   const geometry = entry.pointLines.geometry;
   const positionData = geometry.getAttribute('instanceStart')?.data || null;
   const colorData = geometry.getAttribute('instanceColorStart')?.data || null;
@@ -2812,13 +2983,186 @@ function getEntryFilterActivity(entry) {
   return { point, edge, face };
 }
 
+function lowerBoundSorted(values, target) {
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const mid = low + ((high - low) >> 1);
+    if (values[mid] < target) low = mid + 1;
+    else high = mid;
+  }
+  return low;
+}
+
+function upperBoundSorted(values, target) {
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const mid = low + ((high - low) >> 1);
+    if (values[mid] <= target) low = mid + 1;
+    else high = mid;
+  }
+  return low;
+}
+
+function canUseSortedFaceFilterWithEdges(entry) {
+  if (!shouldDisplayMeshEdges(entry)) return true;
+  return !shouldUseMeshEdgeDomain(entry) && entry.edgeThickness <= 1.0;
+}
+
+function applySortedMeshEdgeDrawRange(entry, begin, end) {
+  if (!shouldDisplayMeshEdges(entry)) return true;
+  if (!canUseSortedFaceFilterWithEdges(entry)) return false;
+  if (entry.edgeLines && !entry.edgeLines.userData.contiguousFullTopology) {
+    disposeMeshEdgeOverlay(entry);
+  }
+  if (!entry.edgeLines) entry.edgeLines = buildMeshEdgeLines(entry);
+  const group = entry.edgeLines;
+  if (!group || group.userData.wideEdges || group.userData.meshEdgeDomain) return false;
+
+  let edgeCount = 0;
+  for (const lines of group.children) {
+    const faceBegin = Number(lines.userData.sourceFaceBegin);
+    const faceEnd = Number(lines.userData.sourceFaceEnd);
+    const segmentsPerFace = Number(lines.userData.segmentsPerFace);
+    if (!Number.isFinite(faceBegin) || !Number.isFinite(faceEnd) || !segmentsPerFace) {
+      return false;
+    }
+    const overlapBegin = Math.max(begin, faceBegin);
+    const overlapEnd = Math.min(end, faceEnd);
+    const selectedFaceCount = Math.max(0, overlapEnd - overlapBegin);
+    const firstIndex = (overlapBegin - faceBegin) * segmentsPerFace * 2;
+    const indexCount = selectedFaceCount * segmentsPerFace * 2;
+    lines.geometry.setDrawRange(firstIndex, indexCount);
+    lines.visible = selectedFaceCount > 0;
+    edgeCount += selectedFaceCount * segmentsPerFace;
+  }
+  group.userData.edgeCount = edgeCount;
+  entry.unmaskedEdgeCount = edgeCount;
+  return true;
+}
+
+function resetSortedMeshEdgeDrawRange(entry) {
+  const group = entry.edgeLines;
+  if (!group || group.userData.wideEdges || group.userData.meshEdgeDomain
+      || !group.userData.contiguousFullTopology) return false;
+  let edgeCount = 0;
+  for (const lines of group.children) {
+    const faceBegin = Number(lines.userData.sourceFaceBegin);
+    const faceEnd = Number(lines.userData.sourceFaceEnd);
+    const segmentsPerFace = Number(lines.userData.segmentsPerFace);
+    if (!Number.isFinite(faceBegin) || !Number.isFinite(faceEnd) || !segmentsPerFace) {
+      return false;
+    }
+    const chunkEdgeCount = (faceEnd - faceBegin) * segmentsPerFace;
+    lines.geometry.setDrawRange(0, chunkEdgeCount * 2);
+    lines.visible = chunkEdgeCount > 0;
+    edgeCount += chunkEdgeCount;
+  }
+  group.userData.edgeCount = edgeCount;
+  entry.unmaskedEdgeCount = edgeCount;
+  return true;
+}
+
+function getSortedFaceFilterSpec(entry) {
+  if (
+    entry.layerKind !== 'mesh'
+    || filterState.maskedOpacity > 0.0
+    || entry.showVertices
+    || !canUseSortedFaceFilterWithEdges(entry)
+  ) return null;
+  let result = null;
+  for (const rule of filterState.rules || []) {
+    const ruleScopeKeys = resolveScopeKeys(rule.scopeKeys, false);
+    if (ruleScopeKeys.length === 0 || !isEntryWithinScope(entry, ruleScopeKeys, false)) continue;
+    const domain = getRuleDomain(rule, ruleScopeKeys);
+    if (!domain || !isFilterRuleRestrictive(rule, domain)) continue;
+    if (domain.kind !== 'face-field') return null;
+    const fieldIdx = (entry.layer.face_field_names || []).findIndex(
+      (name) => String(name) === String(domain.fieldName),
+    );
+    if (fieldIdx < 0) continue;
+    if (!entry.layer.face_field_sorted_ascending?.[fieldIdx]) return null;
+    const values = entry.layer.face_field_values?.[fieldIdx] || null;
+    const activeRange = rangeFromClip(domain.range, rule.scalarClip || createClipState());
+    if (!values || !activeRange || result !== null) return null;
+    result = { values, activeRange };
+  }
+  return result;
+}
+
+function clearMaskedMeshGeometry(entry) {
+  if (!entry.maskedMesh) return;
+  setPositionAttribute(entry.maskedMesh.geometry, new Float32Array(0));
+  setStoredColorAttribute(entry.maskedMesh.geometry, new Uint8Array(0));
+  setIndexAttribute(entry.maskedMesh.geometry, new Uint32Array(0));
+  entry.maskedMesh.geometry.deleteAttribute('normal');
+  entry.maskedMesh.geometry.deleteAttribute('uv');
+}
+
+function applySortedFaceFilter(entry, spec, colors, usesFaceColors) {
+  const faceSize = meshFaceSize(entry.layer);
+  const faceCount = Math.floor(entry.layer.faces.length / faceSize);
+  if (spec.values.length !== faceCount) return false;
+  const begin = lowerBoundSorted(spec.values, spec.activeRange.min);
+  const end = upperBoundSorted(spec.values, spec.activeRange.max);
+  if (usesFaceColors) {
+    setMeshFaceColorMode(entry, true);
+    ensureFullFlatFaceGeometry(entry);
+    // The flat buffer is already in sorted source-face order. A non-indexed
+    // draw range selects the desired contiguous score interval directly.
+    entry.mesh.geometry.setIndex(null);
+    const verticesPerFace = faceSize === 4 ? 6 : 3;
+    entry.mesh.geometry.setDrawRange(
+      begin * verticesPerFace,
+      (end - begin) * verticesPerFace,
+    );
+  } else {
+    const needsIndexedRestore = (
+      (entry.filterActive && !entry.sortedFaceFilterActive)
+      || entry.sortedFaceFilterUsesFaceColors
+    );
+    if (needsIndexedRestore) {
+      restoreIndexedMeshGeometry(entry, colors);
+      setIndexAttribute(entry.mesh.geometry, triangulateFaces(entry.layer.faces, faceSize));
+    }
+    const indicesPerFace = faceSize === 4 ? 6 : 3;
+    entry.mesh.geometry.setDrawRange(
+      begin * indicesPerFace,
+      (end - begin) * indicesPerFace,
+    );
+  }
+  clearMaskedMeshGeometry(entry);
+  entry.passMask = null;
+  entry.edgePassMask = null;
+  entry.facePassMask = null;
+  entry.filterActive = true;
+  entry.pointFilterActive = false;
+  entry.edgeFilterActive = false;
+  entry.faceFilterActive = true;
+  entry.sortedFaceFilterActive = true;
+  entry.sortedFaceFilterUsesFaceColors = usesFaceColors;
+  entry.sortedFaceFilterBegin = begin;
+  entry.sortedFaceFilterEnd = end;
+  entry.unmaskedFaceCount = end - begin;
+  entry.maskedFaceCount = faceCount - (end - begin);
+  updateEntryOpacity(entry, entry.opacity);
+  updateEntryEdgeOverlay(entry);
+  return true;
+}
+
 function applyFiltersToEntry(entry) {
-  if (!entry) return;
+  // Hidden layers are lazy placeholders until first shown.
+  if (!entry || !entry.loaded) return;
   const colors = entry.currentColors || decodeArraySpec(entry.layer.colors, Uint8Array) || new Uint8Array(0);
   const activity = getEntryFilterActivity(entry);
   const usesFaceColors = entry.layerKind === 'mesh'
     && entry.activeSurfaceAssociation === 'face'
     && entry.currentFaceColors;
+  const sortedFaceFilter = getSortedFaceFilterSpec(entry);
+  if (sortedFaceFilter && applySortedFaceFilter(
+    entry, sortedFaceFilter, colors, usesFaceColors,
+  )) return;
 
   // The overwhelmingly common display path has no filters. Rendering the
   // original typed arrays directly avoids an O(N) mask, an N-element JS index
@@ -2835,7 +3179,6 @@ function applyFiltersToEntry(entry) {
         entry.points.geometry.computeBoundingSphere();
         setPositionAttribute(entry.maskedPoints.geometry, new Float32Array(0));
         setStoredColorAttribute(entry.maskedPoints.geometry, new Uint8Array(0));
-        entry.points.userData.sourceIndices = null;
       } else {
         setStoredColorAttribute(entry.points.geometry, colors);
       }
@@ -2848,12 +3191,19 @@ function applyFiltersToEntry(entry) {
       const faceSize = meshFaceSize(entry.layer);
       if (usesFaceColors) {
         setMeshFaceColorMode(entry, true);
-        setFlatFaceGeometry(entry.mesh, entry.layer, null, entry.currentFaceColors);
+        if (entry.sortedFaceFilterActive) {
+          ensureFullFlatFaceGeometry(entry);
+          entry.mesh.geometry.setIndex(null);
+        } else {
+          setFlatFaceGeometry(entry.mesh, entry.layer, null, entry.currentFaceColors);
+        }
       } else {
-        restoreIndexedMeshGeometry(entry, colors);
-        setIndexAttribute(entry.mesh.geometry, triangulateFaces(entry.layer.faces, faceSize));
-        refreshMeshBounds(entry.mesh.geometry, !entry.layer.unlit);
+        if (!entry.sortedFaceFilterActive || entry.sortedFaceFilterUsesFaceColors) {
+          restoreIndexedMeshGeometry(entry, colors);
+          setIndexAttribute(entry.mesh.geometry, triangulateFaces(entry.layer.faces, faceSize));
+        }
       }
+      entry.mesh.geometry.setDrawRange(0, Infinity);
       if (entry.filterActive || usesFaceColors) {
         setPositionAttribute(entry.maskedMesh.geometry, new Float32Array(0));
         setStoredColorAttribute(entry.maskedMesh.geometry, new Uint8Array(0));
@@ -2867,12 +3217,19 @@ function applyFiltersToEntry(entry) {
       }
     }
     const wasFiltered = entry.filterActive;
+    const wasSortedFaceFilter = Boolean(entry.sortedFaceFilterActive);
     entry.filterActive = false;
     entry.pointFilterActive = false;
     entry.edgeFilterActive = false;
     entry.faceFilterActive = false;
+    entry.sortedFaceFilterActive = false;
+    entry.sortedFaceFilterUsesFaceColors = false;
+    entry.sortedFaceFilterBegin = null;
+    entry.sortedFaceFilterEnd = null;
     if (entry.layerKind === 'mesh' && (wasFiltered || entry.layer.edges?.length)) {
-      updateMeshEdgeLinesFromGeometry(entry);
+      if (!wasSortedFaceFilter || !resetSortedMeshEdgeDrawRange(entry)) {
+        updateMeshEdgeLinesFromGeometry(entry);
+      }
     }
     updateEntryOpacity(entry, entry.opacity);
     updateEntryEdgeOverlay(entry);
@@ -2880,6 +3237,11 @@ function applyFiltersToEntry(entry) {
   }
 
   const wasPointFilterActive = Boolean(entry.pointFilterActive);
+  if (entry.layerKind === 'mesh') entry.mesh.geometry.setDrawRange(0, Infinity);
+  entry.sortedFaceFilterActive = false;
+  entry.sortedFaceFilterUsesFaceColors = false;
+  entry.sortedFaceFilterBegin = null;
+  entry.sortedFaceFilterEnd = null;
   const passMask = activity.point ? computeEntryPassMask(entry) : null;
   const edgePassMask = activity.edge ? computeEntryEdgePassMask(entry) : null;
   let facePassMask = activity.face ? computeEntryFacePassMask(entry) : null;
@@ -2912,7 +3274,6 @@ function applyFiltersToEntry(entry) {
         entry.points.geometry.computeBoundingSphere();
         setPositionAttribute(entry.maskedPoints.geometry, new Float32Array(0));
         setStoredColorAttribute(entry.maskedPoints.geometry, new Uint8Array(0));
-        entry.points.userData.sourceIndices = null;
       }
       setStoredColorAttribute(entry.points.geometry, colors);
       entry.unmaskedPointCount = getEntryElementCount(entry);
@@ -2921,25 +3282,87 @@ function applyFiltersToEntry(entry) {
     updatePointLinesFromMask(entry, passMask, edgePassMask);
   } else {
     const faceSize = meshFaceSize(entry.layer);
-    const splitFaces = splitMeshFacesByMask(entry.layer.faces, passMask, faceSize, facePassMask);
+    // With the default zero masked opacity there is no reason to allocate,
+    // populate, and upload the rejected half of a multi-million-face mesh.
+    // It is rebuilt on demand if the user later enables masked visibility.
+    const includeMasked = filterState.maskedOpacity > 0.0;
+    const splitFaces = splitMeshFacesByMask(
+      entry.layer.faces,
+      passMask,
+      faceSize,
+      facePassMask,
+      {
+        includeMasked,
+        includeFaceIndices: usesFaceColors,
+        includeFaces: !usesFaceColors,
+      },
+    );
     if (usesFaceColors) {
       setMeshFaceColorMode(entry, true);
-      setFlatFaceGeometry(entry.mesh, entry.layer, splitFaces.unmaskedFaceIndices, entry.currentFaceColors);
-      setFlatFaceGeometry(entry.maskedMesh, entry.layer, splitFaces.maskedFaceIndices, entry.currentFaceColors);
+      // Face coloring already expands each source face into independent flat
+      // vertices. Keep that large position/color buffer resident and filter by
+      // replacing only its index buffer; rebuilding the flat attributes here
+      // copied hundreds of MB for large meshes on every threshold change.
+      ensureFullFlatFaceGeometry(entry);
+      setIndexAttribute(
+        entry.mesh.geometry,
+        buildFlatFaceIndexBuffer(splitFaces.unmaskedFaceIndices, faceSize),
+      );
+      if (includeMasked) {
+        entry.maskedMesh.geometry.setAttribute(
+          'position', entry.mesh.geometry.getAttribute('position'),
+        );
+        entry.maskedMesh.geometry.setAttribute(
+          'color', entry.mesh.geometry.getAttribute('color'),
+        );
+        entry.maskedMesh.geometry.boundingBox = entry.mesh.geometry.boundingBox;
+        entry.maskedMesh.geometry.boundingSphere = entry.mesh.geometry.boundingSphere;
+        setIndexAttribute(
+          entry.maskedMesh.geometry,
+          buildFlatFaceIndexBuffer(splitFaces.maskedFaceIndices, faceSize),
+        );
+      } else {
+        setPositionAttribute(entry.maskedMesh.geometry, new Float32Array(0));
+        setStoredColorAttribute(entry.maskedMesh.geometry, new Uint8Array(0));
+        entry.maskedMesh.geometry.setIndex(null);
+        entry.maskedMesh.geometry.deleteAttribute('uv');
+      }
     } else {
       restoreIndexedMeshGeometry(entry, colors);
-      setPositionAttribute(entry.maskedMesh.geometry, entry.layer.vertices);
-      setStoredColorAttribute(entry.maskedMesh.geometry, colors);
-      if (entry.layer.texture?.uv) {
-        entry.maskedMesh.geometry.setAttribute('uv', new THREE.BufferAttribute(entry.layer.texture.uv, 2));
-      }
       setIndexAttribute(entry.mesh.geometry, triangulateFaces(splitFaces.unmaskedFaces, faceSize));
-      refreshMeshBounds(entry.mesh.geometry, !entry.layer.unlit);
-      setIndexAttribute(entry.maskedMesh.geometry, triangulateFaces(splitFaces.maskedFaces, faceSize));
-      refreshMeshBounds(entry.maskedMesh.geometry, !entry.layer.unlit);
+      // Vertex positions, normals, and full-mesh bounds are unchanged by an
+      // index-only filter. Reuse them instead of recomputing normals/bounds or
+      // uploading a duplicate vertex buffer for the masked mesh.
+      if (includeMasked) {
+        entry.maskedMesh.geometry.setAttribute(
+          'position', entry.mesh.geometry.getAttribute('position'),
+        );
+        entry.maskedMesh.geometry.setAttribute(
+          'color', entry.mesh.geometry.getAttribute('color'),
+        );
+        const normals = entry.mesh.geometry.getAttribute('normal');
+        if (normals) entry.maskedMesh.geometry.setAttribute('normal', normals);
+        if (entry.layer.texture?.uv) {
+          entry.maskedMesh.geometry.setAttribute(
+            'uv', entry.mesh.geometry.getAttribute('uv'),
+          );
+        }
+        entry.maskedMesh.geometry.boundingBox = entry.mesh.geometry.boundingBox;
+        entry.maskedMesh.geometry.boundingSphere = entry.mesh.geometry.boundingSphere;
+        setIndexAttribute(
+          entry.maskedMesh.geometry,
+          triangulateFaces(splitFaces.maskedFaces, faceSize),
+        );
+      } else {
+        setPositionAttribute(entry.maskedMesh.geometry, new Float32Array(0));
+        setStoredColorAttribute(entry.maskedMesh.geometry, new Uint8Array(0));
+        setIndexAttribute(entry.maskedMesh.geometry, new Uint32Array(0));
+        entry.maskedMesh.geometry.deleteAttribute('normal');
+        entry.maskedMesh.geometry.deleteAttribute('uv');
+      }
     }
-    entry.unmaskedFaceCount = Math.floor(splitFaces.unmaskedFaces.length / faceSize);
-    entry.maskedFaceCount = Math.floor(splitFaces.maskedFaces.length / faceSize);
+    entry.unmaskedFaceCount = splitFaces.unmaskedFaceCount;
+    entry.maskedFaceCount = splitFaces.maskedFaceCount;
     if (passMask) {
       updateMeshVertexPointSubsets(entry, passMask);
     } else if (wasPointFilterActive && (entry.vertexPoints || entry.maskedVertexPoints)) {
@@ -2955,9 +3378,10 @@ function applyFiltersToEntry(entry) {
 
 function applyFiltersToAllEntries() {
   for (const entry of layers) {
+    if (!entry.loaded) continue;
     applyFiltersToEntry(entry);
   }
-  requestRenderAndHover();
+  requestRender();
 }
 
 function requestApplyFiltersToAllEntries() {
@@ -3027,16 +3451,46 @@ function createDualSliderControl({
     right.textContent = formatFilterValue(clippedRange?.max);
   };
 
-  minInput.addEventListener('input', () => {
+  let commitTimer = null;
+  const commitNow = () => {
+    if (commitTimer !== null) {
+      window.clearTimeout(commitTimer);
+      commitTimer = null;
+    }
+    onChanged();
+  };
+  const scheduleCommit = () => {
+    if (commitTimer !== null) window.clearTimeout(commitTimer);
+    // Coalesce the dense stream of range-input events. This still previews a
+    // paused drag, while ensuring the latest value is applied even in notebook
+    // iframes that do not reliably emit a final `change` event.
+    commitTimer = window.setTimeout(() => {
+      commitTimer = null;
+      onChanged();
+    }, 160);
+  };
+  const updateMin = (commit) => {
     setClipBoundary(clipState, 'min', sliderToFilterFrac(minInput.value, 0.0));
     sync();
-    onChanged();
-  });
-  maxInput.addEventListener('input', () => {
+    if (commit) commitNow();
+    else scheduleCommit();
+  };
+  const updateMax = (commit) => {
     setClipBoundary(clipState, 'max', sliderToFilterFrac(maxInput.value, 1.0));
     sync();
-    onChanged();
-  });
+    if (commit) commitNow();
+    else scheduleCommit();
+  };
+  // Keep handles and labels responsive, coalesce live previews, and force the
+  // latest value on every common interaction-completion event.
+  minInput.addEventListener('input', () => updateMin(false));
+  maxInput.addEventListener('input', () => updateMax(false));
+  minInput.addEventListener('change', () => updateMin(true));
+  maxInput.addEventListener('change', () => updateMax(true));
+  minInput.addEventListener('pointerup', commitNow);
+  maxInput.addEventListener('pointerup', commitNow);
+  minInput.addEventListener('blur', commitNow);
+  maxInput.addEventListener('blur', commitNow);
 
   sync();
   wrap.appendChild(title);
@@ -3057,7 +3511,6 @@ function pickDefaultRuleProperty(scopeKeys = null) {
 
 function onFilterRulesUpdated() {
   updateFilterPanelUI();
-  hideHoverTooltip();
   const needsFilterUpdate = layers.some((entry) => {
     if (entry.filterActive) return true;
     const activity = getEntryFilterActivity(entry);
@@ -3184,7 +3637,6 @@ function updateFilterPanelUI() {
             label: `Position ${axis.toUpperCase()}`,
             onChanged: () => {
               requestApplyFiltersToAllEntries();
-              hideHoverTooltip();
             },
           });
           const axisRow = document.createElement('div');
@@ -3200,7 +3652,6 @@ function updateFilterPanelUI() {
           label: domain.fieldName,
           onChanged: () => {
             requestApplyFiltersToAllEntries();
-            hideHoverTooltip();
           },
         }));
       }
@@ -3262,6 +3713,7 @@ function initFilterPanelEvents() {
   }
   if (filterMaskedOpacityInput) {
     filterMaskedOpacityInput.addEventListener('input', () => {
+      const previousMaskedOpacity = filterState.maskedOpacity;
       filterState.maskedOpacity = clampUnit(filterMaskedOpacityInput.value, 0.0);
       if (filterMaskedOpacityValue) {
         filterMaskedOpacityValue.textContent = Number(filterState.maskedOpacity).toFixed(2);
@@ -3269,8 +3721,12 @@ function initFilterPanelEvents() {
       for (const entry of layers) {
         updateEntryOpacity(entry, entry.opacity);
       }
-      requestRenderAndHover();
-      hideHoverTooltip();
+      // Rejected mesh buffers are intentionally omitted while masked opacity
+      // is zero. Materialize them once if the user asks to see masked faces.
+      if (previousMaskedOpacity <= 0.0 && filterState.maskedOpacity > 0.0) {
+        requestApplyFiltersToAllEntries();
+      }
+      requestRender();
     });
   }
   updateFilterPanelUI();
@@ -3315,8 +3771,10 @@ function fitCamera() {
   camera.updateProjectionMatrix();
 
   controls.target.copy(center);
+  surfaceOrbitPivot = center.clone();
+  surfaceOrbitDragging = false;
   controls.update();
-  requestRenderAndHover();
+  requestRender();
 }
 
 function createCmapDropdown(entry, fieldIdx, controlsEnabled, association = 'vertex') {
@@ -3649,265 +4107,6 @@ function setLayerField(entry, fieldIdx, association = 'vertex') {
   }
 }
 
-function hideHoverTooltip() {
-  hoverTooltip.style.display = 'none';
-}
-
-function toHexChannel(value) {
-  return Math.round(Math.min(255, Math.max(0, value))).toString(16).padStart(2, '0');
-}
-
-function formatHoverColorFromBytes(colors, idx) {
-  if (!colors || idx < 0) return null;
-  const base = idx * 3;
-  if (base + 2 >= colors.length) return null;
-  const red = Number(colors[base]);
-  const green = Number(colors[base + 1]);
-  const blue = Number(colors[base + 2]);
-  if (![red, green, blue].every(Number.isFinite)) return null;
-  return {
-    rgb: `rgb(${red}, ${green}, ${blue})`,
-    hex: `#${toHexChannel(red)}${toHexChannel(green)}${toHexChannel(blue)}`,
-  };
-}
-
-function buildHoverTooltipContent(details) {
-  hoverTooltip.replaceChildren();
-
-  const title = document.createElement('div');
-  title.className = 'hover-tooltip-title';
-  title.textContent = details.layerLabel;
-  hoverTooltip.appendChild(title);
-
-  const addRow = (label, value = null, extraNode = null) => {
-    const row = document.createElement('div');
-    row.className = 'hover-tooltip-row';
-
-    const labelNode = document.createElement('div');
-    labelNode.className = 'hover-tooltip-label';
-    labelNode.textContent = label;
-    row.appendChild(labelNode);
-
-    if (extraNode) {
-      row.appendChild(extraNode);
-    }
-
-    if (value !== null && value !== undefined && value !== '') {
-      const valueNode = document.createElement('div');
-      valueNode.className = 'hover-tooltip-value';
-      valueNode.textContent = value;
-      row.appendChild(valueNode);
-    }
-
-    hoverTooltip.appendChild(row);
-  };
-
-  addRow('xyz', details.xyz);
-  addRow('color', null, (() => {
-    const swatch = document.createElement('div');
-    swatch.className = 'hover-tooltip-swatch';
-    swatch.style.background = details.color.rgb;
-    return swatch;
-  })());
-  addRow('value', details.valueText);
-}
-
-function showHoverTooltip(clientX, clientY, details) {
-  buildHoverTooltipContent(details);
-  hoverTooltip.style.display = 'block';
-  const margin = 12;
-  const maxX = window.innerWidth - hoverTooltip.offsetWidth - margin;
-  const maxY = window.innerHeight - hoverTooltip.offsetHeight - margin;
-  hoverTooltip.style.left = `${Math.min(clientX + 14, Math.max(margin, maxX))}px`;
-  hoverTooltip.style.top = `${Math.min(clientY + 14, Math.max(margin, maxY))}px`;
-}
-
-function pickClosestFaceVertexIndex(hit, mesh, posAttr) {
-  if (!hit || !hit.face || !mesh || !posAttr) return -1;
-  const localHit = mesh.worldToLocal(hit.point.clone());
-  const candidates = [hit.face.a, hit.face.b, hit.face.c];
-  let bestIdx = -1;
-  let bestDist2 = Infinity;
-  for (const idx of candidates) {
-    if (idx < 0 || idx >= posAttr.count) continue;
-    const dx = posAttr.getX(idx) - localHit.x;
-    const dy = posAttr.getY(idx) - localHit.y;
-    const dz = posAttr.getZ(idx) - localHit.z;
-    const dist2 = dx * dx + dy * dy + dz * dz;
-    if (dist2 < bestDist2) {
-      bestDist2 = dist2;
-      bestIdx = idx;
-    }
-  }
-  return bestIdx;
-}
-
-function getEntryPointSize(entry) {
-  if (!entry) return 1.0;
-  const numeric = Number(entry.pointSize ?? entry.layer?.point_size ?? payload.point_size);
-  return Number.isFinite(numeric) ? Math.min(12.0, Math.max(1.0, numeric)) : 1.0;
-}
-
-function computePointHoverThreshold(viewportHeightPx, entry) {
-  const distance = camera.position.distanceTo(controls.target);
-  const fov = THREE.MathUtils.degToRad(camera.fov);
-  const worldPerPixel = (2 * Math.max(distance, 1e-6) * Math.tan(fov / 2)) / Math.max(viewportHeightPx, 1);
-  const pointRadiusPx = Math.max(getEntryPointSize(entry) * 0.5, 1.5);
-  return Math.max(worldPerPixel * pointRadiusPx * 1.15, 1e-5);
-}
-
-function pickBestPointHit(hits) {
-  if (!hits || hits.length === 0) return null;
-  let bestHit = null;
-  for (const hit of hits) {
-    if (hit.index === undefined || hit.index === null) continue;
-    if (!bestHit) {
-      bestHit = hit;
-      continue;
-    }
-    const bestDistanceToRay = Number.isFinite(bestHit.distanceToRay) ? bestHit.distanceToRay : Infinity;
-    const hitDistanceToRay = Number.isFinite(hit.distanceToRay) ? hit.distanceToRay : Infinity;
-    if (hitDistanceToRay < bestDistanceToRay - 1e-9) {
-      bestHit = hit;
-      continue;
-    }
-    if (Math.abs(hitDistanceToRay - bestDistanceToRay) <= 1e-9 && hit.distance < bestHit.distance) {
-      bestHit = hit;
-    }
-  }
-  return bestHit;
-}
-
-function getPointSourceIndexFromHit(hit) {
-  if (!hit) return -1;
-  const localIdx = Number(hit.index ?? -1);
-  if (!Number.isFinite(localIdx) || localIdx < 0) return -1;
-  const sourceIndices = hit.object?.userData?.sourceIndices || null;
-  if (Array.isArray(sourceIndices)) {
-    return Number(sourceIndices[localIdx] ?? -1);
-  }
-  if (sourceIndices && typeof sourceIndices.length === 'number') {
-    return Number(sourceIndices[localIdx] ?? -1);
-  }
-  return localIdx;
-}
-
-function updateHoverFromPointer() {
-  if (!pointerState.inside) {
-    hideHoverTooltip();
-    return;
-  }
-  const rect = renderer.domElement.getBoundingClientRect();
-  const x = (pointerState.clientX - rect.left) / rect.width;
-  const y = (pointerState.clientY - rect.top) / rect.height;
-  pointerNdc.x = x * 2 - 1;
-  pointerNdc.y = -(y * 2 - 1);
-  raycaster.setFromCamera(pointerNdc, camera);
-
-  let best = null;
-  for (const entry of layers) {
-    if (!entry.visible) continue;
-    const pointObjects = [entry.points, entry.maskedPoints, entry.vertexPoints, entry.maskedVertexPoints].filter((obj) => obj && obj.visible);
-    if (getEntryElementCount(entry) <= MAX_INTERACTIVE_POINT_PICK_COUNT) {
-      for (const obj of pointObjects) {
-        raycaster.params.Points.threshold = computePointHoverThreshold(rect.height, entry);
-        const hits = raycaster.intersectObject(obj, false);
-        const hit = pickBestPointHit(hits);
-        if (!hit) continue;
-        if (!best || hit.distance < best.hit.distance) {
-          best = { entry, hit };
-        }
-      }
-    }
-    const meshFaceCount = Number(entry.layer.face_count) || 0;
-    if (meshFaceCount <= MAX_INTERACTIVE_MESH_PICK_FACE_COUNT) {
-      const meshObjects = [entry.mesh, entry.maskedMesh].filter((obj) => obj && obj.visible);
-      for (const obj of meshObjects) {
-        ensureMeshBoundsTree(obj);
-        const hits = raycaster.intersectObject(obj, false);
-        const hit = (hits && hits.length > 0) ? hits[0] : null;
-        if (!hit) continue;
-        if (!best || hit.distance < best.hit.distance) {
-          best = { entry, hit };
-        }
-      }
-    }
-  }
-
-  if (!best) {
-    hideHoverTooltip();
-    return;
-  }
-
-  if (!best.hit.object?.isPoints && best.entry.activeFieldAssociation === 'face') {
-    const renderedTriangle = Number(best.hit.faceIndex ?? -1);
-    const trianglesPerFace = meshFaceSize(best.entry.layer) === 4 ? 2 : 1;
-    const subsetFaceIdx = Math.floor(renderedTriangle / trianglesPerFace);
-    const sourceFaceIndices = best.hit.object?.userData?.sourceFaceIndices || [];
-    const sourceFaceIdx = Number(sourceFaceIndices[subsetFaceIdx] ?? -1);
-    const faceState = getAssociationState(best.entry, 'face');
-    const faceData = getAssociationFieldData(best.entry, 'face');
-    const values = faceData.values?.[faceState.activeFieldIdx ?? 0] || null;
-    const color = formatHoverColorFromBytes(best.entry.currentFaceColors, sourceFaceIdx);
-    if (sourceFaceIdx >= 0 && color) {
-      const worldPoint = best.hit.point;
-      const value = values && sourceFaceIdx < values.length ? values[sourceFaceIdx] : null;
-      const fieldLabel = faceData.names?.[faceState.activeFieldIdx ?? 0] || null;
-      showHoverTooltip(pointerState.clientX, pointerState.clientY, {
-        layerLabel: `${best.entry.layer.label}${fieldLabel ? ` (${fieldLabel})` : ''}`,
-        xyz: `(${worldPoint.x.toFixed(4)}, ${worldPoint.y.toFixed(4)}, ${worldPoint.z.toFixed(4)})`,
-        color,
-        valueText: Number.isFinite(value) ? Number(value).toFixed(4) : 'n/a',
-      });
-      return;
-    }
-  }
-
-  let idx = -1;
-  if (best.hit.object?.isPoints) {
-    idx = getPointSourceIndexFromHit(best.hit);
-  } else {
-    const posAttr = best.hit.object?.geometry?.getAttribute('position') || null;
-    idx = pickClosestFaceVertexIndex(best.hit, best.hit.object, posAttr);
-  }
-  if (idx < 0) {
-    hideHoverTooltip();
-    return;
-  }
-
-  const positions = getEntryPositions(best.entry);
-  const base = idx * 3;
-  if (!positions || base + 2 >= positions.length) {
-    hideHoverTooltip();
-    return;
-  }
-  const px = Number(positions[base]);
-  const py = Number(positions[base + 1]);
-  const pz = Number(positions[base + 2]);
-  const hoverColor = formatHoverColorFromBytes(best.entry.currentColors, idx);
-  if (!hoverColor) {
-    hideHoverTooltip();
-    return;
-  }
-
-  const vertexFieldActive = best.entry.activeFieldAssociation === 'vertex';
-  const fieldNames = vertexFieldActive ? (best.entry.layer.field_names || null) : null;
-  const fieldLabel = fieldNames ? fieldNames[best.entry.activeFieldIdx ?? 0] : null;
-  const activeValues = vertexFieldActive
-    ? (best.entry.activeValues || best.entry.layer.values || null)
-    : null;
-  const value = activeValues && idx < activeValues.length ? activeValues[idx] : null;
-  const valueText = (value === null || value === undefined || !Number.isFinite(value))
-    ? 'n/a'
-    : Number(value).toFixed(4);
-
-  showHoverTooltip(pointerState.clientX, pointerState.clientY, {
-    layerLabel: `${best.entry.layer.label}${fieldLabel ? ` (${fieldLabel})` : ''}`,
-    xyz: `(${px.toFixed(4)}, ${py.toFixed(4)}, ${pz.toFixed(4)})`,
-    color: hoverColor,
-    valueText: valueText,
-  });
-}
 
 function createRangeOptionControl({
   labelText,
@@ -3945,7 +4144,7 @@ function appendPointLayerOptions(entry, optionGrid) {
     disabled: !entry.visible,
     onInput: (nextValue) => {
       updateEntryPointSize(entry, nextValue);
-      requestRenderAndHover();
+      requestRender();
     },
   }));
 
@@ -3958,7 +4157,7 @@ function appendPointLayerOptions(entry, optionGrid) {
     disabled: !entry.visible,
     onInput: (nextValue) => {
       updateEntryOpacity(entry, nextValue);
-      requestRenderAndHover();
+      requestRender();
     },
   }));
 
@@ -3972,7 +4171,7 @@ function appendPointLayerOptions(entry, optionGrid) {
       disabled: !entry.visible,
       onInput: (nextValue) => {
         updateEntryEdgeThickness(entry, nextValue);
-        requestRenderAndHover();
+        requestRender();
       },
     }));
   }
@@ -3989,7 +4188,7 @@ function appendMeshLayerOptions(entry, optionGrid) {
     disabled: !entry.visible,
     onInput: (nextValue) => {
       updateEntryOpacity(entry, nextValue);
-      requestRenderAndHover();
+      requestRender();
     },
   }));
 
@@ -4011,7 +4210,7 @@ function appendMeshLayerOptions(entry, optionGrid) {
       updateEntryEdgeOverlay(entry);
     }
     rebuildLayerList();
-    requestRenderAndHover();
+    requestRender();
   });
   edgeToggleLabel.appendChild(edgeToggleInput);
   edgeToggleLabel.appendChild(document.createTextNode('Show edges'));
@@ -4030,7 +4229,7 @@ function appendMeshLayerOptions(entry, optionGrid) {
     }
     updateEntryVertexOverlay(entry);
     rebuildLayerList();
-    requestRenderAndHover();
+    requestRender();
   });
   vertexToggleLabel.appendChild(vertexToggleInput);
   vertexToggleLabel.appendChild(document.createTextNode('Show vertices'));
@@ -4043,6 +4242,19 @@ function appendMeshLayerOptions(entry, optionGrid) {
     && entry.visible
   ) {
     optionGrid.appendChild(createRangeOptionControl({
+      labelText: 'Edge opacity',
+      min: 0,
+      max: 1,
+      step: 0.05,
+      value: entry.edgeOpacity ?? (isDayMode ? 0.82 : 0.92),
+      disabled: !entry.visible,
+      onInput: (nextValue) => {
+        entry.edgeOpacity = clampOpacity(nextValue);
+        updateEntryEdgeOverlay(entry);
+        requestRender();
+      },
+    }));
+    optionGrid.appendChild(createRangeOptionControl({
       labelText: 'Edge thickness',
       min: 1,
       max: 12,
@@ -4051,7 +4263,7 @@ function appendMeshLayerOptions(entry, optionGrid) {
       disabled: !entry.visible,
       onInput: (nextValue) => {
         updateEntryEdgeThickness(entry, nextValue);
-        requestRenderAndHover();
+        requestRender();
       },
     }));
   }
@@ -4067,7 +4279,7 @@ function appendMeshLayerOptions(entry, optionGrid) {
       onInput: (nextValue) => {
         ensureMeshVertexPoints(entry);
         updateEntryPointSize(entry, nextValue);
-        requestRenderAndHover();
+        requestRender();
       },
     }));
   }
@@ -4257,7 +4469,6 @@ function rebuildLayerList() {
       updateMaskedObjectVisibility(entry);
       updateEntryEdgeOverlay(entry);
       rebuildLayerList();
-      hideHoverTooltip();
       requestRender();
     });
 
@@ -4392,7 +4603,6 @@ async function setAllLayersVisibility(visible) {
     updateEntryEdgeOverlay(entry);
   }
   rebuildLayerList();
-  hideHoverTooltip();
   requestRender();
 }
 
@@ -4427,6 +4637,7 @@ function makeLayerPlaceholder(rawLayer, layerIdx) {
     face_field_colors: null,
     face_field_values: null,
     face_field_scalar_meta: null,
+    face_field_sorted_ascending: null,
     scalar_meta: null,
     texture: null,
   };
@@ -4469,6 +4680,7 @@ function makeLayerPlaceholder(rawLayer, layerIdx) {
     sharedFieldClip: createClipState(),
     shareFieldScale: Boolean(rawLayer.share_field_scale ?? payload.initial_share_field_scale),
     opacity: clampOpacity(rawLayer.opacity ?? payload.opacity),
+    edgeOpacity: rawLayer.edge_opacity == null ? null : clampOpacity(rawLayer.edge_opacity),
     showEdges: layerKind === 'mesh' && rawLayer.show_edges === true,
     showVertices: layerKind === 'mesh' && rawLayer.show_vertices === true,
     edgeThickness: getLayerEdgeThickness(rawLayer),
@@ -4480,6 +4692,10 @@ function makeLayerPlaceholder(rawLayer, layerIdx) {
     pointFilterActive: false,
     edgeFilterActive: false,
     faceFilterActive: false,
+    sortedFaceFilterActive: false,
+    sortedFaceFilterUsesFaceColors: false,
+    sortedFaceFilterBegin: null,
+    sortedFaceFilterEnd: null,
     fieldOptionsContainer: null,
     fieldLookup: new Map(),
     edgeFieldLookup: new Map(),
@@ -4526,7 +4742,7 @@ async function loadLayerEntry(entry) {
       currentEdgeColors: null,
       currentFaceColors: null,
       unmaskedPointCount: layerKind === 'pointcloud' ? Math.floor(layer.points.length / 3) : 0,
-      unmaskedEdgeCount: Math.floor((layer.edges?.length || 0) / 2),
+      unmaskedEdgeCount: pointGraphEdgeCount(layer),
       unmaskedFaceCount: layerKind === 'mesh' ? Math.floor(layer.faces.length / meshFaceSize(layer)) : 0,
       fieldClipStates: Array.from({ length: Math.max(fieldCount, 1) }, () => createClipState()),
     });
@@ -4672,9 +4888,6 @@ if (commandsToggleBtn && controlsPanel) {
 document.getElementById('btn-reset-camera').addEventListener('click', () => {
   fitCamera();
 });
-controls.addEventListener('change', () => {
-  scheduleHoverRefresh();
-});
 let cameraInteractionActive = false;
 let cameraInteractionEndTimer = 0;
 
@@ -4684,7 +4897,7 @@ function beginCameraInteraction() {
   for (const entry of layers) {
     if (!entry.visible || !entry.mesh) continue;
     const faceCount = Number(entry.layer.face_count) || 0;
-    if (faceCount <= MAX_INTERACTIVE_MESH_PICK_FACE_COUNT) continue;
+    if (faceCount <= MESH_INTERACTION_PROXY_FACE_THRESHOLD) continue;
     const proxy = ensureMeshInteractionProxy(entry);
     if (!proxy) continue;
     entry.mesh.visible = false;
@@ -4787,7 +5000,157 @@ async function captureCurrentView() {
   return true;
 }
 
+// Small-tile GPU depth picking avoids a linear CPU raycast (or a huge BVH
+// build) on the multi-million-face atlas layers. Geometry and filter draw
+// ranges are shared, not copied; the display itself remains full resolution.
+// Padding keeps point centers inside the pick frustum when their sprites
+// cover the cursor. A one-pixel frustum clips those centers before rasterizing.
+const orbitPickSize = 33;
+const orbitPickCenter = Math.floor(orbitPickSize / 2);
+const orbitDepthTarget = new THREE.WebGLRenderTarget(orbitPickSize, orbitPickSize, {
+  minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+  depthBuffer: true, stencilBuffer: false,
+});
+const orbitDepthMaterial = new THREE.MeshDepthMaterial({
+  depthPacking: THREE.RGBADepthPacking, side: THREE.DoubleSide,
+});
+orbitDepthMaterial.toneMapped = false;
+const orbitPointDepthMaterials = new WeakMap();
+function orbitPointDepthMaterial(object) {
+  let material = orbitPointDepthMaterials.get(object);
+  if (!material) {
+    material = new THREE.ShaderMaterial({
+      uniforms: { size: { value: 1 } },
+      vertexShader: `uniform float size;
+        void main() {
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          gl_PointSize = size;
+        }`,
+      fragmentShader: `#include <packing>
+        void main() {
+          vec2 center = gl_PointCoord - vec2(0.5);
+          if (dot(center, center) > 0.25) discard;
+          gl_FragColor = packDepthToRGBA(gl_FragCoord.z);
+        }`,
+      depthTest: true, depthWrite: true, toneMapped: false,
+    });
+    orbitPointDepthMaterials.set(object, material);
+  }
+  // Display shader sizes are drawing-buffer pixels; the pick tile uses CSS pixels.
+  material.uniforms.size.value = object.material.uniforms.size.value / renderer.getPixelRatio();
+  return material;
+}
+const orbitDepthPixels = new Uint8Array(orbitPickSize * orbitPickSize * 4);
+
+// Sparse point sprites leave holes even over a visible surface. Prefer the
+// frontmost hit in a small cursor neighborhood, rather than a background hit
+// through the exact cursor pixel. Return its pixel as well as its depth so
+// unprojection uses the ray that actually hit the surface.
+function selectOrbitDepthPixel(pixels, size, radius = 6) {
+  const center = Math.floor(size / 2);
+  let best = null;
+  for (let row = 0; row < size; row += 1) {
+    for (let col = 0; col < size; col += 1) {
+      const dx = col - center, dy = row - center;
+      if (dx * dx + dy * dy > radius * radius) continue;
+      const i = 4 * (row * size + col);
+      const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2], a = pixels[i + 3];
+      if (r === 255 && g === 255 && b === 255 && a === 255) continue;
+      const depth = (r / 16777216 + g / 65536 + b / 256 + a) / 256;
+      if (!best || depth < best.depth) best = { depth, dx, dy };
+    }
+  }
+  return best;
+}
+
+function readOrbitSurfaceDepth(clientX, clientY) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  if (!(rect.width > 0 && rect.height > 0)) return null;
+  const x = Math.floor(clientX - rect.left), y = Math.floor(clientY - rect.top);
+  if (x < 0 || y < 0 || x >= rect.width || y >= rect.height) return null;
+  const pickScene = new THREE.Scene();
+  for (const entry of layers) {
+    if (!entry.loaded || !entry.visible || !(entry.opacity > 0)) continue;
+    for (const object of [entry.mesh, entry.maskedMesh]) {
+      if (!object || (object === entry.maskedMesh && !object.visible)) continue;
+      object.updateWorldMatrix(true, false);
+      const mesh = new THREE.Mesh(object.geometry, orbitDepthMaterial);
+      mesh.matrixAutoUpdate = false;
+      mesh.matrix.copy(object.matrixWorld);
+      pickScene.add(mesh);
+    }
+    for (const object of [entry.points, entry.maskedPoints]) {
+      if (!object?.visible || !(object.material.uniforms.opacity.value > 0)) continue;
+      object.updateWorldMatrix(true, false);
+      const points = new THREE.Points(object.geometry, orbitPointDepthMaterial(object));
+      points.matrixAutoUpdate = false;
+      points.matrix.copy(object.matrixWorld);
+      points.frustumCulled = false;
+      pickScene.add(points);
+    }
+  }
+  if (!pickScene.children.length) return null;
+  const pickCamera = camera.clone();
+  pickCamera.setViewOffset(rect.width, rect.height,
+    x - orbitPickCenter, y - orbitPickCenter, orbitPickSize, orbitPickSize);
+  const previousTarget = renderer.getRenderTarget();
+  const previousViewport = renderer.getViewport(new THREE.Vector4());
+  const previousScissor = renderer.getScissor(new THREE.Vector4());
+  const previousScissorTest = renderer.getScissorTest();
+  const previousClear = renderer.getClearColor(new THREE.Color());
+  const previousAlpha = renderer.getClearAlpha();
+  try {
+    renderer.setRenderTarget(orbitDepthTarget);
+    renderer.setViewport(0, 0, orbitPickSize, orbitPickSize);
+    renderer.setScissorTest(false);
+    renderer.setClearColor(0xffffff, 1);
+    renderer.clear();
+    renderer.render(pickScene, pickCamera);
+    renderer.readRenderTargetPixels(orbitDepthTarget, 0, 0, orbitPickSize, orbitPickSize, orbitDepthPixels);
+  } finally {
+    renderer.setRenderTarget(previousTarget);
+    renderer.setViewport(previousViewport);
+    renderer.setScissor(previousScissor);
+    renderer.setScissorTest(previousScissorTest);
+    renderer.setClearColor(previousClear, previousAlpha);
+  }
+  const hit = selectOrbitDepthPixel(orbitDepthPixels, orbitPickSize);
+  if (!hit) return null;
+  const { depth } = hit;
+  const distance = camera.isPerspectiveCamera
+    ? camera.near * camera.far / (camera.far - depth * (camera.far - camera.near))
+    : camera.near + depth * (camera.far - camera.near);
+  return Number.isFinite(distance) && distance > camera.near
+    ? { distance, x: rect.left + x + hit.dx + 0.5,
+        y: rect.top + y - hit.dy + 0.5 } : null;
+}
+
+function prepareSurfaceOrbit(event) {
+  surfaceOrbitDragging = false;
+  if (!controls.enabled || event.pointerType === 'touch' || event.button !== 0) return;
+  const rect = renderer.domElement.getBoundingClientRect();
+  const hit = readOrbitSurfaceDepth(event.clientX, event.clientY);
+  if (hit !== null) {
+    const forward = camera.getWorldDirection(new THREE.Vector3());
+    const ray = new THREE.Vector3(
+      2 * (hit.x - rect.left) / rect.width - 1,
+      1 - 2 * (hit.y - rect.top) / rect.height, 0.5,
+    ).unproject(camera).sub(camera.position).normalize();
+    surfaceOrbitPivot = camera.position.clone().addScaledVector(ray, hit.distance / ray.dot(forward));
+  }
+  // On empty background retain the last world-space anchor, not the target
+  // translated by free dollying. No camera/target changes on pointer-down.
+  if (!surfaceOrbitPivot) surfaceOrbitPivot = controls.target.clone();
+  surfaceOrbitDragging = true;
+}
+// Capture runs before TrackballControls consumes the pointer-down event.
+renderer.domElement.addEventListener('pointerdown', prepareSurfaceOrbit, { capture: true });
+window.addEventListener('pointerup', () => { surfaceOrbitDragging = false; });
+window.addEventListener('pointercancel', () => { surfaceOrbitDragging = false; });
+window.addEventListener('blur', () => { surfaceOrbitDragging = false; });
+
 function stopStuckCameraDrag() {
+  surfaceOrbitDragging = false;
   const position = camera.position.clone();
   const up = camera.up.clone();
   const target = controls.target.clone();
@@ -4806,10 +5169,11 @@ renderer.domElement.addEventListener('pointermove', (event) => {
     stopStuckCameraDrag();
     scheduleCameraInteractionEnd(0);
   }
-  pointerState.inside = true;
-  pointerState.clientX = event.clientX;
-  pointerState.clientY = event.clientY;
-  requestRenderAndHover();
+  // TrackballControls consumes movement in update(), not in pointermove.
+  // Schedule frames during gestures only; idle movement does no picking/work.
+  if (cameraInteractionActive && (event.buttons !== 0 || event.pointerType === 'touch')) {
+    requestRender();
+  }
 });
 renderer.domElement.addEventListener('wheel', () => {
   beginCameraInteraction();
@@ -4819,10 +5183,6 @@ renderer.domElement.addEventListener('pointerdown', beginCameraInteraction);
 renderer.domElement.addEventListener('pointerup', () => scheduleCameraInteractionEnd());
 window.addEventListener('pointerup', () => scheduleCameraInteractionEnd());
 window.addEventListener('pointercancel', () => scheduleCameraInteractionEnd());
-renderer.domElement.addEventListener('pointerleave', () => {
-  pointerState.inside = false;
-  hideHoverTooltip();
-});
 
 document.getElementById('btn-quit-top').addEventListener('click', async () => {
   try {
